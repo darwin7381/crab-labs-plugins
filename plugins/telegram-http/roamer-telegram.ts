@@ -169,7 +169,7 @@ export class RoamerTelegram {
   private checkIconId: string | undefined
   private readonly apiRoot: string
 
-  constructor(private readonly o: { token: string; apiRoot?: string; log: Log }) {
+  constructor(private readonly o: { token: string; apiRoot?: string; log: Log; handover?: { pollOffset: number | null; rememberPollOffset(offset: number | null): void } }) {
     // genesis lab: grammy uses the same API root as the raw POST and the file downloads, so a TELEGRAM_API_ROOT mock receives getUpdates / sendMessage too
     this.apiRoot = o.apiRoot ?? 'https://api.telegram.org'
     this.bot = new Bot(o.token, { client: { ...(o.apiRoot ? { apiRoot: o.apiRoot } : {}) } })
@@ -638,7 +638,10 @@ export class RoamerTelegram {
 
     // Track the latest update_id so the heartbeat log shows whether polling is actually receiving updates (vs alive but stuck).
     bot.use(async (ctx, next) => {
-      if (ctx.update?.update_id) this.lastUpdateId = ctx.update.update_id
+      if (ctx.update?.update_id) {
+        this.lastUpdateId = ctx.update.update_id
+        if (this.stopped) this.o.handover?.rememberPollOffset(this.lastUpdateId + 1)
+      }
       // Minimal inbound trace (2026-08-23, Atlas's 2-of-3 album-documents loss): one line per update makes "did the update even arrive" a grep instead of
       // an argument. Never log content — ids and shape only.
       const m = ctx.update?.message
@@ -841,12 +844,16 @@ export class RoamerTelegram {
   // Retry polling with backoff on any error. Previously only 409 was retried — a single ETIMEDOUT/ECONNRESET/DNS failure rejected bot.start(), the catch
   // returned, and polling stopped permanently while the process stayed alive. 2026-05-13 by Joey: the inner loop wrapped in an outer try/catch so a sync
   // throw in the IIFE itself gets logged and retried instead of silently terminating the loop.
+  private stopped = false
+  private pollTask?: Promise<void>
+  private timers: ReturnType<typeof setInterval>[] = []
   private async pollLoop(): Promise<void> {
     const h = this.host!
-    for (let attempt = 1; ; attempt++) {
+    for (let attempt = 1; !this.stopped; attempt++) {
       try {
         await this.bot.start({
           onStart: info => {
+            if (this.stopped) return
             attempt = 0
             this.botUsername = info.username
             this.log('info', `polling as @${info.username}`)
@@ -866,7 +873,7 @@ export class RoamerTelegram {
         })
         return // bot.stop() was called — clean exit from the loop
       } catch (err) {
-        if (h.shuttingDown()) return
+        if (this.stopped || h.shuttingDown()) return
         // bot.stop() mid-setup rejects with grammy's "Aborted delay" — expected, not an error.
         if (err instanceof Error && err.message === 'Aborted delay') return
         const is409 = err instanceof GrammyError && err.error_code === 409
@@ -886,20 +893,34 @@ export class RoamerTelegram {
     this.host = host
     this.registerHandlers()
     if (!host.staticAccess) {
-      setInterval(() => this.checkApprovals(), 5000).unref()
+      this.timers.push(setInterval(() => this.checkApprovals(), 5000).unref())
       // #16: sweep expired pairing codes even when no message traffic triggers a gate() call — otherwise a dead code sits in access.json (and counts toward
       // the 3-pending cap) until the next inbound.
-      setInterval(() => {
+      this.timers.push(setInterval(() => {
         try {
           const a = host.readAccessFile()
           if (pruneExpired(a)) { host.saveAccess(a); this.log('info', 'pairing sweep: pruned expired pending code(s)') }
         } catch (err) { this.log('warn', `pairing sweep failed: ${err instanceof Error ? err.message : err}`) }
-      }, PAIRING_PRUNE_INTERVAL_MS).unref()
+      }, PAIRING_PRUNE_INTERVAL_MS).unref())
     }
+    this.startPoll(host)
+    this.log('info', 'roamer (ROAMER_MODE=1): the Telegram long poll is started (roamer-telegram.ts); this daemon is not a connector')
+  }
+
+  private startPoll(host: RoamerHost): void {
     this.pollRunning = true
-    void (async () => {
-      while (!host.shuttingDown()) {
-        try { await this.pollLoop(); break } catch (err) {
+    this.pollTask = (async () => {
+      while (!this.stopped && !host.shuttingDown()) {
+        try {
+          const pending = this.o.handover?.pollOffset
+          if (pending != null) {
+            await this.bot.api.getUpdates({ offset: pending, limit: 1 })
+            if (this.stopped || host.shuttingDown()) break
+            this.o.handover!.rememberPollOffset(null)
+          }
+          await this.pollLoop()
+          break
+        } catch (err) {
           this.log('error', `pollLoop crashed unexpectedly: ${err} — restarting in 5s`)
           await new Promise(r => setTimeout(r, 5000))
         }
@@ -907,9 +928,28 @@ export class RoamerTelegram {
       this.pollRunning = false
       this.botUsername = ''
     })()
-    this.log('info', 'roamer (ROAMER_MODE=1): the Telegram long poll is started (roamer-telegram.ts); this daemon is not a connector')
   }
 
   /** bot.stop() signals the poll loop to end; the current getUpdates request may take up to its long-poll timeout to return */
-  stop(): Promise<void> { return Promise.resolve(this.bot.stop()) }
+  async stop(drain = false): Promise<void> {
+    if (!drain) return this.bot.stop()
+    const checkpoint = this.o.handover!
+    const offset = checkpoint.pollOffset ?? this.lastUpdateId + 1
+    checkpoint.rememberPollOffset(offset)
+    this.stopped = true
+    try {
+      const running = this.bot.isRunning()
+      try { if (running) await this.bot.stop() }
+      finally { await this.pollTask }
+      // grammy sends its last offset before an in-flight batch finishes. Confirm any later update,
+      // or the saved offset when resuming a drain after a process restart.
+      if (!running || checkpoint.pollOffset !== offset)
+        await this.bot.api.getUpdates({ offset: checkpoint.pollOffset!, limit: 1 })
+    } catch (err) {
+      this.stopped = false
+      if (this.host && !this.host.shuttingDown()) this.startPoll(this.host)
+      throw err
+    }
+    for (const timer of this.timers) clearInterval(timer)
+  }
 }

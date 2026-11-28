@@ -124,9 +124,9 @@ test('(b) server.ts loads roamer-telegram.ts once, by a dynamic import behind RO
   const src = readFileSync(join(PLUGIN, 'server.ts'), 'utf8')
   const runtime = [...src.matchAll(/import\(\s*['"]\.\/roamer-telegram\.ts['"]\s*\)/g)]
   expect(runtime.length).toBe(1)
-  expect(src).toMatch(/const tg: RoamerTelegram \| null = ROAMER\n\s*\? new \(await import\('\.\/roamer-telegram\.ts'\)\)\.RoamerTelegram\(/)
+  expect(src).toMatch(/tg = ROAMER && !CONNECTOR\n\s*\? new \(await import\('\.\/roamer-telegram\.ts'\)\)\.RoamerTelegram\(/)
   expect(src).toContain('const ROAMER = !INBOX_ONLY && Onsen.isRoamerEnv(process.env)')
-  expect(src).toContain('const CONNECTOR = !INBOX_ONLY && !ROAMER')
+  expect(src).toContain('let CONNECTOR = !INBOX_ONLY && !ROAMER')
   // the only static mention is a type import (erased when Bun runs the file)
   const statics = src.split('\n').filter(l => /^\s*import\b/.test(l) && l.includes('roamer-telegram'))
   expect(statics).toEqual(["import type { RoamerTelegram, RoamerHost } from './roamer-telegram.ts'"])
@@ -136,7 +136,7 @@ test('(b) server.ts loads roamer-telegram.ts once, by a dynamic import behind RO
   const imports = /import\b[^\n]*['"][^'"]*roamer-telegram(\.ts)?['"]|import\(\s*['"][^'"]*roamer-telegram/
   for (const f of daemonSources()) if (!f.endsWith('/telegram-http/server.ts')) expect([f, imports.test(readFileSync(f, 'utf8'))]).toEqual([f, false])
   // the token check: only a roamer exits without one
-  expect(src).toContain('if (!TOKEN && ROAMER) {')
+  expect(src).toContain('if (!TOKEN && ROAMER && !CONNECTOR) {')
 })
 
 test('(c) a roamer: polls the stand-in, an update reaches its target session only, the reply goes out; no target: told on Telegram', async () => {

@@ -18,7 +18,7 @@ import { mkdirSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { Agent } from './agent.ts'
-import { carried, discover, MEMBER_RE, readSettings, readToken, settingsPath, type Found, type Settings } from './agents.ts'
+import { bridgeOwnsBot, carried, discover, MEMBER_RE, readSettings, readToken, settingsPath, type Found, type Settings } from './agents.ts'
 import { Poller, type PollerDeps } from './inbound.ts'
 import { errCode, errSaid, OnsenClient } from './onsen.ts'
 import { Drawer } from './outbound.ts'
@@ -191,6 +191,13 @@ export class Bridge {
   async reconcile(): Promise<void> {
     this.settingsAt = this.now()
     const want = this.wanted()
+    await Promise.all([...want.values()].filter(f => f.roamerPort !== undefined).map(async f => {
+      const accepted = this.state.data.accepted.includes(f.member)
+      if (await bridgeOwnsBot(f, accepted, this.deps.fetch)) return
+      want.delete(f.member)
+      if (this.agents.has(f.member)) await this.drop(f.member, 'its roamer daemon owns the bot')
+      if (accepted) { this.state.data.accepted = this.state.data.accepted.filter(m => m !== f.member); this.state.dirty() }
+    }))
     const before = JSON.stringify([...this.missing.entries()])
     this.missing.clear()
     for (const [m, a] of [...this.agents]) {

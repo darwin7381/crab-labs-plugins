@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from 'bun:test'
 import { randomUUID } from 'crypto'
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'fs'
+import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
@@ -9,8 +9,9 @@ import { Journal } from './lanes-state.ts'
 import { itemRef } from './onsen-items.ts'
 import { osProcStart } from './onsen-status.ts'
 import { createEvents } from './lanes-events.ts'
+import { startOnsenStandin } from './test-fixtures/onsen-standin.ts'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
-import { startBotApiMock } from './test-fixtures/tg-bot-api-mock.ts'
+import { dm, startBotApiMock } from './test-fixtures/tg-bot-api-mock.ts'
 import { freePort, until } from './test-fixtures/tg-daemon.ts'
 
 const clean: Array<() => Promise<void> | void> = []
@@ -45,8 +46,8 @@ async function waitFor(ok: () => boolean | Promise<boolean>, ms = 5000) {
   while (!await ok() && Date.now() < end) await Bun.sleep(15)
   expect(await ok()).toBe(true)
 }
-async function daemon(env: Record<string, string> = {}, initialMode = 200, setup?: (root: string, f: ReturnType<typeof fakeItems>) => Record<string, string> | Promise<Record<string, string>>) {
-  const f = fakeItems(), root = mkdtempSync(join(tmpdir(), 'take-daemon-')), state = join(root, 'tg'), lanes = join(root, '.lanes')
+async function daemon(env: Record<string, string> = {}, initialMode = 200, setup?: (root: string, f: ReturnType<typeof fakeItems>) => Record<string, string> | Promise<Record<string, string>>, actionPort?: number) {
+  const f = fakeItems(env.LANES_AGENT || 'adam', actionPort, env.ROAMER_MODE === '1' ? Date.now : undefined), root = mkdtempSync(join(tmpdir(), 'take-daemon-')), state = join(root, 'tg'), lanes = join(root, '.lanes')
   clean.push(async () => { try { await f.stop() } finally { rmSync(root, { recursive: true, force: true }) } })
   f.mode(initialMode)
   for (const dir of [state, lanes, join(root, 'home')]) mkdirSync(dir)
@@ -130,13 +131,14 @@ async function activePerson(id: string) {
   expect(row.state).toBe('claimed')
   const offer = offers.find(n => n.content.includes(row.id))
   await hook('UserPromptSubmit', { dids: [offer.meta.did] })
-  await waitFor(() => row.claim?.session_id === 'main')
+  await waitFor(() => row.claim?.session_id === sid)
+  expect(row.session_id).toBe('main')
   const stop = async () => {
     await hook('Stop', { phase: 'final' })
     await Bun.sleep(3100)
     writeFileSync(registryFile, JSON.stringify({ ...entry, statusUpdatedAt: Date.now() }))
   }
-  return { d, row, client, offers, hook, stop }
+  return { d, row, client, offers, stop, hook, registryFile, entry }
 }
 
 test('real daemon completes an idle main person item with its reply after the final Stop', async () => {
@@ -176,6 +178,19 @@ test('a mid-turn arrival and the original message each complete with only their 
   await waitFor(() => [first, second].every(row => row.state === 'completed'), 8000)
   expect([first.response_message_ids, second.response_message_ids]).toEqual(responseIds.map(id => [id]))
 }, 25000)
+for (const edge of ['offline', 'new UUID']) test('a main reply completes when its registry reports ' + edge + ' immediately after Stop', async () => {
+  const { d, row, client, offers, hook, registryFile, entry } = await activePerson('leaving-main')
+  const reply = await client.callTool({ name: 'reply', arguments: { chat_id: '1', text: 'finished' } })
+  const id = /onsen:(\d+)/.exec(JSON.stringify(reply.content))?.[1]
+  expect(id).toBeTruthy()
+  await hook('Stop', { phase: 'final' })
+  if (edge === 'offline') unlinkSync(registryFile)
+  else writeFileSync(registryFile, JSON.stringify({ ...entry, sessionId: randomUUID(), status: 'busy', statusUpdatedAt: Date.now() }))
+  await waitFor(() => row.state === 'completed')
+  expect(row.response_message_ids).toEqual([id])
+  expect(d.f.history.filter(h => h.item_id === row.id).map(h => h.body.outcome)).toEqual(['in_session', 'completed'])
+  expect(offers).toHaveLength(1)
+}, 15000)
 
 test('after 45 s without renewal the main completes its original claim with one delivery and no re-take', async () => {
   const { d, row, offers, stop } = await activePerson('lease-expiry')
@@ -863,6 +878,576 @@ test('roamer stays on its local mock bot and never probes items', async () => {
   await waitFor(() => d.log().includes('staying on pull: ROAMER'))
   expect(d.f.calls.filter(c => c.path.endsWith('/items'))).toHaveLength(0)
 })
+
+const member = 'space-roamers'
+const roamerEnv = { GENESIS_LANES: '0', ROAMER_MODE: '1', ROAMER_BOT_NAME: 'space_roamers', LANES_AGENT: member, ONSEN_OBSERVATION: member }
+const roamerState = (root: string) => ({ ROAMER_STATE_FILE: join(root, 'roamer-state.json') })
+
+test('a switched roamer starts with no bot token, registers commands and observes as its own member', async () => {
+  const d = await daemon(roamerEnv, 200, roamerState)
+  const h = await fetch(d.base + '/healthz').then(r => r.json())
+  expect(h.connector.on).toBe(true)
+  expect(h.polling).toBe(false)
+  await waitFor(() => d.f.calls.some(c => c.body?.connector === 'mac-mini/' + member && c.path.endsWith('/observation')))
+  expect(d.f.calls.find(c => c.body?.connector && c.path.endsWith('/observation'))!.body.presence).toBe('offline')
+  const names = d.f.calls.find(c => c.path === '/v1/members/' + member + '/commands')!.body.commands.map((c: any) => c.name)
+  expect(names).toEqual(expect.arrayContaining(['roam', 'roam_status', 'resume_list', 'resume', 'resume_previous', 'restart', 'kill_stuck',
+    'clear', 'agents', 'mcp', 'init', 'compact', 'model', 'effort', 'codexgate', 'sigint']))
+  d.f.mode(503)
+  await d.restart()
+  const offline = await fetch(d.base + '/healthz').then(r => r.json())
+  expect(offline.connector.on).toBe(true)
+  expect(offline.polling).toBe(false)
+})
+
+for (const [name, mode, named] of [['not selected', 200, false], ['409', 409, true], ['404', 404, true]] as const)
+  test('roamer keeps its local bot when ' + name, async () => {
+    const bot = startBotApiMock({}, { pollHoldMs: 100 })
+    clean.push(() => bot.stop())
+    const d = await daemon({ ...roamerEnv, TELEGRAM_BOT_TOKEN: bot.token, TELEGRAM_API_ROOT: bot.url, ...(named ? {} : { ONSEN_TAKE: '' }) }, mode, roamerState)
+    await waitFor(async () => (await fetch(d.base + '/healthz').then(r => r.json())).polling)
+    expect((await fetch(d.base + '/healthz').then(r => r.json())).connector.on).toBe(false)
+    expect(d.f.calls.filter(c => c.path.endsWith('/items'))).toHaveLength(named ? 1 : 0)
+    expect(d.f.calls.some(c => c.path.endsWith('/commands') || c.path.endsWith('/observation'))).toBe(false)
+  })
+
+test('first roamer handover preserves historical unsent spool bytes and keeps its local bot', async () => {
+  const bot = startBotApiMock({}, { pollHoldMs: 100 })
+  clean.push(() => bot.stop())
+  const old = '{"k":"recv","owner":"older-member"}\n'
+  const d = await daemon({ ...roamerEnv, TELEGRAM_BOT_TOKEN: bot.token, TELEGRAM_API_ROOT: bot.url }, 200, root => {
+    const spool = join(root, 'tg/onsen')
+    mkdirSync(spool)
+    writeFileSync(join(spool, 'spool.jsonl'), old)
+    return roamerState(root)
+  })
+  await waitFor(() => bot.polls.length > 0)
+  expect((await fetch(d.base + '/healthz').then(r => r.json())).connector.on).toBe(false)
+  expect(d.log()).toContain('local roamer spool has ' + Buffer.byteLength(old) + ' unconfirmed bytes')
+  expect(readFileSync(join(d.state, 'onsen/spool.jsonl'), 'utf8')).toBe(old)
+  expect(existsSync(join(d.state, 'onsen/cursor.json'))).toBe(false)
+  expect(d.f.calls.filter(c => c.path.endsWith('/batch') || c.path.endsWith('/commands'))).toHaveLength(0)
+})
+
+test('handover confirms the whole local batch when another update is handled during stop', async () => {
+  const bot = startBotApiMock({}, { pollHoldMs: 100 })
+  clean.push(() => bot.stop())
+  const offsets: number[] = []
+  let sending = false, release!: () => void
+  const held = new Promise<void>(resolve => { release = resolve })
+  const proxy = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(req) {
+    const path = new URL(req.url).pathname
+    const body = await req.text()
+    if (/\/send(Rich)?Message$/.test(path) && !sending) { sending = true; await held }
+    if (path.endsWith('/getUpdates')) {
+      const poll = JSON.parse(body)
+      if (poll.limit === 1) { offsets.push(poll.offset); release() }
+    }
+    return fetch(bot.url + path, { method: req.method, headers: { 'Content-Type': 'application/json' }, body })
+  } })
+  clean.push(() => { release(); return proxy.stop(true) })
+  for (const id of [41, 42]) bot.push({ update_id: id, ...dm(1, id, '/help', { command: true }) })
+  const d = await daemon({ ...roamerEnv, C6_FAST_PROBE: '1', TELEGRAM_BOT_TOKEN: bot.token, TELEGRAM_API_ROOT: 'http://127.0.0.1:' + proxy.port }, 409, roamerState)
+  await waitFor(() => sending)
+  d.f.mode(200)
+  await waitFor(async () => (await fetch(d.base + '/healthz').then(r => r.json())).connector.on)
+  expect(offsets).toEqual([42, 43])
+  expect(d.log().match(/inbound u=4[12] /g)).toHaveLength(2)
+}, 10000)
+
+test('a failed offset confirmation keeps the bridge out through restart until the exact offset succeeds', async () => {
+  const bot = startBotApiMock({}, { pollHoldMs: 100 })
+  clean.push(() => bot.stop())
+  const offsets: number[] = []
+  let reject = true
+  bot.fail.fn = (method, body) => {
+    if (method !== 'getUpdates' || Number(body.limit) !== 1) return false
+    offsets.push(Number(body.offset))
+    return reject
+  }
+  const d = await daemon({ ...roamerEnv, C6_FAST_PROBE: '1', TELEGRAM_BOT_TOKEN: bot.token, TELEGRAM_API_ROOT: bot.url }, 409, roamerState)
+  const health = () => fetch(d.base + '/healthz').then(r => r.json())
+  const claimFile = join(d.state, 'onsen/claims.json')
+  const claims = () => JSON.parse(readFileSync(claimFile, 'utf8'))
+  bot.push({ update_id: 41, message: { message_id: 1, chat: { id: 1, type: 'private' }, from: { id: 1, first_name: 'Joey' }, date: 1, text: '/help' } })
+  await waitFor(() => d.log().includes('inbound u=41'))
+  d.f.mode(200)
+  await waitFor(() => offsets.length > 0)
+  expect((await health()).connector.on).toBe(false)
+  expect(claims().pollOffset).toBe(42)
+  expect(claims().connector).toBeUndefined()
+  const before = offsets.length
+  await d.restart()
+  await waitFor(() => offsets.length > before)
+  expect((await health()).connector.on).toBe(false)
+  expect(d.f.calls.some(c => c.path.endsWith('/commands') || c.path.endsWith('/observation'))).toBe(false)
+  reject = false
+  await waitFor(async () => (await health()).connector.on, 12000)
+  expect((await health()).polling).toBe(false)
+  expect(claims().connector).toBe('mac-mini/' + member)
+  expect(claims().pollOffset).toBeUndefined()
+  expect(new Set(offsets)).toEqual(new Set([42]))
+  expect(d.log().match(/inbound u=41 /g)).toHaveLength(1)
+}, 22000)
+
+test('a roamer starts the shared registry CLI comparison only after a runtime switch', async () => {
+  const bot = startBotApiMock({}, { pollHoldMs: 100 })
+  clean.push(() => bot.stop())
+  const d = await daemon({ ...roamerEnv, C6_FAST_PROBE: '1', TELEGRAM_BOT_TOKEN: bot.token, TELEGRAM_API_ROOT: bot.url,
+    ONSEN_REGISTRY_CLI: '1', ONSEN_REGISTRY_FIRST_CHECK_MS: '50' }, 409, root => {
+    const cli = join(root, 'fixture-registry')
+    writeFileSync(cli, '#!/bin/sh\n[ "$1 $2" = "agents --json" ] || exit 1\ntouch "$AGENT_WORKSPACE_DIR/cli-ran"\necho "[]"\n', { mode: 0o700 })
+    return { ...roamerState(root), ONSEN_CLAUDE_BIN: cli }
+  })
+  const ran = join(d.root, 'cli-ran')
+  await waitFor(() => bot.polls.length > 0)
+  await Bun.sleep(200)
+  expect(existsSync(ran)).toBe(false)
+  d.f.mode(200)
+  await waitFor(() => existsSync(ran))
+  expect((await fetch(d.base + '/healthz').then(r => r.json())).connector.on).toBe(true)
+}, 9000)
+
+test('a later successful probe drains the local poll before the bridge can carry the bot', async () => {
+  const bot = startBotApiMock({}, { pollHoldMs: 100 })
+  clean.push(() => bot.stop())
+  const d = await daemon({ ...roamerEnv, C6_FAST_PROBE: '1', TELEGRAM_BOT_TOKEN: bot.token, TELEGRAM_API_ROOT: bot.url }, 409, roamerState)
+  await waitFor(() => bot.polls.length > 0)
+  d.f.mode(200)
+  await waitFor(async () => (await fetch(d.base + '/healthz').then(r => r.json())).connector.on)
+  const calls = bot.polls.length
+  await Bun.sleep(350)
+  expect(bot.polls).toHaveLength(calls)
+  await waitFor(() => d.f.calls.some(c => c.body?.connector === 'mac-mini/' + member && c.path.endsWith('/observation')))
+}, 9000)
+
+for (const mode of ['pull', 'take']) test('a command choice that throws follows ' + mode + ' Action semantics', async () => {
+  const actions = startOnsenStandin({ 'test-member': 'adam' })
+  clean.push(() => actions.stop())
+  const take = mode === 'take'
+  const d = await daemon({ C6_CHOICE_FAILURE: '1', ONSEN_OWNER: 'joey', CHANNEL_BOT_TMUX_SESSION: 'lab',
+    ONSEN_TAKE: take ? 'adam' : '' }, take ? 200 : 409, undefined, actions.port)
+  const post = (path: string, body: unknown) => fetch(d.base + path, { method: 'POST',
+    headers: { Authorization: 'Bearer test-loopback', 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+  const cmd = command(d, 'model', '/model', '100')
+  if (take) await waitFor(() => cmd.state === 'completed')
+  else expect((await post('/onsen/person', { kind: 'person_message', payload: cmd.payload })).status).toBe(200)
+  await waitFor(() => actions.actions.size === 1)
+  const action = [...actions.actions.values()][0]!, payload = actions.press(action.id, '1')
+  if (take) {
+    const control = d.f.add('choice', 'control', { action_id: action.id, payload })
+    await waitFor(() => control.reason === 'not_applied')
+  } else expect((await post('/onsen/action', payload)).ok).toBe(true)
+  const calls = () => actions.acalls.filter(c => c.path === '/v1/actions/' + action.id + (take ? '/cancel' : '/applied'))
+  await waitFor(() => calls().length === 1)
+  expect(d.log()).toContain('fixture choice failed')
+  expect(actions.acalls.some(c => c.path.endsWith(take ? '/applied' : '/cancel'))).toBe(false)
+}, 12000)
+
+test('/roam without a target creates one menu Action; a returned choice is handled once through control', async () => {
+  const actions = startOnsenStandin({ 'test-member': member })
+  clean.push(() => actions.stop())
+  const d = await daemon({ ...roamerEnv, ONSEN_OWNER: 'joey', C6_ROAMER_MENU: '1' }, 200, root => {
+    const bin = join(root, 'bin')
+    mkdirSync(bin)
+    // This takeover already has an MCP stream. There is no real tmux pane or Claude argv in the fixture.
+    writeFileSync(join(bin, 'ps'), '#!/bin/sh\nexit 1\n', { mode: 0o700 })
+    writeFileSync(join(bin, 'tmux'), '#!/bin/sh\n[ "$1" = has-session ]\n', { mode: 0o700 })
+    return { ...roamerState(root), PATH: bin + ':' + process.env.PATH }
+  }, actions.port)
+  const available = join(d.root, 'lab-target')
+  const lab = await target(d)
+  const entry = { pid: lab.child.pid, sessionId: lab.sid, cwd: lab.cwd, kind: 'interactive', status: 'idle', startedAt: 1 }
+  writeFileSync(available, JSON.stringify(entry))
+  const cmd = command(d, 'choose', '/roam@space_roamersbot', '99')
+  await waitFor(() => cmd.state === 'completed')
+  expect(actions.actions.size).toBe(1)
+  const action = [...actions.actions.values()][0]!
+  expect(action).toMatchObject({ source: 'menu', assignees: ['joey'], options: [{ id: '1', label: expect.any(String) }] })
+  expect(d.f.calls.filter(c => c.path === '/v1/messages')).toHaveLength(0)
+  const payload = actions.press(action.id, '1')
+  const press = (id: string) => d.f.add(id, 'control', { action_id: action.id, payload })
+  const first = press('press')
+  await waitFor(() => first.state === 'completed')
+  expect(JSON.parse(readFileSync(roamerState(d.root).ROAMER_STATE_FILE, 'utf8')).current_target.session_id).toBe(lab.sid)
+  const replies = d.f.calls.filter(c => c.path === '/v1/messages').length
+  expect(replies).toBeGreaterThan(0)
+  expect(actions.acalls.filter(c => c.path.endsWith('/applied'))).toHaveLength(1)
+  const repeat = press('repeat')
+  await waitFor(() => repeat.reason === 'not_applied')
+  expect(actions.acalls.filter(c => c.path.endsWith('/applied'))).toHaveLength(1)
+  expect(d.f.calls.filter(c => c.path === '/v1/messages')).toHaveLength(replies)
+  const next = command(d, 'stale', '/roam', '100')
+  await waitFor(() => next.state === 'completed')
+  const stale = [...actions.actions.values()].at(-1)!
+  unlinkSync(available)
+  const missed = d.f.add('stale-choice', 'control', { action_id: stale.id, payload: actions.press(stale.id, '1') })
+  await waitFor(() => missed.reason === 'not_applied')
+  expect(actions.acalls.filter(c => c.path === '/v1/actions/' + stale.id + '/applied')).toHaveLength(0)
+  for (const [slash, kind] of [['/resume_list', 'resume_picker'], ['/model', 'model_picker'], ['/effort', 'other']]) {
+    lab.select()
+    lab.accept({ meta: { message_id: '99', onsen_claims: '' } })
+    const before = actions.actions.size
+    const c = command(d, slash.slice(1), slash, String(100 + before))
+    await waitFor(() => c.state === 'completed')
+    expect(actions.actions.size).toBe(before + 1)
+    const picker = [...actions.actions.values()].at(-1)!
+    expect(picker).toMatchObject({ source: 'menu', menu_kind: kind })
+    if (slash === '/model') {
+      lab.switchSession() // the same process and tmux still have a valid model picker, for a different conversation
+      await waitFor(() => JSON.parse(readFileSync(roamerState(d.root).ROAMER_STATE_FILE, 'utf8')).current_target?.session_id === lab.sid)
+    } else writeFileSync(roamerState(d.root).ROAMER_STATE_FILE, JSON.stringify({ current_target: null }))
+    const gone = d.f.add('gone-' + slash.slice(1), 'control', { action_id: picker.id, payload: actions.press(picker.id, '1') })
+    await waitFor(() => gone.reason === 'not_applied')
+    expect(actions.acalls.filter(c => c.path === '/v1/actions/' + picker.id + '/applied')).toHaveLength(0)
+    expect(actions.acalls.find(c => c.path === '/v1/actions/' + picker.id + '/cancel')?.body.note).toBe('原本的對話已切換')
+  }
+}, 15000)
+
+async function target(d: Awaited<ReturnType<typeof daemon>>, resumed?: string) {
+  const child = Bun.spawn(['sleep', '300']), tmux = randomUUID()
+  let sid = resumed ?? tmux
+  clean.push(async () => { child.kill(); await child.exited })
+  const cwd = join(d.root, 'lab-project')
+  const home = join(d.root, 'home', '.claude'), regs = join(home, 'sessions'), project = join(home, 'projects', cwd.replaceAll('/', '-'))
+  for (const dir of [regs, project]) mkdirSync(dir, { recursive: true })
+  const status = (value: string, sessionId = sid) => writeFileSync(join(regs, child.pid + '.json'), JSON.stringify({
+    pid: child.pid, sessionId, cwd, kind: 'interactive', status: value, statusUpdatedAt: Date.now() }))
+  status('idle')
+  let transcript = join(project, sid + '.jsonl')
+  if (!existsSync(transcript)) writeFileSync(transcript, '')
+  const write = (fields: object) => appendFileSync(transcript, JSON.stringify({ entrypoint: 'cli', timestamp: new Date().toISOString(), ...fields }) + '\n')
+  const select = () => writeFileSync(roamerState(d.root).ROAMER_STATE_FILE, JSON.stringify({ current_target: { tmux, claude_pid: child.pid, cwd, session_id: sid } }))
+  const got: any[] = []
+  async function connect() {
+    const client = new Client({ name: 'lab', version: '1' })
+    client.fallbackNotificationHandler = async n => { if (n.method === 'notifications/claude/channel') got.push(n.params) }
+    await client.connect(new StreamableHTTPClientTransport(new URL(d.base + '/mcp'), { requestInit: { headers: { 'x-test-claude-pid': String(child.pid) } } }))
+    clean.push(() => client.close())
+    return client
+  }
+  const client = await connect()
+  function switchSession() {
+    sid = randomUUID()
+    transcript = join(project, sid + '.jsonl')
+    writeFileSync(transcript, '')
+    status('idle')
+  }
+  return { child, get sid() { return sid }, cwd, get transcript() { return transcript }, switchSession, select, status, client, connect, got, accept: (msg: any) => write({ type: 'user', message: { content:
+    `<channel source="telegram" chat_id="1" message_id="${msg.meta.message_id}" onsen_claims="${msg.meta.onsen_claims}">hello</channel>` } }),
+    stop: () => write({ type: 'system', subtype: 'turn_duration' }) }
+}
+
+test('roamer switches between two live streams in one cwd, binds on intake and completes only the receiving UUID', async () => {
+  const d = await daemon({ ...roamerEnv, ONSEN_BRIDGE_WAIT_MS: '10', C6_SHORT_BUSY: '1' }, 200, roamerState)
+  const unaddressed = d.f.add('before-any-target')
+  const a = await target(d), b = await target(d)
+  await Bun.sleep(350)
+  expect(unaddressed.claim).toBeNull()
+  expect(a.got).toHaveLength(0); expect(b.got).toHaveLength(0)
+  a.select()
+  const one = d.f.add('first', 'message', { session_id: 'main' })
+  await waitFor(() => a.got.length === 1)
+  expect(one.claim!.session_id).toBeNull()
+  b.accept(a.got[0]); b.stop()
+  await Bun.sleep(350)
+  expect(one.claim!.session_id).toBeNull()
+  a.accept(a.got[0])
+  await waitFor(() => one.claim?.session_id === a.sid)
+  expect(one.session_id).toBe('main')
+  b.select()
+  const two = d.f.add('second', 'message', { session_id: null })
+  await waitFor(() => b.got.length === 1)
+  b.accept(b.got[0])
+  await waitFor(() => two.claim?.session_id === b.sid)
+  expect(two.session_id).toBe(b.sid)
+  expect(a.got.map(n => n.content)).toEqual(['first'])
+  expect(b.got.map(n => n.content)).toEqual(['second'])
+  expect(unaddressed.state).toBe('waiting')
+  const reply = await a.client.callTool({ name: 'reply', arguments: { chat_id: '1', text: 'first received' } })
+  expect(reply.isError).not.toBe(true)
+  const beforeBusy = d.f.calls.length
+  // The registry can publish a complete busy interval between two transcript polls.
+  const turn = JSON.parse(readFileSync(join(d.state, 'onsen', 'claims.json'), 'utf8')).claims[two.id].turn
+  expect(typeof turn).toBe('string')
+  const paused = join(d.root, 'pause-transcript-poll')
+  writeFileSync(paused, '')
+  b.status('busy')
+  await waitFor(() => d.f.calls.slice(beforeBusy).some(c => c.path.endsWith('/observation') && c.body.held_item_ids?.includes(two.id)
+    && c.body.sessions?.some((s: { activity: string; turn?: { id: string } }) => s.activity === 'running' && s.turn?.id === turn)))
+  b.status('idle') // Short turn with registry evidence and no transcript turn_duration.
+  unlinkSync(paused)
+  await waitFor(() => two.state === 'completed', 9000)
+  expect(two.response_message_ids).toEqual([])
+  expect(one.claim?.session_id).toBe(a.sid)
+  a.stop()
+  await waitFor(() => one.state === 'completed', 9000)
+  expect(one.response_message_ids).toHaveLength(1)
+  expect(one.session_id).toBe('main')
+  const dying = d.f.add('kill target', 'mail')
+  await waitFor(() => b.got.length === 2)
+  b.accept(b.got[1])
+  await waitFor(() => dying.claim?.session_id === b.sid)
+  b.child.kill(); await b.child.exited
+  await waitFor(() => dying.state === 'waiting' && dying.reason === 'cut')
+  expect(d.f.history.filter(h => h.item_id === dying.id && h.body.outcome === 'cut')).toHaveLength(1)
+  expect(a.got).toHaveLength(1)
+}, 45000)
+
+test('a final Stop and reply are completed when the roamer target exits inside the settle window', async () => {
+  const d = await daemon(roamerEnv, 200, roamerState), a = await target(d)
+  a.select()
+  const row = d.f.add('answered-before-exit')
+  await waitFor(() => a.got.length === 1)
+  a.accept(a.got[0])
+  await waitFor(() => row.claim?.session_id === a.sid)
+  const reply = await a.client.callTool({ name: 'reply', arguments: { chat_id: '1', text: 'done' } })
+  const id = /onsen:(\d+)/.exec(JSON.stringify(reply.content))?.[1]
+  expect(id).toBeTruthy()
+  // The final Stop can be in the next chunk when the process has already exited.
+  appendFileSync(a.transcript, JSON.stringify({ type: 'assistant', message: { content: 'x'.repeat(5 << 20) } }) + '\n')
+  a.stop()
+  a.child.kill(); await a.child.exited
+  await waitFor(() => row.state === 'completed')
+  expect(row.response_message_ids).toEqual([id])
+  expect(d.f.history.map(r => r.body.outcome)).toEqual(['in_session', 'completed'])
+  expect(a.got).toHaveLength(1)
+}, 12000)
+
+test('a session change inside the same target PID cuts the old claim and delivers to the new UUID', async () => {
+  const d = await daemon(roamerEnv, 200, roamerState), a = await target(d)
+  a.select()
+  const first = d.f.add('before-clear')
+  await waitFor(() => a.got.length === 1)
+  a.accept(a.got[0])
+  await waitFor(() => first.claim?.session_id === a.sid)
+  const old = a.sid, oldTranscript = a.transcript
+  a.status('idle', '')
+  await Bun.sleep(350)
+  expect(first.claim?.session_id).toBe(old)
+  expect(JSON.parse(readFileSync(roamerState(d.root).ROAMER_STATE_FILE, 'utf8')).current_target.session_id).toBe(old)
+  a.switchSession()
+  const second = d.f.add('after-clear')
+  await waitFor(() => a.got.length === 2)
+  expect(JSON.parse(readFileSync(roamerState(d.root).ROAMER_STATE_FILE, 'utf8')).current_target).toEqual({
+    tmux: old, claude_pid: a.child.pid, cwd: a.cwd, session_id: a.sid })
+  expect(d.f.history.filter(h => h.item_id === first.id).map(h => h.body.outcome)).toEqual(['in_session', 'cut'])
+  expect(first).toMatchObject({ state: 'waiting', reason: 'cut', session_id: 'main' })
+  expect(d.f.calls.filter(c => c.path.endsWith('/take') && c.body.item_ids.includes(first.id))).toHaveLength(1)
+  a.accept(a.got[1])
+  await waitFor(() => second.claim?.session_id === a.sid)
+  appendFileSync(oldTranscript, JSON.stringify({ type: 'system', subtype: 'turn_duration' }) + '\n')
+  await Bun.sleep(300)
+  expect(second.state).toBe('claimed')
+  a.stop()
+  await waitFor(() => second.state === 'completed', 9000)
+  expect(second.session_id).toBe('main')
+}, 16000)
+
+test('a final Stop before a same-PID switch completes the old row with only its own replies', async () => {
+  const d = await daemon({ ...roamerEnv, ONSEN_BRIDGE_WAIT_MS: '10' }, 200, roamerState), a = await target(d)
+  a.select()
+  const old = d.f.add('answered-before-clear')
+  await waitFor(() => a.got.length === 1)
+  a.accept(a.got[0]); await waitFor(() => old.claim?.session_id === a.sid)
+  const reply = async (text: string) => {
+    const result = await a.client.callTool({ name: 'reply', arguments: { chat_id: '1', text } })
+    return /onsen:(\d+)/.exec(JSON.stringify(result.content))?.[1]
+  }
+  const first = await reply('from the old session')
+  expect(first).toBeTruthy()
+  // Draining the old transcript takes several ticks. Both UUIDs share this PID and MCP stream.
+  appendFileSync(a.transcript, JSON.stringify({ type: 'assistant', message: { content: 'x'.repeat(16 << 20) } }) + '\n')
+  a.stop(); a.switchSession()
+  const nextReply = await reply('from the replacement session')
+  expect(nextReply).toBeTruthy(); expect(nextReply).not.toBe(first)
+  await waitFor(() => old.state === 'completed')
+  expect(old.response_message_ids).toEqual([first])
+  expect(d.f.history.filter(h => h.item_id === old.id).map(h => h.body.outcome)).toEqual(['in_session', 'completed'])
+  const fresh = d.f.add('for-the-replacement')
+  await waitFor(() => a.got.length === 2)
+  expect(a.got[1].content).toBe(fresh.id)
+  a.accept(a.got[1]); await waitFor(() => fresh.claim?.session_id === a.sid)
+  expect(d.f.calls.filter(c => c.path.endsWith('/take') && c.body.item_ids.includes(old.id))).toHaveLength(1)
+}, 14000)
+
+test('after a daemon restart a long turn still ends on its original target transcript', async () => {
+  const d = await daemon(roamerEnv, 200, roamerState), a = await target(d), b = await target(d)
+  a.select()
+  const row = d.f.add('carry turn', 'message', { session_id: null })
+  await waitFor(() => a.got.length === 1)
+  a.accept(a.got[0])
+  await waitFor(() => row.claim?.session_id === a.sid)
+  b.select()
+  appendFileSync(a.transcript, JSON.stringify({ type: 'assistant', message: { content: 'x'.repeat(2 << 20) } }) + '\n')
+  await d.restart()
+  a.stop()
+  await waitFor(() => row.state === 'completed', 9000)
+  expect(d.f.history.filter(h => h.item_id === row.id).map(h => h.body.outcome)).toEqual(['in_session', 'completed'])
+  expect(row.session_id).toBe(a.sid)
+  expect(b.got).toHaveLength(0)
+}, 15000)
+
+test('a missed item waits through fresh peeks and restart until its session changes state', async () => {
+  const d = await daemon(roamerEnv, 200, roamerState), a = await target(d)
+  a.select()
+  // Server-stamped taken_at leaves one second of the normal 20 s acceptance window.
+  d.f.advance(-19_000)
+  const row = d.f.add('unseen', 'message', { created_at: new Date().toISOString() })
+  await waitFor(() => row.reason === 'not_taken')
+  d.f.advance(Date.now() - d.f.now()) // later arrivals and the restarted probe share the selection clock
+  expect(a.got.filter(n => n.content === row.id)).toHaveLength(1)
+  a.status('idle') // refreshing the same status timestamp is not a state change
+  await Bun.sleep(1300)
+  expect(row.failures).toBe(1)
+  expect(a.got.filter(n => n.content === row.id)).toHaveLength(1)
+  await d.restart()
+  await a.connect()
+  const other = d.f.add('still-receiving')
+  await waitFor(() => a.got.some(n => n.content === other.id))
+  expect(row.failures).toBe(1)
+  expect(row.state).toBe('waiting')
+  expect(a.got.filter(n => n.content === row.id)).toHaveLength(1)
+  a.status('busy')
+  await Bun.sleep(350)
+  a.status('idle')
+  await waitFor(() => a.got.filter(n => n.content === row.id).length === 2)
+  a.accept(a.got.filter(n => n.content === row.id)[1])
+  await waitFor(() => row.claim?.session_id === a.sid)
+  expect(row.failures).toBe(1)
+}, 16000)
+
+test('a missed session can change state while a different busy target is selected', async () => {
+  const d = await daemon(roamerEnv, 200, roamerState), a = await target(d), b = await target(d)
+  a.select(); b.status('busy')
+  d.f.advance(-19_000)
+  const row = d.f.add('await-edge', 'message', { created_at: new Date().toISOString() })
+  await waitFor(() => row.reason === 'not_taken')
+  d.f.advance(Date.now() - d.f.now()) // the next take gets a fresh acceptance window
+  b.select()
+  await Bun.sleep(400)
+  a.status('busy')
+  await Bun.sleep(400)
+  a.status('idle')
+  await Bun.sleep(400)
+  expect(b.got).toHaveLength(0)
+  a.select()
+  await waitFor(() => a.got.length === 2)
+  a.accept(a.got[1])
+  await waitFor(() => row.claim?.session_id === a.sid)
+  expect(row.failures).toBe(1)
+}, 12000)
+
+test('changing target during take delivers only to the UUID selected at arrival', async () => {
+  const d = await daemon(roamerEnv, 200, roamerState)
+  const a = await target(d), b = await target(d)
+  a.select()
+  d.f.delayTake(500)
+  const row = d.f.add('moves')
+  await waitFor(() => !!row.claim)
+  b.select()
+  await waitFor(() => a.got.length === 1)
+  expect(a.got[0].content).toBe('moves')
+  a.accept(a.got[0])
+  await waitFor(() => row.claim?.session_id === a.sid)
+  expect(b.got).toHaveLength(0)
+  expect(d.f.calls.filter(c => c.path.endsWith('/take') && c.body.item_ids.includes(row.id))).toHaveLength(1)
+}, 12000)
+
+test('album parts arriving on opposite sides of a roam stay in their respective sessions', async () => {
+  const d = await daemon(roamerEnv, 200, roamerState), a = await target(d), b = await target(d)
+  const part = (id: string) => {
+    const row = d.f.add(id)
+    Object.assign(row.payload, { media_group_id: 'split-album', kind: 'document',
+      attachments: [{ kind: 'document', name: id + '.pdf', client_ref: id, mime: 'application/pdf' }] })
+    return row
+  }
+  a.select()
+  const left = part('left')
+  await waitFor(() => d.log().includes('handed to the'))
+  expect(a.got).toHaveLength(0)
+  b.select()
+  const right = part('right')
+  await waitFor(() => a.got.length === 1 && b.got.length === 1)
+  for (const [target, row] of [[a, left], [b, right]] as const) {
+    expect(target.got[0].meta.attachment_name).toBe(row.id + '.pdf')
+    expect(target.got[0].meta.attachment_name_2).toBeUndefined()
+    target.accept(target.got[0])
+    await waitFor(() => row.claim?.session_id === target.sid)
+  }
+  expect(d.f.calls.filter(c => c.path.endsWith('/take')).map(c => c.body.item_ids).sort()).toEqual([['left'], ['right']])
+}, 12000)
+
+test('a busy arrival and a late first peek keep A across a switch to B and a daemon restart', async () => {
+  const d = await daemon(roamerEnv, 200, roamerState), a = await target(d), b = await target(d)
+  a.status('busy'); a.select()
+  await waitFor(() => d.f.calls.some(c => c.path.endsWith('/observation') && c.body.sessions?.some((s: any) => s.activity === 'running')))
+  const arrived = new Date().toISOString()
+  const deferred = d.f.add('deferred-for-A', 'mail', { not_before: new Date(Date.now() + 1200).toISOString() })
+  await Bun.sleep(30)
+  b.select()
+  const fresh = d.f.add('fresh-for-B')
+  await waitFor(() => b.got.length === 1)
+  expect(b.got[0].content).toBe(fresh.id)
+  b.accept(b.got[0]); await waitFor(() => fresh.claim?.session_id === b.sid)
+  await d.restart(); await a.connect(); await b.connect()
+  const delayed = d.f.add('late-first-peek-for-A', 'message', { created_at: arrived, session_id: 'main' })
+  await Bun.sleep(400)
+  expect([deferred.claim, delayed.claim]).toEqual([null, null])
+  a.status('idle')
+  await waitFor(() => a.got.length === 2)
+  expect(a.got.map(n => n.content).sort()).toEqual([deferred.id, delayed.id].sort())
+  for (const msg of a.got) a.accept(msg)
+  await waitFor(() => [deferred, delayed].every(row => row.claim?.session_id === a.sid))
+  expect(b.got.map(n => n.content)).toEqual([fresh.id])
+}, 16000)
+
+test('cut waits with its warning while A is gone and resumes only in A under its new PID', async () => {
+  const d = await daemon(roamerEnv, 200, roamerState), a = await target(d), b = await target(d)
+  a.select()
+  const rows = [d.f.add('preset-main'), d.f.add('filled-uuid', 'message', { session_id: null })]
+  await waitFor(() => a.got.length === 2)
+  for (const msg of a.got) a.accept(msg)
+  await waitFor(() => rows.every(row => row.claim?.session_id === a.sid))
+  b.select(); a.child.kill(); await a.child.exited
+  await waitFor(() => rows.every(row => row.state === 'waiting' && row.reason === 'cut'))
+  await d.restart(); await b.connect()
+  const fresh = d.f.add('B-stays-available')
+  await waitFor(() => b.got.length === 1)
+  expect(b.got[0].content).toBe(fresh.id)
+  for (const row of rows) {
+    expect(row.claim).toBeNull(); expect(row.reason).toBe('cut')
+    expect(d.f.calls.filter(c => c.path.endsWith('/take') && c.body.item_ids.includes(row.id))).toHaveLength(1)
+  }
+  const resumed = await target(d, a.sid)
+  expect(resumed.child.pid).not.toBe(a.child.pid)
+  await waitFor(() => resumed.got.length === 2)
+  expect(resumed.got.map(m => m.content).sort()).toEqual(rows.map(r => r.id).sort())
+  for (const msg of resumed.got) resumed.accept(msg)
+  await waitFor(() => rows.every(row => row.claim?.session_id === a.sid))
+  expect(rows.map(row => row.session_id)).toEqual(['main', a.sid])
+  expect(b.got).toHaveLength(1)
+}, 16000)
+
+test('an older cut recovers the first intake UUID from detail and keeps an ambiguous preset waiting', async () => {
+  const d = await daemon(roamerEnv, 200, roamerState), a = await target(d), b = await target(d)
+  b.select()
+  const fresh = d.f.add('new-in-B')
+  await waitFor(() => b.got.length === 1)
+  const legacy = (id: string, received: string) => {
+    const row = d.f.add(id, 'message', { reason: 'cut', failures: 1, session_id: 'main' })
+    row.events!.push({ kind: 'in_session', session_id: received, note: null }, { kind: 'cut', note: null })
+    return row
+  }
+  const known = legacy('old-known', a.sid), ambiguous = legacy('old-main-only', 'main')
+  known.events!.push({ kind: 'in_session', session_id: b.sid, note: null }, { kind: 'cut', note: null })
+  await waitFor(() => a.got.length === 1)
+  expect(a.got[0].content).toBe(known.id)
+  a.accept(a.got[0]); await waitFor(() => known.claim?.session_id === a.sid)
+  expect(b.got.map(m => m.content)).toEqual([fresh.id])
+  expect(ambiguous).toMatchObject({ state: 'waiting', reason: 'cut', claim: null })
+  expect(d.f.calls.some(c => c.path.endsWith('/take') && c.body.item_ids.includes(ambiguous.id))).toBe(false)
+}, 12000)
 
 function command(d: Awaited<ReturnType<typeof daemon>>, id: string, text: string, tgId: string) {
   return d.f.add(id, 'control', { message_id: 'm-' + id, payload: { message_id: 'm-' + id, from: 'joey', conversation_id: 'conv',
