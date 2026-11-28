@@ -20,7 +20,7 @@ import { forwardFrom, inboundShape } from '../onsen-client.ts'
 import { mimeOf, telegramFile, TG_BOT_FILE_MAX } from '../onsen-files.ts'
 import { richToMarkdown } from '../rich-inbound.ts'
 import type { Agent } from './agent.ts'
-import { chatWrite, isGroup, mentionedMembers, messageKey } from './groups.ts'
+import { chatWrite, isGroup, messageKey, telegramMentions } from './groups.ts'
 import { errCode, errSaid, retryable, type Answer, type OnsenClient } from './onsen.ts'
 import type { StateStore } from './state.ts'
 import { approvals, dmCommandGate, doneApproval, gate, mayAct, pairingText, PAIRED_TEXT } from './tg-access.ts'
@@ -39,7 +39,6 @@ type Entry = { u: any; id: number; done: boolean; kind: 'write' | 'local'; arriv
 export type PollerDeps = {
   onsen: OnsenClient
   state: StateStore
-  agents: ReadonlyMap<string, Agent>
   unknownChatEndpoints: Set<string>
   log: Log
   now?: () => number
@@ -417,7 +416,7 @@ export class Poller {
       } else e.cache.photo = shape.kind === 'photo'
       const fo = m.forward_origin
       e.cache.body = {
-        member: a.member, client_user_id: String(m.from.id), mentions: mentionedMembers(m, this.d.agents.values()),
+        member: a.member, client_user_id: String(m.from.id), mentions: telegramMentions(m),
         client_user: { username: m.from.username ?? null, display_name: [m.from.first_name, m.from.last_name].filter(Boolean).join(' ') || null },
         chat, client_msg_id: String(m.message_id), sent_at: new Date((m.date ?? 0) * 1000).toISOString(), text,
         // WO-179 (Onsen 0.39.5): a group's own name, for display (the conversation's title); null in a DM

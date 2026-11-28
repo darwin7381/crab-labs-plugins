@@ -118,18 +118,49 @@ test('basic-group keys include stable album, file and forward identities', () =>
   expect(key(rich('bot-a-pic', '甲'))).not.toBe(key(rich('bot-a-pic', '乙')))
 })
 
-test('entities, text mentions by id and patterns name carried members even on another bot', async () => {
-  const msg = { from, chat: supergroup, date }
+test('each writer forwards all Telegram account mentions, including new ones on a duplicate', async () => {
+  const req = spyOn(bridge.onsen, 'req')
+  const msg = { from, chat: group, date }
   const caption = '👋 @LAB_B_BOT @unknown A B'
-  tg.push(a, { message: { ...msg, message_id: 1, caption, caption_entities: [
-    { type: 'mention', offset: 3, length: 10 }, { type: 'mention', offset: 14, length: 8 },
-    { type: 'text_mention', offset: 23, length: 1, user: { id: 101 } }, { type: 'text_mention', offset: 25, length: 1, user: { id: 102 } },
+  const entities = [{ type: 'mention', offset: 3, length: 10 }, { type: 'mention', offset: 14, length: 8 },
+    { type: 'text_mention', offset: 23, length: 1, user: { id: 303, username: 'other_bot' } },
+    { type: 'text_mention', offset: 25, length: 1, user: { id: 404 } }]
+  tg.push(a, { message: { ...msg, message_id: 1, caption, caption_entities: entities.slice(0, 2) } })
+  await confirmed()
+  tg.push(b, { message: { ...msg, message_id: 81, caption, caption_entities: entities } })
+  await confirmed()
+  const posts = req.mock.calls.filter(c => c[1] === '/bridge/messages').map(c => c[2] as any)
+  const key = 'tg:' + messageKey('lab-a', { ...msg, caption })
+  expect(posts.map(p => [p.member, p.idem_key, p.mentions])).toEqual([
+    ['lab-a', key, ['@LAB_B_BOT', '@unknown']],
+    ['lab-b', key, ['@LAB_B_BOT', '@unknown', '@other_bot', '404']],
+  ])
+  expect(onsen.messages).toHaveLength(1)
+  expect(bridge.agents.get('lab-b')!.stats.duplicates).toBe(1)
+  tg.push(a, { message: { ...msg, message_id: 2, text: '/help@remote_bot @remote_bot', entities: [
+    { type: 'bot_command', offset: 0, length: 16 }, { type: 'mention', offset: 17, length: 11 },
   ] } })
-  tg.push(a, { message: { ...msg, message_id: 2, text: '@lab_b_bot', entities: [{ type: 'mention', offset: 0, length: 10 }] } })
   tg.push(a, { message: { ...msg, message_id: 3, text: '小乙' } })
   tg.push(a, { message: { ...msg, message_id: 4, text: 'reply', reply_to_message: { message_id: 2, from: { username: 'lab_b_bot' } } } })
   await confirmed()
-  expect(onsen.messages.map(m => m.mentions)).toEqual([['lab-b', 'lab-a'], ['lab-b'], ['lab-b'], []])
+  expect(onsen.messages.slice(1).map(m => m.mentions)).toEqual([['@remote_bot', '@remote_bot'], [], []])
+})
+
+test('nested rich text keeps its basic-group key when the second bot sees more mention entities', async () => {
+  const calls = spyOn(bridge.onsen, 'req')
+  const rich = (text: unknown) => ({ blocks: [{ type: 'blockquote', blocks: [{ type: 'paragraph', text }] }] })
+  const message = { chat: group, from, date, message_id: 7 }
+  tg.push(a, { message: { ...message, rich_message: rich('@far_bot /help@next_bot 客人') } })
+  await confirmed()
+  tg.push(b, { message: { ...message, message_id: 81, rich_message: rich([
+    { type: 'mention', username: 'far_bot' }, ' ', { type: 'bot_command', bot_command: '/help@next_bot' },
+    ' ', { type: 'text_mention', user_id: 404, text: '客人' },
+  ]) } })
+  await confirmed()
+  const posts = calls.mock.calls.filter(c => c[1] === '/bridge/messages').map(c => c[2] as any)
+  expect(posts.map(p => p.mentions)).toEqual([[], ['@far_bot', '@next_bot', '404']])
+  expect(posts[0].idem_key).toBe(posts[1].idem_key)
+  expect(onsen.messages).toHaveLength(1)
 })
 
 test('membership transitions and migration are ordered PUTs; the new chat still needs its own allowlist entry', async () => {

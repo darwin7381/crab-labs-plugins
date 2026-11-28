@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import { expandHiddenEntities } from '../entities.ts'
+import { richText } from '../rich-inbound.ts'
 import type { Agent } from './agent.ts'
 
 export function isGroup(chat: { type?: string } | undefined): boolean {
@@ -8,8 +9,17 @@ export function isGroup(chat: { type?: string } | undefined): boolean {
 
 /** Rich blocks can contain nested files. Keep the content and stable file identity in a deterministic order. */
 function richContent(value: any): unknown {
-  if (Array.isArray(value)) return value.map(richContent)
+  if (Array.isArray(value)) {
+    const parts: unknown[] = []
+    for (const entry of value) {
+      const part = richContent(entry), last = parts.at(-1)
+      if (typeof last === 'string' && typeof part === 'string') parts[parts.length - 1] = last + part
+      else parts.push(part)
+    }
+    return parts.length === 1 && typeof parts[0] === 'string' ? parts[0] : parts
+  }
   if (value == null || typeof value !== 'object') return value
+  if (value.type === 'mention' || value.type === 'text_mention' || value.type === 'bot_command') return richText(value)
   if (value.file_unique_id) return { file_unique_id: value.file_unique_id }
   return Object.fromEntries(Object.keys(value).filter(k => k !== 'file_id').sort().map(k => [k, richContent(value[k])]))
 }
@@ -19,7 +29,9 @@ function basicGroupHash(m: any): string {
   const text = m.text ?? m.caption ?? ''
   const hash = createHash('sha256').update(text)
   const details: Record<string, unknown> = {}
-  const expanded = expandHiddenEntities(text, m.text != null ? m.entities : m.caption_entities)
+  // The second bot can contribute mentions the first did not see on this same message.
+  const entities = m.text != null ? m.entities : m.caption_entities
+  const expanded = expandHiddenEntities(text, entities?.filter((e: { type: string }) => e.type === 'text_link'))
   if (expanded !== text) details.expanded = expanded
   if (m.rich_message) details.rich = richContent(m.rich_message)
   if (m.media_group_id != null) details.album = m.media_group_id
@@ -46,27 +58,34 @@ export function messageKey(member: string, m: any): string {
   return `${chat}:${m.from.id}:${m.date}:${basicGroupHash(m)}`
 }
 
-export function mentionedMembers(m: any, agents: Iterable<Agent>): string[] {
-  const bots = [...agents].filter(a => a.accepted && a.state !== 'conflict' && a.username)
+/** Classic entities carry offsets into the message. Rich text nodes carry their target or label directly. */
+function mentionAccount(entity: any, label?: string): string | undefined {
+  if (entity.type === 'mention') return entity.username ? '@' + entity.username : label ?? richText(entity.text)
+  if (entity.type === 'text_mention') {
+    if (entity.user?.username) return '@' + entity.user.username
+    const id = entity.user?.id ?? entity.user_id
+    if (id != null) return String(id)
+  }
+  if (entity.type === 'bot_command') return String(entity.bot_command ?? label ?? richText(entity.text)).match(/^\/[\w-]+(@\w+)$/)?.[1]
+}
+
+function collectRichMentions(node: any, accounts: string[]): void {
+  if (!node || typeof node !== 'object') return
+  const account = mentionAccount(node)
+  if (account) accounts.push(account)
+  for (const child of Object.values(node)) collectRichMentions(child, accounts)
+}
+
+/** Send the Telegram account references in order. Onsen resolves them against every bridge's endpoints. */
+export function telegramMentions(m: any): string[] {
   const text: string = m.text ?? m.caption ?? ''
-  const names = new Set<string>()
+  const accounts: string[] = []
   for (const e of (m.text != null ? m.entities : m.caption_entities) ?? []) {
-    let bot: Agent | undefined
-    if (e.type === 'mention') {
-      const tag = text.slice(e.offset, e.offset + e.length).toLowerCase()
-      bot = bots.find(a => tag === '@' + a.username.toLowerCase())
-    } else if (e.type === 'text_mention') {
-      bot = bots.find(a => a.botId === String(e.user?.id))
-    }
-    if (bot) names.add(bot.member)
+    const account = mentionAccount(e, text.slice(e.offset, e.offset + e.length))
+    if (account) accounts.push(account)
   }
-  for (const bot of bots) {
-    if (!text || names.has(bot.member)) continue
-    for (const pattern of bot.access()?.mentionPatterns ?? []) {
-      try { if (new RegExp(pattern, 'i').test(text)) { names.add(bot.member); break } } catch {}
-    }
-  }
-  return [...names]
+  collectRichMentions(m.rich_message?.blocks, accounts)
+  return accounts
 }
 
 type ChatWrite = { kind: 'membership' | 'migration'; path: string; body: { state: 'in' | 'left'; at: string } | { moved_to: string } }

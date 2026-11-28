@@ -143,7 +143,7 @@ describe('stage two', () => {
     await until(() => tg.unconfirmed(TOK) === 0, 5000, 'all done')
     const inGroup = onsen.messages.slice(before)
     expect(inGroup.map(x => [x.client_msg_id, x.chat, x.chat_title, x.mentions])).toEqual([
-      ['501', String(GROUP), 'Lab', []], ['502', String(GROUP), 'Lab', ['gamma']], ['503', String(GROUP), 'Lab', ['gamma']],
+      ['501', String(GROUP), 'Lab', []], ['502', String(GROUP), 'Lab', ['@gamma_bot']], ['503', String(GROUP), 'Lab', ['@gamma_bot']],
     ])
     expect(onsen.identities.get(String(GUEST))).toBe(`tg-${GUEST}`)                            // Onsen made the stranger a guest
     expect(tg.sentTo(TOK, String(GROUP)).length).toBe(0)

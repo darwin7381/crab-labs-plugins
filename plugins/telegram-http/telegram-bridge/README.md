@@ -39,7 +39,8 @@ The bridge registers as the extension `telegram-bridge-<machine>`, kind `bridge`
 
 - **Polling.** `getUpdates` with `allowed_updates` `message, edited_message, callback_query, message_reaction, my_chat_member`.
 - **Confirming.** An update is confirmed to Telegram (the next offset passes it) only once it is done. The first update not done holds the offset, so a restart gets it again.
-- **Gate.** That agent's `access.json`, ported from `server.ts`: DM allowlist, pairing codes (written into `access.json` as before; `approved/<id>` → "Paired! Say hi to Claude."), group allowlists and allowed senders. The bridge forwards mentions of its bots as member names. Onsen selects recipients. A corrupt `access.json` refuses everything for that bot; it is not moved aside.
+- **Gate.** That agent's `access.json`, ported from `server.ts`: DM allowlist, pairing codes (written into `access.json` as before; `approved/<id>` → "Paired! Say hi to Claude."), group allowlists and allowed senders. A corrupt `access.json` refuses everything for that bot; it is not moved aside.
+- **Mentions.** Each incoming message carries the Telegram accounts mentioned in its text, caption or rich text, including the target of a bot command. Each entry is an `@username`, or a decimal Telegram user ID for a text mention without a username. Onsen maps accounts to members and merges new mentions on duplicate writes.
 - **A message.**
   1. Its file is fetched from Telegram (≤ 20 MB) and stored with `POST /v1/files`.
   2. A voice note carries the audio and its caption. Without a caption, `text` is the empty string. Onsen transcribes the audio on arrival.
