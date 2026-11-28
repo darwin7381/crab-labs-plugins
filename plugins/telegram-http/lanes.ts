@@ -3521,18 +3521,19 @@ export function offerMissed(id: string): void { main.offerMissed(id) }
 let onGateOpen: (() => void) | undefined
 export function observeItemGates(open?: () => void): void { onGateOpen = open }
 
-export function editWaitingItem(item: ItemRef, content: string, at: string): void {
-  if (main.replaceQueued('', '', p => ({ content, meta: { ...p.meta, edited_at: at } }), item).length) return
+export function updateWaitingItem(item: ItemRef, edit?: { content: string; at: string }): void {
+  if (main.replaceQueued('', '', edit && (p => ({ content: edit.content, meta: { ...p.meta, edited_at: edit.at } })), item).length) return
   const replace = (ev: InEvent): boolean => {
-    const ref = ev.onsen_items?.find(r => r.onsen_item_id === item.onsen_item_id)
-    if (!ref) return false
-    Object.assign(ref, item)
-    ev.text = content
+    const i = ev.onsen_items?.findIndex(r => r.onsen_item_id === item.onsen_item_id) ?? -1
+    if (i < 0) return false
+    ev.onsen_items![i] = item
+    if (edit) ev.text = edit.content
     return true
   }
   for (const run of queue.values()) {
-    if (run.state === 'queued' && runEvents(run).some(replace)) {
-      runRec(run, 'queued', { ev: lightEv(run.ev), extra: run.extra?.map(lightEv) })
+    if (runEvents(run).some(replace)) {
+      const record = journal.get('run', run.rid!)!
+      journal.write('run', record.id, record.state, { ev: lightEv(run.ev), extra: run.extra?.map(lightEv), steered: run.steered?.map(lightEv) })
       return
     }
   }

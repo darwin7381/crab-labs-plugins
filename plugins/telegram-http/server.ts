@@ -4962,8 +4962,12 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
  *  WO-158: an item Onsen 0.9.4 marks `unverified: true` (only a relay can: a name it passes on without vouching for it, e.g. a BTCC console release) gets
  *  the verdict the same message pushed through BTCC unverified gets today (mesh-identity.ts resolveInbound, a forwarder without verified_from):
  *  verified=false, and forged when the name is an identity that signs (dropped and filed, as on /inject). */
-async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
+async function routeInboxItem(row: InboxItem, change?: 'edited' | 'version'): Promise<void> {
   const item = itemRef(row)
+  if (change) {
+    Lanes.updateWaitingItem(item, change === 'edited' ? { content: String(row.payload.text ?? ''), at: row.updated_at } : undefined)
+    return
+  }
   if (itemClaims?.completed(row.id)) {
     const result = await itemReceiver!.receive([item])
     if (result.given.has(row.id)) itemReceiver!.report([item], 'completed')
@@ -4973,7 +4977,6 @@ async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
   const prefix = [item.note, item.half_done ? '上一回合被打斷，接著做。' : ''].filter(Boolean).join('\n')
   if (prefix) payload.text = prefix + '\n' + (payload.text ?? '')
   if (row.kind === 'message' || row.message_id) {
-    if (edit && row.reason !== 'reassigned') { Lanes.editWaitingItem(item, String(payload.text ?? ''), row.updated_at); return }
     const arrived = await personArrived({ item, kind: 'person_message', seq: row.number, dedupe: 'item:' + row.id, payload })
     if (arrived.code !== 200) throw new Error('person delivery: HTTP ' + arrived.code)
     if (arrived.json.dropped) {

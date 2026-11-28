@@ -37,7 +37,7 @@ export class ItemPeek {
   private request?: AbortController
 
   constructor(readonly mode: TakeMode, readonly index: () => Map<string, number>,
-    readonly route: (it: InboxItem, edit: boolean) => Promise<void>, readonly canRead: () => boolean) {}
+    readonly route: (it: InboxItem, change?: 'edited' | 'version') => Promise<void>, readonly canRead: () => boolean) {}
 
   reset(): void {
     this.generation++
@@ -74,6 +74,15 @@ export class ItemPeek {
     this.due.unref()
   }
 
+  private async routeWaiting(row: InboxItem, heldVersion?: number): Promise<void> {
+    if (heldVersion === undefined) return this.route(row)
+    const detail = await this.mode.req('GET', '/v1/items/' + encodeURIComponent(row.id))
+    if (detail?.status === 404) return
+    if (detail?.status !== 200) throw new Error('could not read item history for ' + row.id)
+    const current: InboxItem = detail.json.data
+    if (current.state === 'waiting') await this.route(current, current.events?.at(-1)?.kind === 'edited' ? 'edited' : 'version')
+  }
+
   async poll(): Promise<void> {
     if (!this.mode.active || this.reading) return
     this.reading = true
@@ -107,7 +116,7 @@ export class ItemPeek {
           if (failure && failure.at > Date.now()) this.wake(failure.at)
           else if ((failure || this.previous.get(it.id) !== it.version) && this.seen.get(it.id) !== it.version) {
             try {
-              await this.route(it, version !== undefined)
+              await this.routeWaiting(it, version)
               this.failures.delete(it.id)
               if (g !== this.generation) return
               this.routed = true

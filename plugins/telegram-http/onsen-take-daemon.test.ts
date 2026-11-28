@@ -122,11 +122,17 @@ test('real daemon routes one unclaimed notification per album at count or 1.5 s 
     return row
   }
   const records = (group: string) => d.journal().filter(l => l.rec === 'msg' && l.notif?.params?.meta?.media_group_id === group)
-  add('a', 'album', 3); add('b', 'album', 3)
+  const a = add('a', 'album', 3); add('b', 'album', 3)
   await Bun.sleep(120); expect(records('album')).toHaveLength(0)
   add('c', 'album', 3)
   await waitFor(() => records('album').length > 0)
   expect(records('album')).toHaveLength(1); expect(records('album')[0].onsen_items.map((r: any) => r.onsen_item_id)).toEqual(['a', 'b', 'c'])
+  const original = records('album')[0].notif
+  a.reason = 'not_taken'; d.f.change(a, 'not_taken')
+  await waitFor(() => d.journal().some(l => l.onsen_items?.some((i: any) => i.onsen_item_id === a.id && i.onsen_version === a.version)))
+  expect(records('album')).toHaveLength(1)
+  expect(records('album')[0].notif).toEqual(original)
+  expect(d.journal().some(l => l.edited_in_queue)).toBe(false)
   add('x', 'window'); await Bun.sleep(300); add('y', 'window')
   await Bun.sleep(1050); expect(records('window')).toHaveLength(0)
   await waitFor(() => records('window').length > 0)
