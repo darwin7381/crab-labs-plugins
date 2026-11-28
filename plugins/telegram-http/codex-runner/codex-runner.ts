@@ -18,6 +18,7 @@ export const ROLE = '外部模型（OpenAI Codex CLI）：審設計、寫程式�
 export const DISPLAY_NAME = 'Codex'
 export const TOOL = 'codex exec'
 const SEND_TEXT_MAX = 4000            // Onsen /send payload.text
+const MISSING_ID_LIMIT = 3
 const RESULT_ATTACH_AT = 3500         // an answer longer than this goes along whole as a file (the body keeps room for the notes)
 const SAY_MAX = 100_000               // an answer recorded in Joey's conversation (Onsen keeps up to 200 000)
 
@@ -221,7 +222,9 @@ export type Att = { name: string | null; mime: string | null; kind: string | nul
 export type JobState = 'lookup' | 'queued' | 'starting' | 'running' | 'finishing' | 'done' | 'failed' | 'skipped'
 export type Job = {
   id: string; source: 'call' | 'person'; key: string; text: string; attachments: Att[]; state: JobState; received_at: string
-  item_id: string; claim_id: string; response_message_ids?: string[]
+  item_id: string; claim_id: string; response_message_ids?: string[]; run_id?: string
+  reply_key?: string; missing_reply_ids?: number; reply_error?: string
+  missing_upload_ids?: Record<string, number>
   call_id?: string | null; number?: number | null; caller?: string; kind?: string
   /** the session's thread (an agent's item); hop: the item's hop, the answer's is one more */
   thread?: string; thread_given?: boolean; hop?: number
@@ -290,6 +293,7 @@ export function contextOf(p: Record<string, any>): string[] {
 const folderOf = (s: string): string => s.replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) || 'conversation'
 const tail = (s: string, lines: number, chars: number): string => { const t = s.split('\n').slice(-lines).join('\n'); return t.length > chars ? '…' + t.slice(-chars) : t }
 const cut = (s: string, n: number): string => s.length <= n ? s : s.slice(0, n - 1) + '…'
+const validId = (id: unknown): boolean => typeof id === 'string' && !!id.trim() || typeof id === 'number' && Number.isSafeInteger(id) && id > 0
 const dur = (ms: number): string => ms >= 60_000 ? `${Math.round(ms / 60_000)} 分鐘` : `${Math.round(ms / 1000)} 秒`
 const size = (n: number): string => n >= 1_048_576 ? `${Math.round(n / 1_048_576)} MB` : `${n} bytes`
 
@@ -360,7 +364,6 @@ export class CodexRunner {
   private readonly peek: ItemPeek
   private readonly receiver: ItemReceiver
   private pendingTake?: Promise<void>
-  private recovered = false
   private readonly obs: ObservationPut
   private procs = new Map<string, ChildProcess | null>()
   private timers = new Set<ReturnType<typeof setTimeout>>()
@@ -380,15 +383,13 @@ export class CodexRunner {
     this.items.watchItemReports(line => this.claims.replay(line), (line, ok) => this.claims.acknowledged(line, ok))
     this.mode = new TakeMode(cfg.agent, this.items.request.bind(this.items), active => {
       if (!active) { this.peek.stop(); return }
-      this.claims.start()
-      if (!this.recovered) { this.recovered = true; this.recover() }
       this.changed()
       this.peek.reset()
     }, msg => this.log('info', msg), machineName(cfg.host))
     this.peek = new ItemPeek(this.mode, () => new Map(), it => this.pendingTake = this.take(it),
       () => !this.claims.blocked() && this.busy().length < cfg.max, cfg.waitS)
     this.receiver = new ItemReceiver(this.mode, this.claims, at => this.peek.dueAt(at))
-    this.obs = new ObservationPut({ agent: cfg.agent, on: () => !this.stopped && this.mode.active, put: (o, t) => this.observe(o, t),
+    this.obs = new ObservationPut({ agent: cfg.agent, on: () => !this.stopped && (this.mode.active || this.claims.held().length > 0), put: (o, t) => this.observe(o, t),
       refresh: () => this.obs.update(this.observation()), exception: line => this.log('warn', `observation rejected: ${JSON.stringify(line).slice(0, 500)}`),
       log: (l, m) => this.log(l, m), now: cfg.now }, cfg.heartbeatMs ? { heartbeatMs: cfg.heartbeatMs } : {})
   }
@@ -436,6 +437,9 @@ export class CodexRunner {
     if (notReady) this.log('error', `${notReady}: every item fails with this note until it is there`)
     else this.log('info', this.cfg.codexHome ? `Codex runs with its own home ${this.cfg.codexHome} (HOME ${this.cfg.childHome})` : 'Codex runs with the inherited home (CODEX_RUNNER_CODEX_HOME=inherit)')
     this.items.start()
+    this.claims.start()
+    this.recover()
+    if (this.claims.held().length) this.changed()
     await this.mode.probe()
     this.later(1_000, () => void this.declareWork(0))
   }
@@ -495,8 +499,10 @@ export class CodexRunner {
       this.claims.report(row.id, 'not_taken')
       return
     }
-    if (this.claims.completed(row.id)) {
-      this.claims.report(row.id, 'completed')
+    const previous = this.state.jobs.findLast(j => j.item_id === row.id && (j.state === 'done' || j.state === 'failed'))
+    if (previous || this.claims.completed(row.id)) {
+      if (previous) this.completeClaim(previous, row.claim!.id)
+      else this.claims.report(row.id, 'completed')
       return
     }
     const p = row.payload, person = row.kind === 'message'
@@ -514,6 +520,8 @@ export class CodexRunner {
     const number = p.msg_id ?? row.refs.find(ref => ref.kind === 'btcc_msg_id')?.value
     const job: Job = { id: 'j' + ++this.state.seq, state: 'starting', received_at: this.iso(), source: person ? 'person' : 'call',
       item_id: row.id, claim_id: row.claim!.id, key: sessionKey(row) ?? 't:' + thread, text: String(p.text ?? p.body ?? ''),
+      reply_key: (person ? 'codex:out:item:' : 'codex-reply:') + row.id,
+      run_id: row.kind === 'schedule' ? String(p.run_id ?? row.refs.find(r => r.kind === 'run')?.value ?? '') : undefined,
       caller: row.from, call_id: row.call_id, conversation_id: p.conversation_id != null ? String(p.conversation_id) : undefined,
       message_id: row.message_id ?? undefined, attachments: Array.isArray(p.attachments) ? p.attachments : [],
       chat: p.client?.chat != null ? String(p.client.chat) : undefined, kind: row.kind, via: p.via, context: contextOf(p),
@@ -543,6 +551,7 @@ export class CodexRunner {
     this.state.last_activity_at = this.iso()
     this.changed()
     try {
+      this.claims.bind(j.item_id, 'main', j.id)
       const conv = this.session(j)
       j.dir = conv.dir
       mkdirSync(join(conv.dir, '.codex-runner'), { recursive: true, mode: 0o700 })
@@ -557,8 +566,7 @@ export class CodexRunner {
       if (this.stopped) return                                      // restart returns this unstarted claim to Onsen
       const notReady = codexHomeReady(this.cfg)                     // Codex's own home missing: this item fails with the note, never runs elsewhere
       if (notReady) throw new Error(notReady)
-      if (!this.mode.active || !this.claims.owns(j.item_id, j.claim_id)) {
-        if (this.claims.owns(j.item_id, j.claim_id)) this.claims.report(j.item_id, 'not_taken')
+      if (!this.claims.owns(j.item_id, j.claim_id)) {
         j.state = 'skipped'; this.after(j); return
       }
       this.spawnRun(j)
@@ -728,7 +736,6 @@ export class CodexRunner {
     this.changed()
     child.on('error', e => { if (j.state === 'running') { j.why = `無法啟動 codex（${e.message}）`; this.exited(j, null, null) } })
     child.on('exit', (code, signal) => this.exited(j, code, signal))
-    if (j.pid) this.claims.bind(j.item_id, 'main', j.id)
     this.armTimeout(j)
   }
   private limit(j: Job): number { return j.dev ? this.cfg.devTimeoutMs : this.cfg.timeoutMs }
@@ -825,6 +832,7 @@ export class CodexRunner {
     try {
       if (j.dev && !j.steps.branch) {
         await this.pushDev(j)
+        if (this.stopped) return
         j.steps.branch = true; this.save()
       }
       // the files
@@ -834,7 +842,18 @@ export class CodexRunner {
           const name = rel === `last-${j.n}.txt` ? `codex-answer-${j.n}.md` : basename(rel)
           let r: Answer = null
           try { r = await this.onsen.upload(join(j.dir!, rel), name, rel === `last-${j.n}.txt` ? 'text/markdown' : mimeOf(rel), `codex-runner:${j.id}:${rel}`) } catch (e) { r = null; this.stats.last_error = String(e) }
-          if (r && (r.status === 200 || r.status === 201) && r.json?.data?.id) j.uploads[rel] = String(r.json.data.id)
+          if (this.stopped) return
+          if (r && r.status >= 200 && r.status < 300) {
+            const id = r.json?.data?.id
+            if (validId(id)) j.uploads[rel] = String(id)
+            else {
+              j.missing_upload_ids ??= {}
+              j.missing_upload_ids[rel] = (j.missing_upload_ids[rel] ?? 0) + 1
+              if (j.missing_upload_ids[rel] < MISSING_ID_LIMIT) { retry = true; continue }
+              j.uploads[rel] = '-'; (j.skipped_files ??= []).push(`${rel}（Onsen 未回傳檔案 ID）`)
+              this.log('warn', `${j.id}: no file ID for ${rel} after ${MISSING_ID_LIMIT} responses`)
+            }
+          }
           else if (r && [400, 403, 404, 409, 413].includes(r.status)) { j.uploads[rel] = '-'; (j.skipped_files ??= []).push(`${rel}（Onsen 不收：HTTP ${r.status}）`); this.log('warn', `${j.id}: ${rel} not uploaded: HTTP ${r.status} ${JSON.stringify(r.json?.error ?? r.json?.detail ?? '').slice(0, 200)}`) }
           else { retry = true; continue }
           this.save()
@@ -844,16 +863,23 @@ export class CodexRunner {
       if (retry) return
       const fileLines = (j.files ?? []).filter(r => j.uploads![r] && j.uploads![r] !== '-')
       if (!j.steps.reply) {
-        const r = j.source === 'call' ? await this.reply(j, ids, fileLines) : await this.answerNew(j, ids)
+        const r = j.source === 'person' ? await this.answerNew(j, ids)
+          : j.kind === 'alert' || j.kind === 'schedule' ? 'ok' : await this.reply(j, ids, fileLines)
+        if (this.stopped) return
         if (r === 'retry') return void (retry = true)
-        if (r === 'refused') j.outcome = 'failed'
+        if (r === 'missing_id') {
+          j.missing_reply_ids = (j.missing_reply_ids ?? 0) + 1
+          if (j.missing_reply_ids < MISSING_ID_LIMIT) return void (retry = true)
+          j.reply_error = `Onsen returned no valid reply message ID after ${MISSING_ID_LIMIT} responses`
+        } else if (r === 'refused') j.reply_error = 'Onsen refused the reply'
+        if (j.reply_error) {
+          this.stats.last_error = j.reply_error
+          this.log('error', `${j.id}: ${j.reply_error}`)
+          j.outcome = 'failed'
+        }
         j.steps.reply = true; this.save()
       }
-      const outcome = j.outcome === 'completed' ? 'completed' : j.timed_out || j.signal || (!j.why && j.pid && j.exit == null) ? 'cut' : 'error'
-      if (this.claims.owns(j.item_id, j.claim_id)) {
-        this.claims.report(j.item_id, outcome, { ...(j.response_message_ids ? { response_message_ids: j.response_message_ids } : {}),
-          ...(outcome === 'cut' ? { half_done: !!j.dir && madeBy(j.dir, j.before ?? {}, j.dev ? 'repo' : undefined).length > 0 } : {}) })
-      }
+      this.completeClaim(j, j.claim_id)
       j.state = j.outcome === 'completed' ? 'done' : 'failed'
       if (j.outcome === 'completed') this.stats.completed++; else this.stats.failed++
       this.after(j)
@@ -863,6 +889,23 @@ export class CodexRunner {
     } finally {
       this.reporting.delete(j.id)
       if (retry) { this.stats.reports_retried++; this.save(); this.later(this.cfg.retryMs, () => void this.report(j)) }
+    }
+  }
+  /** Persist the result before the terminal report. An Item restored under a new claim reuses both the result and the reply. */
+  private completeClaim(j: Job, claim: string): void {
+    j.steps ??= {}
+    if ((j.call_id || j.run_id) && !j.steps.result) {
+      const ids = (j.files ?? []).map(rel => j.uploads?.[rel]).filter((id): id is string => !!id && id !== '-')
+      const text = this.answerBody(j, SEND_TEXT_MAX)
+      const result = { outcome: j.outcome === 'failed' ? 'failed' : 'ok', body: { format: 'markdown' as const, text },
+        ...(ids.length ? { attachment_file_ids: ids } : {}) }
+      if (!this.items.recordCall({ event: j.item_id, idem: 'codex:result:' + j.item_id, call_id: j.call_id ?? null, run_id: j.run_id, body: { result } }))
+        throw new Error('could not spool Call result for ' + j.item_id)
+      j.steps.result = true; this.save()
+    }
+    if (this.claims.owns(j.item_id, claim)) {
+      const note = j.reply_error ?? (j.outcome === 'failed' ? cut(j.result_text ?? 'Codex failed', 1000) : undefined)
+      this.claims.report(j.item_id, 'completed', { response_message_ids: j.response_message_ids ?? [], ...(note ? { note } : {}) })
     }
   }
   /** the job left the busy set: the turn ends when nothing else is busy; the next ones start */
@@ -896,7 +939,7 @@ export class CodexRunner {
     return j.number ?? this.state.sessions[j.key]?.first_number ?? null
   }
   /** the answer to a peer's Call or follow-up, in its inbox (it reaches the caller as every Call's answer does), carrying the session's thread */
-  private async reply(j: Job, ids: string[], files: string[]): Promise<'ok' | 'retry' | 'refused'> {
+  private async reply(j: Job, ids: string[], files: string[]): Promise<'ok' | 'retry' | 'refused' | 'missing_id'> {
     const attachments = files.map((rel, i) => `- ${basename(rel)}：${join(j.dir!, rel)}\n  ${this.cfg.base}/v1/files/${ids[i]}`)
     const list = attachments.length ? '\n\n附件：\n' + cut(attachments.join('\n'), 600) : ''
     const more = this.skippedList(j, 500) + this.devLine(j) + this.threadLine(j)
@@ -908,15 +951,16 @@ export class CodexRunner {
       : cut(answer, Math.max(0, SEND_TEXT_MAX - extras.length - note.length)) + note + extras
     let r: Answer = null
     try {
-      r = await this.onsen.req('POST', '/send', { to: j.caller, kind: 'peer_call', no_reply: true, dedupe: `codex-reply:${j.item_id}:${j.claim_id}`,
+      r = await this.onsen.req('POST', '/send', { to: j.caller, kind: 'peer_call', no_reply: true, dedupe: j.reply_key ?? `codex-reply:${j.item_id}:${j.claim_id}`,
         // no_reply: the answer is the result; the caller owes Codex nothing for it, and an answer to it would be new work for Codex (takes_work), answered
         // again, up to the hop limit (Chiron mesh 12558: his lanes held each result as a call owed an answer)
         payload: { text, reply_to_id: this.replyNumber(j), no_reply: true, ...(j.thread ? { thread: j.thread, hop: (j.hop ?? 0) + 1 } : {}) },
         refs: { thread: j.thread, ...(j.call_id ? { call: j.call_id } : {}) }, ...(ids.length ? { attachment_file_ids: ids } : {}) })
     } catch (e) { this.stats.last_error = String(e) }
-    if (r?.status === 200 && r.json?.results?.[0]?.to === j.caller) {
-      const id = r.json.results[0].message_id
-      if (typeof id === 'string' && /^cm\d+$/.test(id)) j.response_message_ids = [id]
+    if (r && r.status >= 200 && r.status < 300) {
+      const reply = r.json?.results?.[0], id = reply?.message_id
+      if (reply?.to !== j.caller || typeof id !== 'string' || !/^cm\d+$/.test(id)) return 'missing_id'
+      j.response_message_ids = [id]
       return 'ok'
     }
     if (r && refusedForGood(r)) {
@@ -927,22 +971,23 @@ export class CodexRunner {
     return 'retry'
   }
   /** the answer's text in a conversation: the last message, and the files that did not go along */
-  private answerBody(j: Job): string {
-    const more = this.skippedList(j, 800) + this.devLine(j)
-    return cut(cut(j.result_text ?? '', SAY_MAX - more.length) + more, SAY_MAX)
+  private answerBody(j: Job, max = SAY_MAX): string {
+    const more = this.skippedList(j, 800) + this.devLine(j) + this.threadLine(j)
+    const text = [j.reply_error, j.result_text].filter(Boolean).join('\n\n')
+    return cut(cut(text, Math.max(1, max - more.length)) + more, max)
   }
   /** the answer to a person's message (person_message): written new-style into its conversation (Onsen 0.35.0, CONTRACT §7d 連接器這一頭):
    *  conversation_id, no agent / client / chat / client_msg_id / delivery. Onsen decides which bridge draws it (delivery pending until that
    *  bridge reports; sent at write when none has to) */
-  private async answerNew(j: Job, ids: string[]): Promise<'ok' | 'retry' | 'refused'> {
-    const rec = { conversation_id: j.conversation_id, reply_to_message_id: j.message_id, idem_key: `codex:out:item:${j.item_id}:${j.claim_id}`, sent_at: j.ended_at ?? this.iso(), body: this.answerBody(j),
+  private async answerNew(j: Job, ids: string[]): Promise<'ok' | 'retry' | 'refused' | 'missing_id'> {
+    const rec = { conversation_id: j.conversation_id, reply_to_message_id: j.message_id, idem_key: j.reply_key ?? `codex:out:item:${j.item_id}:${j.claim_id}`, sent_at: j.ended_at ?? this.iso(), body: this.answerBody(j),
       sender: 'main', turn_id: `codex-${j.id}`, ...(ids.length ? { attachment_file_ids: ids } : {}) }
     let r: Answer = null
     try { r = await this.onsen.req('POST', '/v1/messages', rec) } catch (e) { this.stats.last_error = String(e) }
-    if (r?.status === 200 || r?.status === 201) {
+    if (r && r.status >= 200 && r.status < 300) {
       const d = r.json?.data ?? r.json ?? {}                        // /api/onsen/messages answers {id, duplicate, conversation_id, delivery}
       const id = d.message_id ?? d.id
-      if (id == null) return 'retry'
+      if (!validId(id)) return 'missing_id'
       j.response_message_ids = [String(id)]
       this.log('info', `${j.id}: answer ${d.message_id ?? d.id ?? '?'} written into conversation ${d.conversation_id ?? j.conversation_id}`
         + `${d.duplicate ? ' (already there)' : ''}${d.delivery ? `, delivery ${d.delivery}` : ''}${ids.length ? `, ${ids.length} file(s)` : ''}`)

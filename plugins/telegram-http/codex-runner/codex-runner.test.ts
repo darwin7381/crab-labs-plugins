@@ -22,7 +22,8 @@ class FakeOnsen {
   profiles: any[] = []
   profileStatus: number[] = []
   newStyleStatus: number[] = []
-  replyMessageId?: string
+  replyMessageId: string | null = 'cm500'
+  personWithoutId = false
   fileSeq = 900
   paths: string[] = []
   get observations() { return this.items.calls.filter(c => c.path.endsWith('/observation')).map(c => c.body) }
@@ -30,6 +31,7 @@ class FakeOnsen {
   push(input: Record<string, any>) {
     const { sender, payload, call_id, refs = {}, attachments, dedupe } = input
     const id = call_id ?? dedupe
+    if (call_id) this.items.scheduleCalls.set(call_id, { id: call_id, run: '', result: null })
     return this.items.add(id, 'call', { from: sender, call_id: call_id ?? null,
       refs: Object.entries(refs).map(([kind, value]) => ({ kind, value: String(value) })),
       payload: { conversation_id: 'cv-' + sender, attachments, ...payload } })
@@ -66,7 +68,7 @@ class FakeOnsen {
       if (st !== 200) return this.j(st, {})
       let i = this.records.findIndex(r => r.idem_key === b.idem_key)
       if (i < 0) i = this.records.push(b) - 1
-      return this.j(200, { id: 5001 + i })
+      return this.j(200, this.personWithoutId ? { duplicate: i >= 0 } : { id: 5001 + i })
     }
     if (m === 'PUT' && p === '/v1/members/codex/profile') { this.profiles.push(await req.json()); const st = this.profileStatus.shift() ?? 200; return this.j(st, st === 200 ? { data: { name: 'codex' } } : { error: { code: 'not_found' } }) }
     return null
@@ -79,7 +81,8 @@ afterEach(async () => {
   for (const r of runners.splice(0)) await r.stop({ offline: false })
   for (const o of onsens.splice(0)) {
     await o.stop()
-    expect(o.paths.filter(path => /^\/(?:inbox|forms|v1\/calls|deliveries)(?:\/|$)/.test(path))).toEqual([])
+    expect(o.paths.filter(path => /^\/(?:inbox|forms|deliveries)(?:\/|$)/.test(path))).toEqual([])
+    for (const call of o.items.calls.filter(c => c.path.endsWith('/state'))) expect(Object.keys(call.body)).toEqual(['result'])
   }
   for (const d of tmps.splice(0)) {
     for (const f of [join(d, 'live')]) if (existsSync(f)) for (const pid of readdirSync(f)) { try { process.kill(Number(pid), 'SIGKILL') } catch {} }
@@ -158,7 +161,8 @@ describe('#dev items (Chiron mesh 13257)', () => {
     await r.start()
     await until(() => done(onsen, '9961')() && done(onsen, '9962')(), 20_000, 'both')
     expect(g(bare, 'ls-tree', '--name-only', 'feat/x')).toContain('a.txt')
-    expect(onsen.statesOf('9962')).toEqual(['error'])
+    expect(onsen.statesOf('9962')).toEqual(['in_session', 'completed'])
+    expect(onsen.items.scheduleCalls.get('9962')?.result.outcome).toBe('failed')
     expect(onsen.reply('9962').payload.text).toContain('不認得這個名字')
   }, 40_000)
   test('a ./repo the runner did not make is moved aside, never reused; the base is origin\'s default branch', async () => {
@@ -324,7 +328,9 @@ describe('a Call', () => {
     expect(s.payload.text).toContain('answer to:')
     expect(s.payload.text).toContain(join(folder, 'capy.png'))
     expect(s.attachment_file_ids).toEqual(fin.attachment_file_ids)
-    expect(s.dedupe).toContain('codex-reply:71:')
+    expect(s.dedupe).toBe('codex-reply:71')
+    expect(onsen.items.scheduleCalls.get('71')?.result).toMatchObject({ outcome: 'ok', attachment_file_ids: s.attachment_file_ids,
+      body: { format: 'markdown', text: expect.stringContaining('answer to:') } })
     // the session's thread: on the reply (what the caller's daemon fills in when it reply_to's it) and named in the result
     expect(s.payload.thread).toMatch(/^codex#t-[0-9a-f]{12}$/)
     expect(s.refs).toEqual({ call: '71', thread: s.payload.thread })
@@ -368,7 +374,7 @@ describe('a Call', () => {
     expect(starts.slice(2).every(x => x.dir === folder)).toBe(true)
     expect(starts[3].at).toBeGreaterThanOrEqual(ends[2].at)                   // one session: never two at once
     expect(onsen.statesOf('83')).toEqual(['in_session', 'completed'])
-    expect(onsen.items.rows.get('83')!.response_message_ids).toEqual([]) // /send accepted the reply with only its inbox sequence
+    expect(onsen.items.rows.get('83')!.response_message_ids).toEqual(['cm500'])
     expect(onsen.statesOf('84')).toEqual(['in_session', 'completed'])
     expect(Object.keys(r.state.sessions)).toEqual([`t:${T}`])
   })
@@ -390,7 +396,8 @@ describe('a Call', () => {
     const r = runner(cfg)
     await r.start()
     await until(done(onsen, '91'), 10_000, 'Call 91')
-    expect(onsen.statesOf('91')).toEqual(['in_session', 'error'])
+    expect(onsen.statesOf('91')).toEqual(['in_session', 'completed'])
+    expect(onsen.items.scheduleCalls.get('91')?.result).toMatchObject({ outcome: 'failed', body: { text: expect.stringContaining('boom line 40') } })
     const t = onsen.sends.at(-1)!.payload.text as string
     expect(t).toContain('codex 結束碼 3')
     expect(t).toContain('the model said no')
@@ -399,6 +406,14 @@ describe('a Call', () => {
     expect(t).not.toContain('boom line 10\n')                                 // the last 30 lines only
     await until(() => onsen.sends.length === 1, 5_000, 'the reply')
     expect(onsen.sends[0].payload.text).toContain('沒做完')
+    onsen.items.advance(6 * 60_000)
+    const row = onsen.items.rows.get('91')!
+    row.state = 'waiting'; onsen.items.change(row, 'restored')
+    await until(() => onsen.statesOf('91').length === 3)
+    expect(onsen.statesOf('91')).toEqual(['in_session', 'completed', 'completed'])
+    expect(row.response_message_ids).toEqual(['cm500'])
+    expect(r.stats.runs).toBe(1)
+    expect(onsen.paths.filter(p => p === '/send')).toHaveLength(1)
   })
 
   test('[4] the time limit: SIGTERM, then SIGKILL for a codex that ignores it; failed', async () => {
@@ -407,7 +422,8 @@ describe('a Call', () => {
     const r = runner(cfg)
     await r.start()
     await until(done(onsen, '95'), 10_000, 'Call 95')
-    expect(onsen.statesOf('95').slice(0, 2)).toEqual(['in_session', 'cut'])
+    expect(onsen.statesOf('95')).toEqual(['in_session', 'completed'])
+    expect(onsen.items.scheduleCalls.get('95')?.result.outcome).toBe('failed')
     expect(onsen.sends.at(-1)!.payload.text).toContain('超過 1 秒沒結束，已停止')
     const pid = codexLog().find(x => x.ev === 'start').pid
     let gone = false
@@ -508,7 +524,7 @@ describe('Codex\'s own home (Chiron 08:49Z note 2)', () => {
     const r = runner(cfg)
     await r.start()
     await until(done(onsen, '161'), 10_000, 'Call 161')
-    expect(onsen.statesOf('161')).toEqual(['error'])
+    expect(onsen.statesOf('161')).toEqual(['in_session', 'completed'])
     expect(onsen.sends.at(-1)!.payload.text).toContain('Codex 的專用設定還沒建好')
     expect(codexLog()).toEqual([])
   })
@@ -607,10 +623,12 @@ describe('a person\'s message (person_message, WO-196 stage one)', () => {
   test('from Telegram with a photo: run in its conversation\'s folder, answered new-style into the conversation, the facts on its Telegram numbers', async () => {
     const { onsen, cfg, codexLog } = setup()
     const photo = onsen.file('31', 'photo.png', PNG)
-    onsen.pushPerson(pm(8001, { text: '照這張改 IMG:out.png', kind: 'photo',
+    const row = onsen.pushPerson(pm(8001, { text: '照這張改 IMG:out.png', kind: 'photo',
       attachments: [{ kind: 'photo', name: 'photo.png', mime: 'image/png', bytes: PNG.length, url: photo, client_ref: 'AgACAgUAAx0' }],
       client: { name: 'telegram', chat: '1828173984', msg_id: '4711', user: 'Advac777', user_id: '1828173984' },
       reply_to: { message_id: '7990', client_msg_id: '4700', from: 'codex', text: 'the earlier picture' }, reply_quote: 'the water' }))
+    row.call_id = 'photo-call'
+    onsen.items.scheduleCalls.set(row.call_id, { id: row.call_id, run: '', result: null })
     const r = runner(cfg)
     await r.start()
     await until(() => onsen.statesOf('pm:8001').includes('completed') && r.state.jobs[0]?.state === 'done', 10_000, 'turn_end')
@@ -626,11 +644,12 @@ describe('a person\'s message (person_message, WO-196 stage one)', () => {
     const rec = onsen.records[0]
     expect(Object.keys(rec).sort()).toEqual(NEW_STYLE_KEYS)
     expect(rec).toMatchObject({ conversation_id: '7001', reply_to_message_id: '8001', sender: 'main' })
-    expect(rec.idem_key).toContain('codex:out:item:pm:8001:')
+    expect(rec.idem_key).toBe('codex:out:item:pm:8001')
     expect(rec.turn_id).toBe('codex-j1')
     expect(Number.isNaN(Date.parse(rec.sent_at))).toBe(false)
     expect(rec.body).toContain('answer to: 照這張改')
     expect(rec.attachment_file_ids.map((id: string) => onsen.files.get(id)!.name)).toEqual(['out.png'])
+    expect(onsen.items.scheduleCalls.get('photo-call')!.result).toMatchObject({ outcome: 'ok', attachment_file_ids: rec.attachment_file_ids })
     expect(onsen.items.rows.get('pm:8001')!.response_message_ids).toEqual(['5001'])
     expect(onsen.sends).toEqual([])
     expect(onsen.observations.some(o => o.sessions[0].turn?.trigger?.kind === 'message' && o.sessions[0].turn.trigger.message_id === '8001'
@@ -753,6 +772,84 @@ test('an unsupported control and a silent bell settle without starting codex', a
   await until(() => control.state === 'cancelled' && bell.state === 'completed')
   expect(onsen.statesOf('press')).toEqual(['not_applied'])
   expect(codexLog()).toEqual([])
+})
+
+test('alerts and schedules complete with their Call result and no peer reply', async () => {
+  const { cfg, onsen } = setup()
+  for (const kind of ['alert', 'schedule']) {
+    const call = 'c-' + kind
+    onsen.items.scheduleCalls.set(call, { id: call, run: kind === 'schedule' ? '700' : '', result: null })
+    onsen.items.add(kind, kind, { call_id: kind === 'alert' ? call : null, refs: [{ kind: 'run', value: '700' }],
+      payload: { text: kind === 'alert' ? 'FAIL alert' : 'schedule work' } })
+  }
+  await runner(cfg).start()
+  await until(() => ['alert', 'schedule'].every(id => onsen.statesOf(id).includes('completed')))
+  expect(onsen.items.scheduleCalls.get('c-alert')!.result.outcome).toBe('failed')
+  expect(onsen.items.scheduleCalls.get('c-schedule')!.result.outcome).toBe('ok')
+  expect(onsen.sends).toHaveLength(0)
+  expect(onsen.records).toHaveLength(0)
+})
+
+test('acceptance binds before downloads and a paused probe keeps renewing the held claim', async () => {
+  const { cfg, onsen, codexLog } = setup({ heartbeatMs: 75, now: () => Date.now() + 21_000 })
+  const row = onsen.push({ sender: 'eve', call_id: 'slow', payload: { text: 'check', msg_id: 71 },
+    attachments: [{ name: 'slow.txt', url: onsen.base + '/v1/files/slow' }] })
+  let release!: () => void
+  const downloading = new Promise<void>(resolve => release = resolve)
+  const r = runner(cfg)
+  r.onsen.download = async () => { await downloading; return { ok: false, why: 'no file' } }
+  await r.start()
+  try {
+    await until(() => !!row.in_session_at)
+    expect(codexLog()).toEqual([])
+    onsen.items.mode(409); onsen.items.add('wake-peek', 'mail')
+    await until(() => !(r.health().take as any).active)
+    for (let n = 0; n < 2; n++) {
+      const before = row.claim!.expires_at
+      onsen.items.advance(25_000)
+      await until(() => row.claim?.expires_at !== before)
+    }
+    expect(row.state).toBe('claimed')
+    expect(onsen.observations.at(-1).held_item_ids).toContain(row.id)
+  } finally { release() }
+  await until(done(onsen, 'slow'))
+  expect(onsen.statesOf('slow')).toEqual(['in_session', 'completed'])
+})
+
+for (const person of [true, false]) test('2xx missing the reply ID is bounded across restart and releases the worker, person=' + person, async () => {
+  const { cfg, onsen, codexLog } = setup({ max: 1, retryMs: 200 })
+  onsen.personWithoutId = person
+  onsen.replyMessageId = null
+  const first = person ? onsen.pushPerson(pm(62, { text: 'first' }))
+    : onsen.push({ sender: 'eve', call_id: 'bad-ack', payload: { text: 'first', msg_id: 62 } })
+  const a = runner(cfg)
+  await a.start()
+  await until(() => a.state.jobs[0]?.missing_reply_ids === 1)
+  await a.stop({ offline: false })
+  onsen.items.add('next', 'alert', { payload: { text: 'next job' } })
+  const b = runner(cfg)
+  await b.start()
+  await until(() => onsen.statesOf('next').includes('completed'))
+  expect(onsen.statesOf(first.id)).toEqual(['in_session', 'completed'])
+  expect(onsen.items.history.find(h => h.item_id === first.id && h.body.outcome === 'completed')?.body)
+    .toMatchObject({ response_message_ids: [], note: expect.stringContaining('no valid reply message ID') })
+  expect(onsen.paths.filter(p => p === (person ? '/v1/messages' : '/send'))).toHaveLength(3)
+  expect(person ? onsen.records : onsen.sends).toHaveLength(1)
+  expect(codexLog().filter(l => l.ev === 'start')).toHaveLength(2)
+  expect(b.busy()).toHaveLength(0)
+})
+
+test('a file upload returning 2xx without a file ID is retried three times and listed in the answer', async () => {
+  const { cfg, onsen } = setup()
+  onsen.push({ sender: 'eve', call_id: 'file-ack', payload: { text: 'IMG:output.png', msg_id: 74 } })
+  const r = runner(cfg)
+  let uploads = 0
+  r.onsen.upload = async () => { uploads++; return { status: 201, json: {} } }
+  await r.start()
+  await until(done(onsen, 'file-ack'))
+  expect(uploads).toBe(3)
+  expect(onsen.reply('file-ack').payload.text).toContain('output.png（Onsen 未回傳檔案 ID）')
+  expect(r.busy()).toHaveLength(0)
 })
 
 test('the same item given twice is one job; an attachment off Onsen\'s origin is not fetched with the credential', async () => {

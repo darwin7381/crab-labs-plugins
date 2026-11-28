@@ -48,7 +48,7 @@ const GUARD_MS = 1_000
 export class ObservationPut {
   readonly heartbeatMs: number
   readonly timeoutMs: number
-  /** the observation handed in last, its change key, and when */
+  /** latest observation waiting to be sent, its change key, and when it was computed */
   private latest: { o: Observation; key: string; ms: number } | null = null
   /** the change key of the last one sent, and when it was sent (ms) */
   private sentKey: string | null = null
@@ -94,6 +94,7 @@ export class ObservationPut {
     const now = this.now()
     const changed = l.key !== this.sentKey, beatDue = this.beatNow || now - this.sentAt >= this.heartbeatMs
     if (!changed && !(beatDue && now - l.ms <= this.heartbeatMs)) return
+    this.latest = null
     this.sentKey = l.key; this.sentAt = now; this.beatNow = false
     this.arm()
     this.inflight = true

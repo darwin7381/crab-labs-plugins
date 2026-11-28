@@ -21,11 +21,11 @@ function obs(ms: number, tool: string | null = null): Observation {
 }
 type Call = { body: Observation; timeoutMs: number; resolve: (a: PutAnswer) => void; reject: (e: unknown) => void }
 /** a sender with a stand-in put whose answers the test gives (auto: answer 200 at once); counts the requests in flight at once */
-function rig(o: { on?: () => boolean; auto?: PutAnswer | ((b: Observation) => PutAnswer) | null; heartbeatMs?: number; timeoutMs?: number; refresh?: (s: ObservationPut) => void } = {}) {
+function rig(o: { on?: () => boolean; auto?: PutAnswer | ((b: Observation) => PutAnswer) | null; heartbeatMs?: number; timeoutMs?: number; now?: () => number; refresh?: (s: ObservationPut) => void } = {}) {
   const calls: Call[] = [], exceptions: Array<Record<string, unknown>> = [], logs: string[] = []
   let inFlight = 0, maxInFlight = 0
   const ref: { s?: ObservationPut } = {}
-  const s = new ObservationPut({ agent: 'adam', on: o.on ?? (() => true),
+  const s = new ObservationPut({ agent: 'adam', on: o.on ?? (() => true), now: o.now,
     put: (body, timeoutMs) => new Promise<PutAnswer>((resolve, reject) => {
       inFlight++; maxInFlight = Math.max(maxInFlight, inFlight)
       let settled = false
@@ -71,10 +71,9 @@ describe('WO-180 the observation sender', () => {
   test('unchanged: one every heartbeat, the record computed again for it (refresh), its reported_at new; a change resets the beat', async () => {
     const at: number[] = []
     let n = 0
-    const r = rig({ auto: OK, heartbeatMs: 120, refresh: s => s.update(obs(T0 + 1000 * ++n)) })
-    const t0 = Date.now()
-    r.s.update(obs(T0)); at.push(Date.now() - t0)
-    while (r.calls.length < 4) { await sleep(5); if (r.calls.length > at.length) at.push(Date.now() - t0) }
+    const r = rig({ auto: () => { at.push(Date.now()); return OK }, heartbeatMs: 120, refresh: s => s.update(obs(T0 + 1000 * ++n)) })
+    r.s.update(obs(T0))
+    while (r.calls.length < 4) await sleep(5)
     const gaps = at.slice(1).map((t, i) => t - at[i]!)
     for (const g of gaps) { expect(g).toBeGreaterThanOrEqual(115); expect(g).toBeLessThan(200) }
     expect(r.calls.map(c => c.body.reported_at)).toEqual([0, 1, 2, 3].map(k => new Date(T0 + 1000 * k).toISOString()))   // each one new
@@ -89,10 +88,13 @@ describe('WO-180 the observation sender', () => {
   })
 
   test('a beat with no fresh record (the compute loop stopped, no refresh) sends nothing: the next update sends at once', async () => {
-    const r = rig({ auto: OK, heartbeatMs: 60 })
+    let now = T0
+    const r = rig({ auto: OK, heartbeatMs: 60, now: () => now })
     r.s.update(obs(T0))
-    await sleep(200)
-    expect(r.calls).toHaveLength(1)                                           // the one held is 200 ms old: not reported as alive
+    now += 60
+    await sleep(100)
+    expect(r.calls).toHaveLength(1)                                           // exactly at the boundary, the last snapshot was already sent
+    now = T0 + 200
     r.s.update(obs(T0 + 200))                                                 // unchanged, but the beat is overdue
     expect(r.calls).toHaveLength(2)
     r.s.stop()

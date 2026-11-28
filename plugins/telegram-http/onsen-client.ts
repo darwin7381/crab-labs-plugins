@@ -725,7 +725,7 @@ export class OnsenClient {
     const cred = this.cfg.credential()
     if (!cred) return null
     if (method === 'POST') return this.post(path, body ?? {}, cred, timeoutMs, headers)
-    if (method === 'PUT') return this.put(path, body ?? {}, cred, timeoutMs)      // WO-197: the connector's edit (PUT /v1/messages/<id>)
+    if (method === 'PUT') return this.put(path, body ?? {}, cred, timeoutMs, headers)
     const timeout = AbortSignal.timeout(timeoutMs)
     const r = await this.f(`${this.cfg.base}${path}`, { headers: this.headers(cred, headers), signal: cancel ? AbortSignal.any([cancel, timeout]) : timeout })
     let json: any = null

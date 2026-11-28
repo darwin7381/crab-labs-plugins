@@ -126,7 +126,7 @@ plugins/telegram-http/lanes-wake-rules.json::owner-mail-main
 plugins/telegram-http/lanes-main.ts::batchedRider
 plugins/telegram-http/onsen-client.ts::/threads/events
 plugins/telegram-http/codex-runner/codex-runner.ts::this.receiver.receive([itemRef(peeked)])
-plugins/telegram-http/codex-runner/codex-runner.ts::this.claims.report(j.item_id, outcome,
+plugins/telegram-http/codex-runner/codex-runner.ts::this.claims.report(j.item_id, 'completed', { response_message_ids:
 plugins/telegram-http/onsen-inbox.ts::export function recipientNote
 plugins/telegram-http/onsen-inbox.ts::的主線現在不在線上。例行的事它的分身照常處理；要主線決定的，等它回來才會看到。
 plugins/telegram-http/lanes.ts::找別的 agent。**先判要不要送**。只有三種情況才送：有結果要交給它、你做不了、要它補東西。
