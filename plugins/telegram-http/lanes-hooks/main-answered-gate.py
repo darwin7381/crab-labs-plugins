@@ -240,7 +240,20 @@ def _reason(p, msgs, outs, turn=None, context=None):
     return _missed(p, sid, d, msgs, outs) or _unsent(p, sid, d, msgs, outs, turn, context)
 
 
-def _unsent(p, sid, d, msgs, outs, turn, context=None):
+def take_owed(p, msgs, outs, turn):
+    """Identify unsent results for the current senders. The daemon owns the hold and the Item reports."""
+    by_sender = {}
+    for msg in msgs:
+        if not msg.get('system') and not msg.get('no_reply'):
+            by_sender.setdefault(msg.get('user'), []).append(msg)
+    mids = []
+    for group in by_sender.values():
+        if _unsent(p, p.get('session_id'), lanes_run_dir(p), group, outs, turn, remember=False):
+            mids.extend(m['mid'] for m in group)
+    return {'mids': mids, 'reason': UNSENT_WORDS} if mids else None
+
+
+def _unsent(p, sid, d, msgs, outs, turn, context=None, remember=True):
     """The hold for a turn whose last words reached nobody, or None. One hold per turn (the prompt id).
     002v (002s r2 G02): a turn that took in nothing (a background task's notification opened it) carries on the work of the last turn that
     took messages in: its messages and outputs are the question's, and when the turn itself sent nothing, all of it came after the last output."""
@@ -255,7 +268,7 @@ def _unsent(p, sid, d, msgs, outs, turn, context=None):
     if not msgs or not outs or not after or len(final) < UNSENT_MIN:
         return None
     sp = os.path.join(d, 'answered-gate.json')
-    st, key = _load(sp), f"{sid}:unsent:{turn.get('prompt_id') or p.get('prompt_id') or ''}"
+    st, key = _load(sp) if remember else {}, f"{sid}:unsent:{turn.get('prompt_id') or p.get('prompt_id') or ''}"
     if key in st:
         return None
     facts = {'calls_after': after, 'chars': len(final), **({'carried': True} if carried else {})}
@@ -272,7 +285,7 @@ def _unsent(p, sid, d, msgs, outs, turn, context=None):
     if not hold or mode == 'shadow':
         return None
     st[key] = time.strftime('%Y-%m-%dT%H:%M:%S%z')
-    return UNSENT_WORDS if _save(sp, st) else None
+    return UNSENT_WORDS if not remember or _save(sp, st) else None
 
 
 def _missed(p, sid, d, msgs, outs):

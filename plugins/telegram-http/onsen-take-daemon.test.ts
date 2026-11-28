@@ -505,6 +505,25 @@ test('a real peer hold leaves no M1 or lane reference; release starts a full pee
   expect(d.f.calls.slice(since).some(c => c.query.has('wait') && !c.query.has('changed_after'))).toBe(true)
 }, 12000)
 
+test('a lane lists its open Item once and completes it on a normal exit without an answer', async () => {
+  const d = await daemon({}, 200, root => {
+    const bin = join(root, 'finish-owing'), hook = join(import.meta.dir, 'lanes-hooks/lane-stop-hook.py')
+    writeFileSync(bin, `#!/bin/sh
+echo '{"hook_event_name":"Stop"}' | python3 -B "${hook}" > ./first-stop
+echo '{"hook_event_name":"Stop"}' | python3 -B "${hook}" > ./second-stop
+echo '{"type":"result","subtype":"success","is_error":false,"result":"done"}'
+`)
+    chmodSync(bin, 0o700)
+    return { LANES_CLAUDE_BIN: bin }
+  })
+  const row = d.f.add('unanswered', 'alert', { from: 'alert-dispatcher', payload: { text: '[P2] unanswered alert', line: 'call' } })
+  await waitFor(() => row.state === 'completed')
+  expect(JSON.parse(readFileSync(join(d.root, 'first-stop'), 'utf8')).decision).toBe('block')
+  expect(readFileSync(join(d.root, 'second-stop'), 'utf8')).toBe('')
+  expect(d.f.history.filter(h => h.item_id === row.id).map(h => h.body.outcome)).toEqual(['in_session', 'owed', 'completed'])
+  expect(row.reason).toBe('not_answered')
+})
+
 test('a silent Item lane reports stuck and is stopped once; its cut names the restart', async () => {
   const d = await daemon({}, 200, root => {
     const bin = join(root, 'stalled-lane')

@@ -263,6 +263,63 @@ test('20 s without a bind returns the offer, the same did can bind once on a new
   expect(row.claim!.id).not.toBe(first); expect(r.outcomes(row.id)).toEqual(['not_taken', 'in_session']); expect(r.offers.length).toBe(1)
 })
 
+test('the last-result check and open obligations share one owed prompt on the bound Item', async () => {
+  const r = await mainRig(), row = r.f.add('work-after-reply')
+  await r.bind(row)
+  const check = await r.hook('Stop')
+  expect(check.item_stop).toBe('check')
+  const owed = { phase: 'owed' as const, owed_mids: [check.items![0].mid] }
+  expect((await r.hook('Stop', { ...owed, owed_mids: ['not-this-turn'] })).accepted).toBeUndefined()
+  expect((await r.hook('Stop', owed)).accepted).toBe(true)
+  expect((await r.hook('Stop', owed)).accepted).toBeUndefined()
+  r.owing(true)
+  const next = await r.hook('Stop')
+  expect(next.block).toBeUndefined(); expect(next.item_stop).toBe('done')
+  await r.hook('Stop', { phase: 'final' }); r.f.advance(4000); r.status('idle'); await r.sync()
+  expect(r.outcomes(row.id)).toEqual(['in_session', 'owed', 'completed'])
+  expect(row.reason).toBe('not_answered')
+  await r.hook('UserPromptSubmit', { prompt_id: 'empty' })
+  expect((await r.hook('Stop', { prompt_id: 'empty' })).block).toBeUndefined()
+})
+
+test('the Stop hook checks unsent results per sender and uses the daemon’s single owed hold', () => {
+  const r = rig()
+  const script = `
+import importlib.util, io, json, os, sys
+from unittest.mock import patch
+def load(name):
+    spec = importlib.util.spec_from_file_location(name, 'lanes-hooks/' + name + '.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+hook, gate = load('main-hook'), load('main-answered-gate')
+items = [{'mid': name, 'user': name, 'body': 'report the result'} for name in ['eve', 'adam']]
+turn = {'prompt_id': 'p', 'calls': [{'name': 'mcp__reply'}, {'name': 'Read'}]}
+payload = {'hook_event_name': 'Stop', 'session_id': 's', 'prompt_id': 'p',
+           'last_assistant_message': 'There were 194 failed requests in the logs across twenty pages.'}
+phases, printed = [], []
+def post(b, timeout):
+    phases.append(b['phase'])
+    if b['phase'] == 'owed':
+        assert b['owed_mids'] == ['eve']
+        return {'accepted': True}
+    return {'item_stop': 'done' if 'owed' in phases else 'check', 'items': items,
+            'turn': turn, 'outputs': [{'to': 'eve', 'text': 'Looking up the logs.'}]}
+def aid(file, fn, *args):
+    return gate.take_owed(*args) if fn == 'take_owed' else None
+with patch.object(hook, 'post', post), patch.object(hook, 'out', printed.append), patch.object(hook, 'aid', aid), \\
+     patch.object(gate, 'unsent_p', lambda msgs, outs, final: 1 if msgs[0]['user'] == 'eve' else 0):
+    for _ in range(2):
+        with patch.object(sys, 'stdin', io.StringIO(json.dumps(payload))):
+            hook.main()
+print(json.dumps([phases, len(printed), bool(os.path.exists(os.path.join(os.environ['LANES_DIR'], 'run', 'answered-gate.json')))]))
+`
+  const proc = Bun.spawnSync(['python3', '-B', '-c', script], { cwd: import.meta.dir, env: { ...process.env, LANES_DIR: r.dir } })
+  expect(proc.stderr.toString()).toBe('')
+  expect(proc.exitCode).toBe(0)
+  expect(JSON.parse(proc.stdout.toString())).toEqual([['check', 'owed', 'check', 'final'], 1, false])
+})
+
 test('a later hook reopens a final Stop; owed and background remain claimed through the next session Stop', async () => {
   const r = await mainRig(), row = r.f.add('owed')
   await r.bind(row); r.owing(true)

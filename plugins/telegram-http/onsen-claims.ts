@@ -31,6 +31,7 @@ export class Claims implements ClaimStore {
     } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e }
   }
 
+  wasOwed(id: string): boolean { return this.rows[id]?.last_outcome === 'owed' }
   held(): string[] { return Object.keys(this.rows) }
   owns(id: string): boolean {
     const row = this.rows[id]

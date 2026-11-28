@@ -3865,6 +3865,8 @@ function runEnded(lane: Lane | undefined, it: QItem, e: { reason: string; proces
     itemReceiver?.report(refs, outcome, { ...(limit ? { retry_after: D.usageWall?.(0)?.resets_at ?? null } : {}),
       ...(it.stuckRestart ? { note: '卡住重開' } : {}), ...(e.halfDone ? { half_done: true } : {}) })
   }
+  // A lane that saw its one owed prompt and still ended normally has completed that row.
+  if (e.reason === 'normal') itemReceiver?.report(refs.filter(r => itemReceiver!.claims.wasOwed(r.onsen_item_id)), 'completed')
   releaseScheduleThread(lane, it)                                           // WO-164 point 4: a schedule's run is over: its thread lets the lane go
   const gaveUp = retryable && it.attempts >= MAX_ATTEMPTS
   asWake({ kind: 'lane_exit', rule: gaveUp ? 'exit-failed' : 'exit-owes', urgency: 'ordered', lane: lane?.id ?? it.lane }, () => {   // WO-147
@@ -7345,7 +7347,10 @@ export function laneStop(tok: RunTok): string | null {
   if (tok.stopHeld) return null
   const ids = runEventIds(tok).filter(id => events.openObs(id).length)
   if (!ids.length) return null
+  const owed = runEvents(queue.get(tok.evId)).filter(ev => ids.includes(ev.id)).flatMap(ev => ev.onsen_items ?? [])
+  itemReceiver?.report(owed, 'owed')
   tok.stopHeld = true
+  if (owed.length) return `這一輪還欠事沒交代：${ids.map(id => events.openText(id)).join(' ')}。把結果告訴等的人，再結束這一輪。`
   logos('lane.stop_held', { lane: lane.id, run: tok.runId, events: ids })
   return `⛔ lane-stop: ${lane.id} has not finished what its event owes. ${ids.map(id => events.openText(id)).join(' ')} `
     + 'Do it now (one message each). If Joey must decide, use ask_joey; if the main must do it, handoff_main. Whatever is still open when the run ends goes to the main.'
