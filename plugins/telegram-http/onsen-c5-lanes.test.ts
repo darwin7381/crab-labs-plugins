@@ -272,3 +272,13 @@ test.each([false, true])('no-change withdraws a migrated followup and drops a st
   expect(selfRows().filter(r => r.session_id === lane)).toHaveLength(1)
   expect(f.calls.filter(c => c.path === '/v1/items/' + row!.id && c.body.outcome === 'withdrawn')).toHaveLength(1)
 })
+
+test.each([false, true])('a new lane commitment during the Jev await suppresses the duplicate only on take (take=%s)', async take => {
+  if (!take) mode.pause('pull', 60_000)
+  try {
+    const tok = { commitments: 0 } as any
+    const check = L.promiseCheck({ who: 'adam.reflex.1', to: 'eve', text: '10 分鐘後回報', thread: null, ref: 'during-jev-' + take, tok })
+    tok.commitments = 1
+    expect(await check).toBe(take ? 'dup' : 'written')
+  } finally { if (!take) await mode.probe() }
+})

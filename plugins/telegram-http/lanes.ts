@@ -6316,7 +6316,7 @@ export async function promiseCheck(o: { who: string; to: string; text: string; e
   if (ask) logMainCommitment({ who: o.who, to: o.to, btcc_msg_id: o.ref ?? null, p: ask.p, deadline: dl, hit, wrote: hit && !own, thread: o.thread, thread_from: o.thread_from ?? null, ms: ask.ms,
     ...(forms ? { form: true, sentences: forms.length } : {}) })
   if (!hit) return 'no'
-  if (own || o.tok && (o.tok.commitments ?? 0) > 0) return 'dup'
+  if (own || activeSelfWriter() && o.tok && (o.tok.commitments ?? 0) > 0) return 'dup'
   const said = forms ? forms.join(' ') : o.text
   const cm = commitmentFromReport(said, o.relay ? to : undefined, to) ?? { who: to, what: said.replace(/\s+/g, ' ').trim().slice(0, 500), by: '未說明' }
   if (o.tok) o.tok.commitments = 1
