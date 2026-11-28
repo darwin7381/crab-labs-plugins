@@ -6842,7 +6842,14 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       return `ledger: commitment recorded (${chk.c.who}: ${chk.c.what}; by ${chk.c.by})`
     }
     case 'followup': {
-      const pending = Object.values(S.followups).filter(f => f.thread === lane.thread && f.state === 'pending').length
+      const pending = Object.values(S.followups).filter(f => {
+        if (f.thread !== lane.thread) return false
+        if (f.state === 'pending') return true
+        // A due check queued behind the lane is still a waiting Item until the lane takes it.
+        const run = f.onsen === 'submitted' && itemReceiver?.mode.active ? queue.get(f.event) : undefined
+        return run?.state === 'queued' && run.ev.followup === f.id
+          && run.ev.onsen_items?.some(r => !itemReceiver?.claims.owns(r.onsen_item_id))
+      }).length
       const chk = checkFollowupArgs(a, pending)
       if (!chk.ok) return `followup refused: ${chk.error}`
       // 002k (C6): run cap and no-change rule of the chain

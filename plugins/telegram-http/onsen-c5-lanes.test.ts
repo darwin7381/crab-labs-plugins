@@ -28,7 +28,8 @@ L.__setMainConnected('test-main')
 const client = new OnsenClient({ dir, agent: 'adam', record: true, base: f.base, credential: () => 'test-member', log: () => {} })
 const mode = new TakeMode('adam', client.request.bind(client), () => {}, () => {})
 const claims = new Claims(join(dir, 'claims.json'), client, () => {}, () => {}, f.now)
-L.useItemReceiver(new ItemReceiver(mode, claims, () => {}), write => client.recordSelfWrite(write))
+const receiver = new ItemReceiver(mode, claims, () => {})
+L.useItemReceiver(receiver, write => client.recordSelfWrite(write))
 await mode.probe()
 afterAll(() => {
   mode.stop(); claims.stop(); client.stop(); f.stop(); jev.stop(true)
@@ -150,6 +151,9 @@ test('followup keeps the origin lane and sender limits, and only a due Item ente
   expect(follow.fired_event).toBe(event)
   expect(L.itemIndex().get(row.id)).toBe(row.version)
   expect(row.claim).toBeNull()
+  expect(await schedule('到點但還沒有領走')).toContain('max 3')
+  f.advance(Math.max(0, Date.parse(row.not_before!) - f.now() + 1))
+  expect((await receiver.receive([itemRef(row)])).given.has(row.id)).toBe(true)
   const next = { ...tok, runId: 'check-r2', followup: true, followupId: follow.id }
   const did = '數量仍是 12 件'
   s.threads[thread]!.fu_fp = outcomeFingerprint('normal', { did })
