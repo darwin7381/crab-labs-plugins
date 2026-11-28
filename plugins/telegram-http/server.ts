@@ -345,7 +345,7 @@ const tg: RoamerTelegram | null = ROAMER
 const botName = (): string => tg?.botUsername ?? ''
 // Onsen (WO-139): every Telegram message in or out of this daemon becomes one record in Onsen (onsen-client.ts: local spool first, synced in order).
 // Telegram daemon only. ONSEN_BASE / ONSEN_RECORD / ONSEN_AGENTS / ONSEN_CREDENTIAL_FILE come from the plist or the machine config (fleet-config.ts).
-// The credential is the agent's mesh credential, kept by its agent-inbox daemon (<workspace>/.agent-inbox-state/mesh-credential); never logged.
+// The Telegram client's default credential is kept by its agent-inbox daemon (<workspace>/.agent-inbox-state/mesh-credential).
 const ONSEN_AGENT = Onsen.agentName(process.env, process.env.AGENT_WORKSPACE_DIR ?? dirname(STATE_DIR))
 /** WO-175: this agent's daemons report the moments of the Calls it receives (lanes on, recording on, ONSEN_CALL_STATE not off): the two old start receipts
  *  (the agent-inbox daemon's when a lane takes a scheduled run, the main's M1 bind) are off then: the Call's `running` is the start receipt BTCC reads */
@@ -375,7 +375,8 @@ function onBase(url: URL, base: URL | null): boolean {
 }
 
 function credentialFor(url: string | null, fallback = readMeshCredential): string | null {
-  if (readBenchCredential && url) {
+  // The roster can advertise BTCC's mailbox inject even on a machine with no BTCC_API_BASE.
+  if (readBenchCredential && url && !isMailboxInject(url)) {
     const target = URL.parse(url)
     if (target && authBases.find(({ base }) => onBase(target, base))?.bench) return readBenchCredential()
   }
@@ -2101,8 +2102,8 @@ function maybeAutoAckScheduled(runId: string | undefined): void {
 
 // WO-151 3a / 3b (Relay part 3, onsen-inbox.ts): this agent-inbox daemon takes what is sent to it from Onsen (ONSEN_PULL) and writes its calls there
 // (ONSEN_SEND; WO-158, 1.52.0: only there, no push to the roster url; off = the push, the stop switch). Each switch: a comma list of agent names or
-// `*` (the plist, then the machine config), read at start; one base, ONSEN_BASE (default https://core.kbro.ai/api/onsen); the credential is this
-// daemon's mesh credential. Off: neither runs; only the dedupe keys /inject delivers are
+// `*` (the plist, then the machine config), read at start; one base, ONSEN_BASE (default https://core.kbro.ai/api/onsen).
+// The default credential is this daemon's mesh credential. Off: neither runs; only the dedupe keys /inject delivers are
 // recorded (onsen-inbox.json), so that turning ONSEN_PULL on later never hands on again what /inject already delivered.
 const ONSEN_PULL_ON = INBOX_ONLY && switchOn(process.env.ONSEN_PULL, INBOX_SELF)
 const ONSEN_SEND_ON = INBOX_ONLY && switchOn(process.env.ONSEN_SEND, INBOX_SELF)
