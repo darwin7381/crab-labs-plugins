@@ -211,6 +211,18 @@ test('C5 bench: the main reply tool writes one timed promise for the test accoun
   expect(notices).toHaveLength(0)
 })
 
+test('C5 routes self text only from payload.text', async () => {
+  const d = await daemon({})
+  const fields = { from: 'adam', session_id: 'main' }
+  d.f.add('top-level', 'self', { ...fields, payload: { text: 'visible item text', body: { text: 'nested decoy' } } })
+  d.f.add('nested-only', 'self', { ...fields, payload: { body: { text: 'nested decoy' } } })
+  const deliveries = () => d.journal().filter(r => r.rec === 'msg' && r.onsen_items?.some((i: any) => ['top-level', 'nested-only'].includes(i.onsen_item_id)))
+  await waitFor(() => new Set(deliveries().flatMap(r => r.onsen_items.map((i: any) => i.onsen_item_id))).size === 2)
+  const contents = JSON.stringify(deliveries().map(r => r.notif))
+  expect(contents).toContain('visible item text')
+  expect(contents).not.toContain('nested decoy')
+})
+
 test('C5 active connector schedules its own keepwarm with the legacy local switch off, including across restart', async () => {
   const at = Date.now() - 120_000, sid = randomUUID(), ts = (ms: number) => new Date(at + ms).toISOString()
   const d = await daemon({}, 200, root => {

@@ -93,7 +93,7 @@ export class ItemWrites {
       for (const row of page.json.items as InboxItem[]) {
         if (row.from !== this.member || row.kind !== item.kind || row.session_id !== (item.session_id ?? null)) continue
         const followup = row.refs.some(r => r.kind === 'item' && r.value === key)
-        if (!followup && ((row.payload?.text ?? row.payload?.body?.text) !== (item.body?.text ?? '')
+        if (!followup && (row.payload?.text !== (item.body?.text ?? '')
           || row.waiter !== (item.waiter ?? this.member) || epochSecond(row.not_before) !== epochSecond(item.not_before)
           || epochSecond(row.deadline) !== epochSecond(item.deadline))) continue
         if (id && id !== row.id) return { status: 409, json: { error: 'ambiguous pre-receipt Item' } }

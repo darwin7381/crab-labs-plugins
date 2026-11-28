@@ -135,11 +135,14 @@ test('a pre-receipt commitment closes by matching its original waiting Item with
     const item = ownItem('self', 'main', '回報（old-event）', fake.now() + 60_000, 'eve')
     const row = (await (await request('POST', base, item, 'pre-upgrade')).json()).data
     const other = (await (await request('POST', base, { ...item, waiter: 'cain' }, 'other')).json()).data
+    const nested = fake.add('body-only', 'self', { from: 'adam', session_id: 'main', waiter: 'eve',
+      not_before: item.not_before, deadline: item.deadline, payload: { body: { text: item.body!.text } } })
     c.recordItemWrite({ key: 'pre-upgrade', item, complete: true })
     await c.syncNow(true)
     expect(c.writtenItemId('pre-upgrade')).toBe(row.id)
     expect(fake.rows.get(row.id)!.state).toBe('completed')
     expect(fake.rows.get(other.id)!.state).toBe('waiting')
+    expect(nested.state).toBe('waiting')
     expect(fake.calls.filter(call => call.key === 'pre-upgrade')).toHaveLength(1)
   } finally { c.stop(); rmSync(dir, { recursive: true, force: true }) }
 })

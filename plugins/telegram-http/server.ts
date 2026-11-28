@@ -4989,7 +4989,7 @@ async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
   }
   const payload = { ...row.payload }
   if (row.from === row.member && (row.kind === 'self' || row.kind === 'keepwarm')) {
-    Lanes.routeOwnItem(row, item, [item.note, item.half_done ? '上一回合被打斷，接著做。' : '', payload.text ?? payload.body?.text].filter(Boolean).join('\n'))
+    Lanes.routeOwnItem(row, item, [item.note, item.half_done ? '上一回合被打斷，接著做。' : '', payload.text].filter(Boolean).join('\n'))
     return
   }
   const prefix = [item.note, item.half_done ? '上一回合被打斷，接著做。' : ''].filter(Boolean).join('\n')
