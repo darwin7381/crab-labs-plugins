@@ -128,6 +128,8 @@ plugins/telegram-http/lanes.ts::function releaseScheduleThread
 plugins/telegram-http/lanes-wake-rules.json::owner-mail-main
 plugins/telegram-http/lanes-main.ts::batchedRider
 plugins/telegram-http/onsen-client.ts::/threads/events
+plugins/telegram-http/codex-runner/codex-runner.ts::this.receiver.receive([itemRef(peeked)])
+plugins/telegram-http/codex-runner/codex-runner.ts::this.claims.report(j.item_id, outcome,
 plugins/telegram-http/onsen-inbox.ts::export function recipientNote
 plugins/telegram-http/onsen-inbox.ts::的主線現在不在線上。例行的事它的分身照常處理；要主線決定的，等它回來才會看到。
 plugins/telegram-http/lanes.ts::找別的 agent。**先判要不要送**。只有三種情況才送：有結果要交給它、你做不了、要它補東西。
@@ -195,8 +197,6 @@ plugins/telegram-http/onsen-client.ts::const items = await this.withFiles(run.ma
 plugins/telegram-http/onsen-client.ts::const s = await this.withoutFiles(run[k]!.line, items[k]!, said, cred)
 plugins/telegram-http/lanes.ts::if ((e as any)?.heldInOnsen === true) { if (held) held.said = String((e as Error).message)
 plugins/telegram-http/roamer-telegram.ts::await h.finishInbound(this.inboundFacts(ctx, text, image, attachment, attachmentFromReply, voiceTranscript, inTopic), { imagePath, imageError })
-plugins/telegram-http/onsen-inbox.ts::export type HandResult = 'delivered' | 'duplicate' | 'undelivered' | 'later'
-plugins/telegram-http/onsen-inbox.ts::if (!retryHeld && due != null && due > this.now()) { i++; continue }
 plugins/telegram-http/server.ts::function pageReplyMeta(r: NonNullable<OnsenVisible.FormItem['reply_to']>): Record<string, string> {
 plugins/telegram-http/server.ts::if (it.say && it.reply_to && typeof it.reply_to === 'object') Object.assign(meta, pageReplyMeta(it.reply_to))
 plugins/telegram-http/server.ts::...(p.reply_to && typeof p.reply_to === 'object' ? { reply_to: p.reply_to } : {}) }

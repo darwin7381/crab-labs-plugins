@@ -3,7 +3,8 @@ import { mock, spyOn } from 'bun:test'
 import * as identity from '../mesh-identity.ts'
 import * as mcpAuth from '../mcp-auth.ts'
 
-const mesh = { ...identity, readOwnCredential: () => 'test-member', readCredentialFile: () => 'test-member' }
+const memberToken = process.env.FIXTURE_MEMBER_TOKEN ?? 'test-member'
+const mesh = { ...identity, readOwnCredential: () => memberToken, readCredentialFile: () => memberToken }
 const auth = { ...mcpAuth, ensureToken: () => 'test-loopback' }
 mock.module('../mesh-identity.ts', () => mesh)
 mock.module('../mcp-auth.ts', () => auth)
