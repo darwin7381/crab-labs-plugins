@@ -44,7 +44,7 @@ import type { ItemReceiver, Outcome, ReportFields } from './onsen-receive.ts'
 
 export type MainEnv = {
   itemReceiver?: () => ItemReceiver | undefined
-  restartSession?: () => Promise<string>
+  restartSession?: (retryPid?: number) => Promise<string>
   journal: Journal
   agent: string
   log: (level: 'info' | 'warn' | 'error', msg: string) => void
@@ -219,14 +219,16 @@ export function createMain(E: MainEnv) {
   const tellJoey: MainEnv['tellJoey'] = (...args) => { if (!takeModeActive(E.itemReceiver?.()?.mode)) E.tellJoey(...args) }
   function retryRestart(g: Row, error: unknown): void {
     E.log('warn', `lanes: main ${g.id} restart after ${g.item_restart}: ${error}; will retry`)
-    setMain(g, g.state as MainPhase, { item_restart_retry: g.item_restart, item_restart: null, item_restart_at: null })
+    setMain(g, g.state as MainPhase, { item_restart_retry: g.item_restart, item_restart: null })
   }
   async function restartForReport(g: Row, reason: 'stuck' | 'usage_limit_probe', now = Date.now()): Promise<void> {
     if (g.item_restart || !E.restartSession) return
+    // The wrapper may already have reused the tmux name. Keep the last attempt time until this PID's generation ends.
+    const retryPid = g.item_restart_at != null || g.item_restart_retry ? Number(g.pid) : undefined
     setMain(g, g.state as MainPhase, { item_restart: reason, item_restart_at: now, item_restart_retry: null })
-    try { await E.restartSession() }
+    try { await E.restartSession(retryPid) }
     catch (err) {
-      if (currentGen() === g && g.item_restart_at === now && E.pidAlive(Number(g.pid))) retryRestart(g, err)
+      if (currentGen() === g && g.item_restart === reason && g.item_restart_at === now && E.pidAlive(Number(g.pid))) retryRestart(g, err)
     }
   }
   const aidItem = (r: Row): AidItem => { const m = metaOf(r.notif); return { mid: m.message_id || m.btcc_msg_id || r.id, kind: m.message_id ? 'tg' : m.btcc_msg_id ? 'mesh' : 'sys',
@@ -938,7 +940,7 @@ export function createMain(E: MainEnv) {
     // sign of life; an idle main that leaves an offer untaken is not excused by its background agents.
     if (g.item_restart && ev !== 'SessionEnd') return {}
     if ((g.item_restart || g.item_restart_retry) && ev === 'SessionEnd' && E.pidAlive(pid)) return {}
-    if (g.item_restart_retry === 'stuck' && ev !== 'SessionEnd') setMain(g, g.state as MainPhase, { item_restart_retry: null })
+    if (g.item_restart_retry === 'stuck' && ev !== 'SessionEnd') setMain(g, g.state as MainPhase, { item_restart_retry: null, item_restart_at: g.item_restart_at ?? Date.now() })
     if (b.sub && g.state !== 'in_turn') return {}
     lastEventAt.set(g.id, Date.now())
     if (stuck && !stuck.undelivered && stuck.gen === g.id) { stuck = null; tellJoey('主線又有動靜了（hook 事件恢復），疑似卡死解除。', 'main-unstuck') }

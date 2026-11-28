@@ -8,10 +8,10 @@
 
 ## d503fc6 審查修訂
 
-審查修正開始時重讀 §4b，契約 MD5 為 `fbee7e7295a1e0e90e1b64ee753af7d9`。04:25Z 的裁決發布後複核，契約 MD5 為 `b95c0bb6a6fca963ec8af825ada122af`。以下行號對應 review-c3。
+審查修正開始時重讀 §4b，契約 MD5 為 `fbee7e7295a1e0e90e1b64ee753af7d9`。04:25Z 的裁決發布後複核，契約 MD5 為 `b95c0bb6a6fca963ec8af825ada122af`。N1 複審重讀已定 3、36 時的 MD5 為 `40948e23f6fa921174eac6c99ca87294`。以下行號對應 review-c3。
 
 1. `lanes.ts:3956,4219` 各車道保存自己的拒絕時間。keeper 未顯示該車道的牆時，60 秒後放一筆真實工作探測。成功清除，再拒就從該次重算。主線的牆只適用於相符模型。
-2. `lanes-main.ts:211` 自動重開以舊 PID 退出為準。舊 PID 過數秒仍活著就解除 hook 封鎖，交給後續 tick 重試。同一次卡住只報一次。
+2. `lanes-main.ts` 的 `restartForReport` 以舊 PID 退出為準。第一次用精確的 tmux 名稱交給 wrapper 重開。舊 PID 過數秒仍活著就解除 hook 封鎖，後續重試直接給這個 PID `SIGTERM`。3 秒後檢查它是否仍在，並核對可讀到的行程啟動時間，再決定是否給 `SIGKILL`。測試讓舊行程留在同名新 session 外，確認新 TUI 存活，同一次卡住只報一次。
 3. `lanes-main.ts:1228` 卡住時至少要成功記錄一筆持有中 claim 的 `stuck` 才重開。手打回合、本地列、過期 claim 均以回歸測試驗證。
 4. `main-hook.py:190` 保留逐則漏答與工具結果未送出的內容判斷，同一次 Stop 合併提醒，對應的 claim 報 `owed`。本機及切換前的列也保留內容檢查。
 5. `onsen-claims.ts` 每筆 `completed` 附上屬於該 claim 的回覆訊息 ID，涵蓋車道直接完成與提醒後完成。

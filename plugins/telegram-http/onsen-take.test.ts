@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
@@ -35,18 +35,18 @@ function rig() {
   return { f, client, mode, claims, file, receiver, dir, logs, misses, deadlines, outcomes, sync: () => client.syncNow(true),
     attach(m: MainApi) { main = m } }
 }
-async function mainRig(restart?: () => Promise<void>) {
+async function mainRig(restart?: (retryPid?: number) => Promise<void>, pid = 1051) {
   const r = rig()
   await r.mode.probe()
   const journal = new Journal(join(r.dir, 'state.jsonl')), offers: any[] = [], notices: string[] = []
-  const sid = crypto.randomUUID(), pid = 1051
+  const sid = crypto.randomUUID()
   let oldPidAlive = true
   let member = 'idle', bg = 0, owes: boolean | string = false, wall: MainWall | null = null
   const restarts: string[] = []
   const m = createMain({ journal, agent: 'adam', itemReceiver: () => r.receiver, log: () => {}, offer: async n => { offers.push(n); return true },
     streamOpen: () => true, memberState: () => member, expectedSession: () => [sid], pidAlive: n => n !== pid || oldPidAlive, context: () => '', info: () => null,
     genChanged: () => {}, refused: () => {}, done: () => {}, undone: () => {},
-    restartSession: async () => { restarts.push(sid); await restart?.(); return sid }, tellJoey: (_s, rule) => notices.push(rule), genuineAfter: () => 1,
+    restartSession: async retryPid => { restarts.push(sid); await restart?.(retryPid); return sid }, tellJoey: (_s, rule) => notices.push(rule), genuineAfter: () => 1,
     mainOwed: ids => ids.filter(id => owes === true || owes === id).map(id => ({ id, from: 'joey', text: id, owes: ['reply'] })), usageWall: () => wall })
   m.initMain(); r.attach(m)
   const hook = (event: string, data: Partial<MainEvent> = {}) => m.mainEvent({ event, pid, session_id: sid, prompt_id: 'turn', ...data })
@@ -543,35 +543,108 @@ test('one stuck turn reports each claim, restarts once, then cuts with one failu
 })
 
 test('a surviving pid unlocks hooks and a failed restart retries until the old pid exits', async () => {
-  let attempt = 0
-  const r = await mainRig(async () => { if (++attempt === 2) throw Error('missing exact tmux session') })
+  const targets: (number | undefined)[] = []
+  let failWrapper!: (reason: Error) => void
+  const r = await mainRig(async pid => {
+    targets.push(pid)
+    if (pid === undefined) await new Promise<void>((_, reject) => { failWrapper = reject })
+    if (targets.length === 2) throw Error('signal failed')
+  })
   const row = r.f.add('surviving-pid')
   await r.bind(row)
   const late = Date.now() + MAIN_STUCK_MS + 100
-  await r.m.tick(late); await r.m.tick(late + 4999)
+  const first = r.m.tick(late)
+  await until(() => targets.length === 1)
+  await r.m.tick(late + 4999)
   expect(r.m.currentGen()?.item_restart).toBe('stuck')
   await r.m.tick(late + 5000)
   expect(r.m.currentGen()?.item_restart).toBeUndefined()
+  failWrapper(Error('wrapper check failed after the session closed')); await first
+  expect(r.m.currentGen()?.item_restart_retry).toBe('stuck')
   await r.m.tick(late + 10000)
   await r.hook('SessionEnd')
   expect(r.m.currentGen()?.item_restart_retry).toBe('stuck')
   expect(r.m.currentGen()?.item_restart).toBeUndefined()
   await r.m.tick(late + 15000)
-  expect(r.restarts).toHaveLength(3)
+  expect(targets).toEqual([undefined, 1051, 1051])
   r.oldPidExited(); await r.m.tick(late + 20000); await r.sync()
   expect(r.outcomes(row.id)).toEqual(['in_session', 'stuck', 'cut'])
   expect(r.f.history.at(-1)?.body.note).toBe('卡住重開')
 })
 
+test('a restart retry sends TERM then KILL to the lingering PID and leaves the replacement tmux session alive', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'restart-retry-'))
+  const signals = join(dir, 'signals'), pane = join(dir, 'pane-pid'), kills = join(dir, 'session-kills')
+  const old = Bun.spawn([process.execPath, '--no-env-file', '-e', `
+    import { appendFileSync } from 'fs'
+    const log = text => appendFileSync(process.env.SIGNAL_LOG, text + '\\n')
+    for (const signal of ['SIGHUP', 'SIGTERM']) process.on(signal, () => log(signal))
+    log('ready')
+    setInterval(() => {}, 60_000)
+  `], { env: { ...process.env, SIGNAL_LOG: signals } })
+  const fresh = Bun.spawn(['sleep', '60'])
+  try {
+    await until(() => existsSync(signals))
+    writeFileSync(pane, old.pid + '\n')
+    writeFileSync(join(dir, 'tmux'), `#!/bin/sh
+set -eu
+test "$*" = 'kill-session -t =test-c3'
+read -r pid < "$PANE"
+echo "$pid" >> "$KILLS"
+kill -HUP "$pid"
+echo "$FRESH" > "$PANE"
+`, { mode: 0o700 })
+    const wrapperChecks = join(dir, 'wrapper-checks')
+    writeFileSync(join(dir, 'launchctl'), '#!/bin/sh\ntest "$1" = print || exit 1\necho "$1" >> "$CHECKS"\necho "state = running"\n', { mode: 0o700 })
+    const r = await mainRig(async retryPid => {
+      const proc = Bun.spawn([process.execPath, '--no-env-file', '-e',
+        "import { restartClaudeTUI } from './channel-bot-control.ts'; await restartClaudeTUI(true, " + retryPid + ")"], {
+        cwd: import.meta.dir, stderr: 'pipe', env: { ...process.env, PATH: dir, PANE: pane, KILLS: kills, FRESH: String(fresh.pid), CHECKS: wrapperChecks,
+          CHANNEL_BOT_TMUX_SESSION: 'test-c3', CHANNEL_BOT_SERVICE_MANAGER: 'launchd', CHANNEL_BOT_WRAPPER_LABEL: 'fixture-only' },
+      })
+      if (await proc.exited !== 0) throw Error(await new Response(proc.stderr).text())
+    }, old.pid)
+    const row = r.f.add('lingering-pid')
+    await r.bind(row)
+    const late = Date.now() + MAIN_STUCK_MS + 100
+    await r.m.tick(late)
+    await until(() => readFileSync(signals, 'utf8').includes('SIGHUP'))
+    expect(readFileSync(pane, 'utf8').trim()).toBe(String(fresh.pid))
+    expect(old.exitCode).toBeNull()
+    await r.m.tick(late + 5000)
+    const retryAt = Date.now(), exitedAt = old.exited.then(() => Date.now())
+    const retry = r.m.tick(late + 10000)
+    await until(() => readFileSync(signals, 'utf8').includes('SIGTERM'))
+    await r.hook('SessionStart', { pid: fresh.pid, source: 'startup' })
+    expect(old.exitCode).toBeNull()
+    await retry
+    await until(() => old.signalCode === 'SIGKILL')
+    expect((await exitedAt) - retryAt).toBeGreaterThanOrEqual(3_000)
+    expect(readFileSync(kills, 'utf8').trim()).toBe(String(old.pid))
+    expect(readFileSync(wrapperChecks, 'utf8').trim().split('\n')).toEqual(['print', 'print'])
+    expect(fresh.exitCode).toBeNull()
+    expect(r.m.currentGen()?.pid).toBe(fresh.pid)
+    r.oldPidExited(); await r.m.tick(late + 15000); await r.sync()
+    expect(r.outcomes(row.id)).toEqual(['in_session', 'stuck', 'cut'])
+  } finally {
+    old.kill('SIGKILL'); fresh.kill('SIGKILL')
+    await Promise.all([old.exited, fresh.exited])
+    rmSync(dir, { recursive: true, force: true })
+  }
+}, 12000)
+
 test('the surviving main can make progress after the failed restart', async () => {
-  const r = await mainRig(), row = r.f.add('still-working')
+  const targets: (number | undefined)[] = []
+  const r = await mainRig(async pid => { targets.push(pid) }), row = r.f.add('still-working')
   await r.bind(row)
   const late = Date.now() + MAIN_STUCK_MS + 100
   await r.m.tick(late); await r.m.tick(late + 5000)
   await r.hook('PreToolUse', { tool_name: 'Read' })
   expect(r.m.currentGen()?.tool_open).toBe('Read')
   await r.m.tick()
-  expect(r.restarts).toHaveLength(1)
+  expect(targets).toEqual([undefined])
+  await r.m.tick(late + 10000)
+  expect(targets).toEqual([undefined, 1051])
 })
 
 for (const source of ['typed', 'pull', 'returned'] as const) test('a silent main with no claim to report stays alive: ' + source, async () => {
@@ -634,7 +707,8 @@ test('a waiting person’s original row records one limit and completes after re
 })
 
 test('walled main leaves mail and person waiting, keeper-clear probe reports the reset time when refused', async () => {
-  const r = await mainRig(), first = r.f.add('first'), mail = r.f.add('blocked-mail', 'mail'), person = r.f.add('probe')
+  const targets: (number | undefined)[] = []
+  const r = await mainRig(async pid => { targets.push(pid) }), first = r.f.add('first'), mail = r.f.add('blocked-mail', 'mail'), person = r.f.add('probe')
   await r.bind(first)
   const reset = new Date(r.f.now() + 60_000).toISOString()
   r.setWall({ walled: true, clearedMs: null, lastWallMs: Date.now(), resets_at: reset })
@@ -648,6 +722,9 @@ test('walled main leaves mail and person waiting, keeper-clear probe reports the
   expect(r.outcomes(person.id)).toEqual(['in_session', 'usage_limit_probe'])
   expect(r.restarts).toEqual([r.sid]); expect(r.notices).toEqual([])
   expect(r.f.history.at(-1)!.body.retry_after).toBe(reset); expect(mail.state).toBe('waiting')
+  const restartAt = r.m.currentGen()!.item_restart_at
+  await r.m.tick(restartAt + 5000); await r.m.tick(restartAt + 10000)
+  expect(targets).toEqual([undefined, 1051])
   r.oldPidExited(); await r.m.tick()
   await r.hook('SessionStart', { pid: 1052, source: 'startup' })
   await r.m.pump(); await r.sync()
