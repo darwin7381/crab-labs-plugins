@@ -537,7 +537,7 @@ describe('a Call', () => {
     const mid = r.observation()
     expect(mid.queue.pending).toBe(2)
     expect(mid.background!.tasks).toBe(3)
-    await until(() => callers.every((_, i) => done(onsen, `10${i}`)()), 15_000, 'all five')
+    await until(() => callers.every((_, i) => done(onsen, `10${i}`)()) && onsen.sends.length === callers.length, 15_000, 'all five Calls and their replies')
     expect(Math.max(...codexLog().filter(x => x.ev === 'start').map(x => x.live))).toBe(3)
     callers.forEach((_, i) => expect(onsen.statesOf(`10${i}`)).toEqual(['accepted', 'running', 'completed']))
     // five sessions, five folders, no resume: two sessions running at once never see each other's new files
