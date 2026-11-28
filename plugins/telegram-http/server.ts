@@ -1578,7 +1578,7 @@ type PermPrompt = { request_id: string; tool_name: string; preview: string; copi
 const permPrompts = new Map<string, PermPrompt>()
 // WO-197 (Chiron mesh 12852, 「不靠第二張名單對齊」): a connector (1.59.0: every Telegram daemon but a roamer) has its Actions on, whatever ONSEN_ACTIONS
 // says: a connector asks people only through Actions. A roamer, as before: ONSEN_ACTIONS
-const onsenActions: Onsen.OnsenActions | null = onsen ? new Onsen.OnsenActions({ req: (m, p, b, t, h) => onsen.request(m, p, b, t, h), log,
+const onsenActions: Onsen.OnsenActions | null = onsen ? new Onsen.OnsenActions({ req: (m, p, b, t, h) => onsen.request(m, p, b, t, h), log, takeMode,
   on: () => CONNECTOR || Onsen.actionsOn(process.env, ONSEN_AGENT) }) : null
 // A prompt lives only in this process (Claude Code's channel answer goes to the session that asked): after a restart the channel cannot answer it any
 // more. The open ones' Action ids are kept in a file. The next start keeps them for ONSEN_PERM_RESTART_GRACE_MS (180 s): a duty officer that asks

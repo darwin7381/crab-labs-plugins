@@ -83,6 +83,26 @@ const logs: string[] = []
 const log = (_l: string, m: string) => { logs.push(m) }
 
 describe('OnsenActions', () => {
+  test('C2 takes applied_at from the control Item while take is active', async () => {
+    const s = standIn(), takeMode = { active: false }
+    const actions = new OnsenActions({ req: s.req, log, takeMode })
+    const h = actions.open(perm, 'c2-control')!
+    await h.tail
+    takeMode.active = true
+    actions.pressedElsewhere(h, 'allow', 'joey')
+    actions.applied(h)
+    await h.tail
+    expect(s.calls.map(c => c.path)).toEqual(['/v1/actions', '/v1/actions/1/resolve'])
+    expect(h.selected).toBe('allow')
+    expect(actions.stats.applied).toBe(0)
+
+    takeMode.active = false
+    actions.applied(h)
+    await h.tail
+    expect(s.calls.at(-1)?.path).toBe('/v1/actions/1/applied')
+    expect(actions.stats.applied).toBe(1)
+  })
+
   test('create: only the fields Onsen takes, the Idempotency-Key, the handle follows id / version / state', async () => {
     const s = standIn()
     const a = new OnsenActions({ req: s.req, log, retryMs: [5, 5] })

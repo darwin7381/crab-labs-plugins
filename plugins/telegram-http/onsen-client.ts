@@ -31,6 +31,7 @@ import { randomUUID } from 'crypto'
 import { basename, join } from 'path'
 import { OnsenIds } from './onsen-connector.ts'
 import type { WakeItem } from './onsen-wake.ts'
+import type { TakeMode } from './onsen-take.ts'
 
 // ------------------------------------------------------------------ records (the contract posted on WO-139)
 export type OnsenAttachment = { name?: string; mime?: string; size?: number; file_id?: string }
@@ -1587,7 +1588,7 @@ export class OnsenActions {
   private byId = new Map<string, ActionHandle>()
   private credWarnAt = 0
   private callErr = ''
-  constructor(readonly o: { req: ActionReq; log: Log; on?: boolean | (() => boolean); timeoutMs?: number; retryMs?: number[]; keep?: number }) {}
+  constructor(readonly o: { req: ActionReq; log: Log; on?: boolean | (() => boolean); takeMode?: Pick<TakeMode, 'active'>; timeoutMs?: number; retryMs?: number[]; keep?: number }) {}
   /** making new Actions (ONSEN_ACTIONS); the calls about one that exists go on either way. WO-197 (Chiron mesh 12852): a function is asked each time
    *  (server.ts: a connector's Actions are on whatever ONSEN_ACTIONS says, from the moment it is named) */
   get on(): boolean { const v = this.o.on; return typeof v === 'function' ? v() !== false : v !== false }
@@ -1731,7 +1732,7 @@ export class OnsenActions {
   health(): Record<string, unknown> { return { on: this.on, ...this.stats, followed: this.byKey.size } }
 
   private async appliedNow(h: ActionHandle, o: { at?: string; option_id?: string; resolved_by?: string }): Promise<void> {
-    if (!h.id) return
+    if (!h.id || this.o.takeMode?.active) return
     if (h.appliedAt && (!o.option_id || o.option_id === h.selected)) return   // WO-176 r2: applied is reported once
     const r = await this.call('POST', `/v1/actions/${h.id}/applied`, o)
     if (r?.status === 200) { this.take(h, r.json?.data); this.stats.applied++; this.o.log('info', `onsen action ${h.id}: applied${o.option_id ? ` ${o.option_id}` : ''}`) }
