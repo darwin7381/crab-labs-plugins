@@ -368,6 +368,8 @@ if (ONSEN_TAKE_ON) {
     takeMode = new TakeMode(ONSEN_AGENT, (m, p, b, t, h, signal) => onsen.request(m, p, b, t, h, signal),
       async active => {
         if (active && ROAMER && !CONNECTOR) {
+          const pending = onsen.pendingBytes()
+          if (pending) throw new Error(`local roamer spool has ${pending} unconfirmed bytes; review it before switching`)
           await tg?.stop(true)
           itemClaims!.rememberCarrier(takeMode!.connector)
           tg = null

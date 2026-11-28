@@ -648,6 +648,24 @@ for (const [name, mode, named] of [['not selected', 200, false], ['409', 409, tr
     expect(d.f.calls.some(c => c.path.endsWith('/commands') || c.path.endsWith('/observation'))).toBe(false)
   })
 
+test('first roamer handover preserves historical unsent spool bytes and keeps its local bot', async () => {
+  const bot = startBotApiMock({}, { pollHoldMs: 100 })
+  clean.push(() => bot.stop())
+  const old = '{"k":"recv","owner":"older-member"}\n'
+  const d = await daemon({ ...roamerEnv, TELEGRAM_BOT_TOKEN: bot.token, TELEGRAM_API_ROOT: bot.url }, 200, root => {
+    const spool = join(root, 'tg/onsen')
+    mkdirSync(spool)
+    writeFileSync(join(spool, 'spool.jsonl'), old)
+    return roamerState(root)
+  })
+  await waitFor(() => bot.polls.length > 0)
+  expect((await fetch(d.base + '/healthz').then(r => r.json())).connector.on).toBe(false)
+  expect(d.log()).toContain('local roamer spool has ' + Buffer.byteLength(old) + ' unconfirmed bytes')
+  expect(readFileSync(join(d.state, 'onsen/spool.jsonl'), 'utf8')).toBe(old)
+  expect(existsSync(join(d.state, 'onsen/cursor.json'))).toBe(false)
+  expect(d.f.calls.filter(c => c.path.endsWith('/batch') || c.path.endsWith('/commands'))).toHaveLength(0)
+})
+
 test('handover confirms the whole local batch when another update is handled during stop', async () => {
   const bot = startBotApiMock({}, { pollHoldMs: 100 })
   clean.push(() => bot.stop())
