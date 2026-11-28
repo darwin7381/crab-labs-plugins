@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from 'bun:test'
 import { randomUUID } from 'crypto'
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
@@ -382,7 +382,8 @@ test('C5 converts a saved followup and delivers its self Item once to the origin
 
 async function laneHook(root: string, n: number, event: string) {
   const file = join(root, 'hook-' + n)
-  writeFileSync(file, event)
+  writeFileSync(file + '.tmp', event)
+  renameSync(file + '.tmp', file)
   await waitFor(() => existsSync(file + '.out'))
   return readFileSync(file + '.out', 'utf8').trim()
 }
