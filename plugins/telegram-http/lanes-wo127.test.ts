@@ -11,7 +11,7 @@ import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, chmodSync, mkdi
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { createServer } from 'http'
-import { decisionEvent, dueEvent } from './mail-events.ts'
+import { MailEvents, decisionEvent, dueEvent } from './mail-events.ts'
 process.env.LANES_FLOOD_CONTROL = '0'
 process.env.LANES_DEFER_DECISIONS = '0'                                     // WO-128 (1.39.0): these tests pin 1.38's behaviour (every card wakes the main); lanes-wo128 tests the switch on
 // the tg daemon's own HTTP routes, for the agent-inbox side's calls into it (/lanes/mail-checked)
@@ -24,7 +24,7 @@ delete process.env.LANES_TG_PORT
 Lref = L
 const B = await import('./lanes-boundary.ts')
 const { mainContext } = await import('./lanes-main.ts')
-const { LANE_DECIDE_LATER_TOOL, MAILBOX_CARD_TOOL } = await import('./fleet-mail.ts')
+const { LANE_DECIDE_LATER_TOOL, MAILBOX_CARD_TOOL, callTool } = await import('./fleet-mail.ts')
 
 const ws = mkdtempSync(join(tmpdir(), 'lanes-wo127-ws-'))
 const dir = join(ws, '.lanes'); mkdirSync(dir)
@@ -159,7 +159,7 @@ async function asked(text = 'api-gw 5xx 一直高，可以重啟嗎？'): Promis
 }
 
 // ------------------------------------------------------------------ 1-3: the decision comes back, the lane finishes, Joey gets one line
-test('WO-127 #1 照建議: decide_later wakes the main with the card; mailbox_decide → the same thread\'s lane resumes and finishes; one line to Joey, the system\'s words in front; the main owes nothing and its Stop check is not held', async () => {
+test.each([false, true])('WO-127 #1 照建議 (take=%s): decide_later wakes the main with the card; mailbox_decide → the same thread\'s lane resumes and finishes; one line to Joey, the system\'s words in front; the main owes nothing and its Stop check is not held', async take => {
   const before = sent.length
   const { r, m, out } = await asked()
   expect(out).toContain(`放進主線的信箱了（#${m}`); expect(out).toContain('The main was woken with your card')
@@ -175,11 +175,22 @@ test('WO-127 #1 照建議: decide_later wakes the main with the card; mailbox_de
   const mt = await mainTurnWith([r.id])
   try {
     const runs = runsOf().length
-    const d = await L.routeEvent(decided(m, 'as_recommended'))
-    expect(d).toMatchObject({ rule: 'mail-decision', target: 'lane', lane: r.lane })                   // the same lane, resumed
+    const mail = new MailEvents({ file: join(tmp, 'mail-decisions'), onTake: () => take, log: () => {},
+      send: async ev => {
+        const d = await L.routeEvent(ev as any)
+        expect(d).toMatchObject({ rule: 'mail-decision', target: 'lane', lane: r.lane })
+        return d.target === 'lane'
+      } })
+    const answer = await callTool('mailbox_decide', { id: m, decision: 'as_recommended' }, {
+      btcc: async (method, path, body) => {
+        expect([method, path]).toEqual(['POST', '/api/mesh/mail/' + m + '/decide'])
+        return { status: 200, json: { ...box.get(m), ...body as object } }
+      }, mailEvent: d => mail.emit(decisionEvent(d)), call: async () => '', core: async () => { throw Error('unexpected call') }
+    })
+    expect(answer!.content[0]!.text).toContain('已交給 ' + r.lane)                   // the same lane, resumed
     expect(L.__events().mainObs(r.id)).toEqual([])                                                  // the main owes nothing for it any more
     expect((await stopCheck(mt)).block).toBeUndefined()                                             // and its Stop check holds nothing
-    const dr = await runOf(r.lane, runs, d.lane ? `mail-decision-${m}` : '')
+    const dr = await runOf(r.lane, runs, `mail-decision-${m}`)
     expect(dr.argv).toContain('--resume')
     expect(dr.prompt).toContain('主線回了決定：照建議。'); expect(dr.prompt).toContain(`信 #${m}`); expect(dr.prompt).toContain('要你決定：要不要現在重啟 api-gw')
     expect(dr.prompt).toContain('說好之後：重啟 api-gw、看 5 分鐘、回 Eve')

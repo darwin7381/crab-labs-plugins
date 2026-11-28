@@ -28,7 +28,7 @@ export interface FleetDeps {
   /** WO-126: the lane (lane.id) calling, when openBy is 'lane': a lane item or a card names it */
   lane?: string
   /** WO-126: hand the mail_decision event to the lane router (the agent-inbox daemon's mail-events queue). Absent = lanes off: the main does it itself */
-  mailEvent?: (decided: any) => Promise<'handed' | 'queued' | 'item'>
+  mailEvent?: (decided: any) => Promise<'handed' | 'queued'>
 }
 const TOUCH_MAX = 5
 
@@ -440,7 +440,6 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
       const said = `#${id} 記下決定：${decisionText(j.decision, j.note)}。`
       if (!deps.mailEvent) return text(`${said}車道沒開：照這個決定自己做完（回信、勾掉）。`)
       const how = await deps.mailEvent(j).catch(() => 'queued' as const)
-      if (how === 'item') return text(said)
       const who = j.lane ? `${j.lane}${j.thread ? `（${j.thread}）` : ''}` : '分身'
       return text(how === 'handed' ? `${said}已交給 ${who} 接著做完，它會向 Joey 回報。`
         : `${said}分流器現在連不上，決定排著，連上就交給 ${who}；不用再回一次。`)

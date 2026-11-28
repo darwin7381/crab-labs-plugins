@@ -92,10 +92,8 @@ export class MailEvents {
     try { return await this.o.send(ev) } catch (e) { this.o.log('warn', `mail-events: ${ev.id}: ${e}`); return false }
   }
   /** hand one event to the router now; if it cannot take it, it waits (in order, one per id) for the next flush */
-  async emit(ev: MailEvent): Promise<'handed' | 'queued' | 'item'> {
-    if (this.o.onTake?.()) return 'item'
+  async emit(ev: MailEvent): Promise<'handed' | 'queued'> {
     await this.flush()                                  // what waits goes first: the router sees events in order
-    if (this.o.onTake?.()) return 'item'
     if (!this.pending.length && await this.tryOne(ev)) return 'handed'
     if (!this.pending.some(p => p.id === ev.id)) {
       this.pending.push(ev)
@@ -110,7 +108,7 @@ export class MailEvents {
     if (this.flushing) return this.flushing
     this.flushing = (async () => {
       let n = 0
-      while (this.pending.length && !this.o.onTake?.()) {
+      while (this.pending.length) {
         if (!await this.tryOne(this.pending[0])) break
         this.pending.shift(); n++
       }
@@ -128,6 +126,7 @@ export class MailEvents {
     if (items && !this.o.onTake?.()) {
       const t = this.now()
       for (const it of items) {
+        if (this.o.onTake?.()) break
         const ev = dueEvent(it)
         if (this.dueSent[ev.id]) continue
         this.dueSent[ev.id] = t
