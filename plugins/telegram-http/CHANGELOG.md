@@ -1,3 +1,10 @@
+## 1.59.10 — 2026-11-28 (WO-168 stage two: Chiron's lab check of 1.59.9, three fixes)
+
+- **A menu taller than 40 rows is read up to its own border** (`screenFacts`, Chiron 00:27Z item 1): on a 50-row pane the resume picker's title 「Resume session (1 of 37)」 sits on row 7, outside the 40 rows above the footer, so the record said `other` and `/resume <n>` (`isPickerOpen` reads the record's kind since 1.59.9) would have sent Escape and failed. The window now reaches the menu's top border on the visible screen when the border is further up; menus within 40 rows read as before.
+- **`menu_options` match the screen** (item 7): a scroll arrow in the cursor's gutter (「   ↓ /clear」) is the gutter, so the last visible session is listed; a heading at the options' column is not an option: Claude Code draws a section heading bold (/mcp 「Built-in MCPs (always available)」) or a label all in a colour of its own with no option right above it (the resume picker's project name); a row in that colour right under an option is its description and stays, as before. Read from the escapes (`rowStyle`); a screen's text without escapes keeps every row as before.
+- **`waiting_text` is the menu's question**: headings and a box drawn inside the menu above the options (the resume picker's search field) are not part of it: the resume picker says 「Resume session (1 of 37)」.
+- Real screens of the lab pane (200×50, Claude Code 2.1.322): `test-fixtures/wo168/lab-resume-tall.*`, `lab-mcp.*`.
+
 ## 1.59.9 — 2026-11-28 (WO-168 stage two: one capture of the own pane, the record read by its readers)
 
 - **One capture of the daemon's own pane** (`pane-look.ts`, Joey TG chiron:2515 「不要補丁式」): the status record, the duty officer, the startup-picker's observer, the lanes main-wall probe's looks and presses, and the busy checks before a Telegram command read the own pane only through it; every look goes to the record. Roamer panes as before.

@@ -13,7 +13,7 @@ import { spawnSync } from 'node:child_process'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { ScreenStatus, VERDICT_MENUS, VERDICT_STATES, composeRecord, inputTyped, programVerdict, publishView, regionParts, screenFacts, screenHash,
+import { ScreenStatus, VERDICT_MENUS, VERDICT_STATES, composeRecord, inputTyped, programVerdict, publishView, regionParts, rowStyle, screenFacts, screenHash,
   type ScreenDeps, type ScreenJudge, type ScreenVerdict } from './screen-status.ts'
 import { JevJudge, verdictOf, type JevAnswer } from './screen-judge-jev.ts'
 import { PaneReader, snapPaneLook, splitVisible, stripAnsi, type PaneLook } from './pane-look.ts'
@@ -73,6 +73,39 @@ describe('facts: real screens', () => {
     expect(factsOf(lookOf('cc-09-effort').visible).question.startsWith('Effort')).toBe(true)             // the border with the effort hint on it is the top
     expect(factsOf(fx('lab-help-panel.txt'))).toMatchObject({ menu_open: true, options: [], menu_kind: null })
     expect(factsOf(fx('lab-resume-picker.txt'))).toMatchObject({ menu_open: true, menu_kind: 'resume_picker' })
+  })
+  // WO-168 (Chiron 11-28 00:27Z, items 1 and 7): real screens of the lab pane (200×50, Claude Code 2.1.322, 00:31Z), escapes kept
+  const lookVis = (name: string) => { const a = fx(`${name}.ansi`).replace(/\n$/, ''); return { t: stripAnsi(a), a } }
+  test('the resume picker taller than 40 rows: its kind, every visible session (the ↓ row too), no heading, the question is the title', () => {
+    const { t, a } = lookVis('lab-resume-tall')
+    const f = factsOf(t, a)
+    expect(f.menu_kind).toBe('resume_picker')                                       // the title is on row 7, the footer on row 49
+    expect(f.question).toBe('Resume session (1 of 37)')                             // not the search field, not the project name
+    expect(f.options[0]).toEqual({ n: null, text: '(session)', cursor: true })
+    expect(f.options.map(o => o.text)).not.toContain('claude-lab-relay')
+    expect(f.options.slice(-2)).toEqual([{ n: null, text: '/clear', cursor: false }, { n: null, text: '1 day ago · HEAD · 27.9KB', cursor: false }])
+    expect(f.options.length).toBe(24)                                               // 12 sessions, each its title and its description row
+    expect(f.options.filter(o => o.cursor).length).toBe(1)
+    // the record: the judge could only say other; the program knows the layout
+    const v = composeRecord(V('waiting_for_human', 'other', 1), regionParts(t).st, prog('working'), {}, { hash: 'h', seen_at: T0, facts: f }).view
+    expect(v.detail).toMatchObject({ waitingFor: 'resume_picker', waiting_text: 'Resume session (1 of 37)' })
+  })
+  test('/mcp: the section heading is not an option; the three servers word for word, the cursor on the first', () => {
+    const { t, a } = lookVis('lab-mcp')
+    const f = factsOf(t, a)
+    expect(f.question).toBe('Manage MCP servers\n3 servers')
+    expect(f.options).toEqual([
+      { n: null, text: '✔ easel                                1 tool', cursor: true },
+      { n: null, text: '✔ plugin:agent-inbox:agent-inbox       9 tools', cursor: false },
+      { n: null, text: '✔ plugin:telegram-http:telegram-http   22 tools', cursor: false }])
+    expect(factsOf(t).options.length).toBe(4)                                       // without escapes the heading cannot be told: as before
+  })
+  test('rowStyle: bold first letter, every letter in a colour of its own', () => {
+    expect(rowStyle('     \x1b[1mBuilt-in MCPs\x1b[0m\x1b[38;5;246m (always available)\x1b[39m')).toEqual({ bold: true, coloured: false })
+    expect(rowStyle('     \x1b[38;5;246mclaude-lab-relay\x1b[39m')).toEqual({ bold: false, coloured: true })
+    expect(rowStyle('\x1b[39m     \x1b[38;5;114m✔\x1b[39m plugin:agent-inbox:agent-inbox       \x1b[38;5;246m9 tools\x1b[39m')).toEqual({ bold: false, coloured: false })
+    expect(rowStyle('   \x1b[38;5;246m↓\x1b[39m /clear')).toEqual({ bold: false, coloured: false })
+    expect(rowStyle('   ')).toBeNull()
   })
   test('the usage-limit options (lab-relay): kind, both options, the question', () => {
     expect(factsOf(fx('lab-limit-options-menu.txt'))).toEqual({ menu_open: true, menu_kind: 'usage_limit_options', question: 'What do you want to do?',

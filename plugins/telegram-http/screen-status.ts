@@ -150,32 +150,78 @@ const RATE_LIMIT_FOOTER = /Esc.*cancel|Enter.*confirm/
 const RESUME_MENU = /Resume session/                                                 // channel-bot-control.ts isPickerOpen
 const indentOf = (r: string): number => r.length - r.trimStart().length
 const tidy = (s: string): string => s.replace(/[│╮╯╰╭]+\s*$/, '').replace(/^\s*[│]\s?/, '').trim()
+// WO-168 (Chiron 11-28 00:27Z, item 7): a list longer than the screen draws its scroll arrow in the cursor's gutter (「   ↓ /clear」, the resume picker,
+// real screen lab-resume-tall): the arrow is the gutter, not the row's text or its indent
+const GUTTER_ARROW = /^(\s*)[↑↓](?=\s)/
+const ungutter = (r: string): string => r.replace(GUTTER_ARROW, '$1 ')
+/** how a row is drawn (its escapes): whether its first letter is bold, and whether every letter of it has a colour of its own (a foreground set, or dim)
+ *  rather than the terminal's default. null: no letters */
+export function rowStyle(ansi: string): { bold: boolean; coloured: boolean } | null {
+  let bold = false, fg = false, dim = false, first: boolean | null = null, all = true, any = false
+  const re = /\x1b\[([0-9;:]*)m|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-9;:?<=>]*[ -/]*[@-~]|([^\x1b]+)/g
+  for (let m = re.exec(ansi); m; m = re.exec(ansi)) {
+    if (m[2] != null) {
+      if (!m[2].replace(/[\s ]/g, '')) continue
+      any = true
+      if (first == null) first = bold
+      if (!fg && !dim) all = false
+      continue
+    }
+    if (m[1] == null) continue                                             // another sequence (a hyperlink, a cursor move): not text
+    const ps = m[1] === '' ? ['0'] : m[1].split(/[;:]/)
+    for (let k = 0; k < ps.length; k++) {
+      const p = ps[k]!
+      if (p === '0' || p === '') { bold = false; fg = false; dim = false }
+      else if (p === '1') bold = true
+      else if (p === '2') dim = true
+      else if (p === '22') { bold = false; dim = false }
+      else if (p === '39') fg = false
+      else if (p === '38' || p === '48') { const set = p === '38'; k += ps[k + 1] === '5' ? 2 : ps[k + 1] === '2' ? 4 : 0; if (set) fg = true }
+      else if (/^(3[0-7]|9[0-7])$/.test(p)) fg = true
+    }
+  }
+  return any ? { bold: !!first, coloured: all } : null
+}
 /** the options of a menu block: the last clean 1..N numbered run with a live cursor on one of them; else, with no numbered run, the rows at the cursor
- *  row's column (the trust prompt, the autocompact offer), n null; fewer than two: none. An option is its own row: a row under it at the label's column
- *  is a description in some menus (the refusal picker's 「Continue on Opus 4.8 now, …」) and a wrapped label in others, and the plain text cannot tell
- *  them apart, so neither is joined. `first`: the block index of the first option */
-export function menuOptions(block: string[]): { options: MenuOption[]; first: number } {
+ *  row's column (the trust prompt, the autocompact offer, the resume picker, /mcp), n null; fewer than two: none. An option is its own row: a row under
+ *  it at the label's column is a description in some menus (the refusal picker's 「Continue on Opus 4.8 now, …」, a resume session's 「3 hours ago ·
+ *  HEAD · 631.3KB」) and a wrapped label in others, and the plain text cannot tell them apart, so neither is joined. `first`: the block index of the
+ *  first option.
+ *  WO-168 (Chiron 11-28 00:27Z, item 7): `ansi`, the same rows as captured: a heading at the options' column is not an option. Claude Code draws a
+ *  section heading bold (/mcp 「Built-in MCPs (always available)」) or, as a label, all in a colour of its own with no option right above it (the
+ *  resume picker's project 「claude-lab-relay」 under the search box); a row in that colour right under an option is that option's description and
+ *  stays. `headings`: their block indexes (not the question either). Without escapes (a screen's text handed in) no row is taken as a heading */
+export function menuOptions(block0: string[], ansi: string[] | null = null): { options: MenuOption[]; first: number; headings: number[] } {
+  const block = block0.map(ungutter)
   type R = { i: number; n: number; text: string; cursor: boolean }
   const rows: R[] = []
   block.forEach((r, i) => { const m = NUM_OPT.exec(r); if (m) rows.push({ i, n: parseInt(m[4]!, 10), text: m[5]!, cursor: !!m[2] }) })
   let run: R[] = []
   for (const x of rows) { if (x.n === 1) run = [x]; else if (run.length && x.n === run[run.length - 1]!.n + 1) run.push(x) }
-  if (run.length >= 2 && run.some(x => x.cursor)) return { options: run.map(x => ({ n: x.n, text: tidy(x.text), cursor: x.cursor })), first: run[0]!.i }
+  if (run.length >= 2 && run.some(x => x.cursor)) return { options: run.map(x => ({ n: x.n, text: tidy(x.text), cursor: x.cursor })), first: run[0]!.i, headings: [] }
+  const none = { options: [] as MenuOption[], first: -1, headings: [] as number[] }
   let ci = -1
   for (let i = block.length - 1; i >= 0; i--) if (CUR_OPT.test(block[i]!)) { ci = i; break }
-  if (ci < 0) return { options: [], first: -1 }
+  if (ci < 0) return none
   const col = block[ci]!.indexOf(CUR_OPT.exec(block[ci]!)![2]!)
   const at = (r: string): boolean => !!r.trim() && (indentOf(r) === col || (CUR_OPT.test(r) && r.indexOf(CUR_OPT.exec(r)![2]!) === col))
   let first = ci
   for (let i = ci - 1; i >= 0; i--) { const r = block[i]!; if (!r.trim()) continue; if (at(r)) first = i; else if (indentOf(r) < col) break }
-  const opts: MenuOption[] = []
+  const style = (i: number) => ansi && ansi.length === block.length ? rowStyle(ansi[i]!) : null
+  const opts: MenuOption[] = [], headings: number[] = []
+  let firstOpt = -1, prevOpt = -1
   for (let i = first; i < block.length; i++) {
     const r = block[i]!
     if (!r.trim()) continue
-    if (at(r)) { const m = CUR_OPT.exec(r); opts.push({ n: null, text: tidy(m ? m[2]! : r), cursor: !!m }) }
-    else if (indentOf(r) < col) break
+    if (at(r)) {
+      const m = CUR_OPT.exec(r), s = m ? null : style(i)
+      if (s && (s.bold || (s.coloured && prevOpt !== i - 1))) { headings.push(i); continue }
+      opts.push({ n: null, text: tidy(m ? m[2]! : r), cursor: !!m })
+      if (firstOpt < 0) firstOpt = i
+      prevOpt = i
+    } else if (indentOf(r) < col) break
   }
-  return opts.length >= 2 ? { options: opts, first } : { options: [], first: -1 }
+  return opts.length >= 2 ? { options: opts, first: firstOpt, headings } : none
 }
 /** real text in the input box: the box's rows as captured (escapes kept), the prompt glyph and the box border left out, dim text left out */
 export function inputTyped(boxAnsi: string[]): boolean {
@@ -227,20 +273,35 @@ export function screenFacts(visible: string, visibleAnsi: string | null, st: Pic
   if (footer < 0 && !refusal && !confirm) return none
   let end = footer >= 0 ? footer : ne[ne.length - 1]! + 1
   if (footer >= 0) { const k = ne.indexOf(footer); if (k > 0 && FOOTER_PART.test(rows[ne[k - 1]!]!) && !NUM_OPT.test(rows[ne[k - 1]!]!)) end = ne[k - 1]! }
-  const from = Math.max(0, end - 40)
+  // the window: the 40 rows above the footer; WO-168 (Chiron 11-28 00:27Z, item 1): a menu taller than that (the resume picker on a 50-row pane: its
+  // border on row 6, its title 「Resume session (1 of 37)」 on row 7, the footer on row 49) reaches up to its own top border, on the visible screen
+  let from = Math.max(0, end - 40)
+  for (let j = end - 1; j >= 0; j--) if (MENU_TOP.test(rows[j]!)) { if (j < from) from = j; break }
   const win = rows.slice(from, end)
+  const ansiAll = visibleAnsi == null ? null : String(visibleAnsi).replace(/\n$/, '').split('\n')
+  const winAnsi = ansiAll && ansiAll.length === rows.length ? ansiAll.slice(from, end) : null
   const topAbove = (i: number): number => { for (let j = i - 1; j >= 0; j--) if (MENU_TOP.test(win[j]!)) return j; return -1 }
   // the options: a numbered run anywhere in the window (a rule between two options, as in the refusal picker, is inside the menu); with none, an
   // unnumbered list under the menu's top border only (a `❯ /command` echo above the border is history, not a cursor)
-  let { options, first } = menuOptions(win)
+  let { options, first, headings } = menuOptions(win, winAnsi)
   let top: number
   if (options.length && options[0]!.n != null) top = topAbove(first)
   else {
     top = topAbove(win.length)
-    const r = menuOptions(win.slice(top + 1))
-    options = r.options; first = r.first >= 0 ? r.first + top + 1 : -1
+    const r = menuOptions(win.slice(top + 1), winAnsi ? winAnsi.slice(top + 1) : null)
+    options = r.options; first = r.first >= 0 ? r.first + top + 1 : -1; headings = r.headings.map(i => i + top + 1)
   }
-  const qRows = win.slice(top + 1, first >= 0 ? first : win.length).filter(r => r.trim() && !RULE_ROW.test(r)).map(r => tidy(r)).filter(Boolean)
+  // the question: the menu's text above its options. Not part of it: a heading of the list, and a box drawn inside the menu above the options (the
+  // resume picker's search field 「╭───╮ │ ⌕ Search… │ ╰───╯」, item 7: the field is not the question)
+  const qEnd = first >= 0 ? first : win.length
+  const skip = new Set(headings)
+  for (let i = top + 1; i < qEnd; i++) {
+    if (!/^\s*╭─/.test(win[i]!)) continue
+    let j = i + 1
+    while (j < qEnd && !/^\s*╰─/.test(win[j]!)) j++
+    if (j < qEnd) { for (let k = i; k <= j; k++) skip.add(k); i = j }
+  }
+  const qRows = win.slice(top + 1, qEnd).map((r, k) => skip.has(top + 1 + k) ? '' : r).filter(r => r.trim() && !RULE_ROW.test(r)).map(r => tidy(r)).filter(Boolean)
   const question = qRows.join('\n')
   const said = [question, ...options.map(o => o.text)].join('\n')
   const kind = refusal ? 'refusal_fallback' as const : confirm ? 'switch_confirm' as const
