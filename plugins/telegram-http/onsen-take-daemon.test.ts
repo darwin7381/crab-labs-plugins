@@ -207,6 +207,23 @@ function scriptedLane(root: string) {
 }
 
 const worker = 'adam.worker.1'
+for (const named of [false, true]) test('scheduled receipt writes only Call.result, named Call=' + named, async () => {
+  const summary = 'The snapshot could not be verified.', steps = [{ step: 'Verify snapshot', done: false, note: summary }]
+  const d = await daemon({ LANES_RECEIPT_STEPS: '1' }, 200, root => {
+    writeFileSync(join(root, 'receipt-input.json'), JSON.stringify({ outcome: 'failed', steps, summary }))
+    return scriptedLane(root)
+  })
+  d.f.scheduleCalls.set('806', { id: '806', run: '762', result: null })
+  const schedule = d.f.add('schedule', 'schedule', { from: 'scheduler', call_id: named ? '806' : null,
+    payload: { text: '[scheduled][test][run:762] verify snapshot', line: 'call', run_id: '762', frequency: 'high' } })
+  await waitFor(() => schedule.claim?.session_id != null)
+  writeFileSync(join(d.root, 'release-lane'), '')
+  await waitFor(() => !!d.f.scheduleCalls.get('806')!.result)
+  expect(readFileSync(join(d.root, 'scheduler-receipt'), 'utf8')).toContain('Call result queued')
+  expect(d.f.calls.filter(c => c.path.endsWith('/state')).map(c => c.body)).toEqual([{ result: { outcome: 'failed', steps, body: { format: 'markdown', text: summary } } }])
+  expect(d.f.calls.filter(c => c.path === '/v1/calls').map(c => c.query.get('ref_value'))).toEqual(named ? [] : ['762'])
+})
+
 async function laneHook(root: string, n: number, event: string) {
   const file = join(root, 'hook-' + n)
   writeFileSync(file, event)

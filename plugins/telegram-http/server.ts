@@ -3485,6 +3485,7 @@ if (Lanes.LANES_ON) {
     } } : {}),
     registryNames: () => Object.keys(loadInboxRegistry()).filter(n => n !== (process.env.LANES_AGENT ?? INBOX_SELF)),
     checkWaitingCall: onsen ? (id, why, thread) => onsen!.checkWaitingCall(id, why, thread) : undefined,
+    recordScheduleResult: line => onsen?.recordCall(line) ?? false,
     wallNoticeOwned: (rule, m) => mainWallNoticeOwned(rule, m.kind),
     ...(mentionCards ? { mentions: () => mentionCards.fetchIfOn(), mentionsRead: (posts: string[]) => mentionCards.read(posts) } : {}),   // WO-181
     // WO-120: M1 asks the usage-wall state before its in-session probe (walled → no offer; cleared after this episode began → offer now)

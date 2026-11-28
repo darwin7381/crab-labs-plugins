@@ -14,6 +14,7 @@ export function fakeItems(member = 'adam', token = 'test-member', extra?: (req: 
   const calls: Array<{ path: string; query: URLSearchParams; body: any; key: string | null }> = []
   const issued = new Set<string>(), reports = new Set<string>()
   const history: ItemReport[] = [], waiters = new Set<() => void>()
+  const scheduleCalls = new Map<string, { id: string; run: string; result: any }>()
   let mode = 200, unavailable = false, holdReports = false, delayTake = 0
   const detail = (data: unknown) => Response.json({ api_version: '1', as_of: iso(now), viewer: member, read_by: null, data })
   const error = (status: number, code: string, extra = {}) => Response.json({ error: { code, message: code, retryable: status >= 500, ...extra } }, { status })
@@ -56,6 +57,13 @@ export function fakeItems(member = 'adam', token = 'test-member', extra?: (req: 
     if (unavailable || holdReports && path.endsWith('/report')) return error(503, 'service_unavailable')
     expire()
     // Existing resources used by the real tg daemon alongside the Item API.
+    if (path === '/v1/calls' && req.method === 'GET') return Response.json({ items: [...scheduleCalls.values()].filter(c => c.run === q.get('ref_value')) })
+    if (path.startsWith('/v1/calls/') && path.endsWith('/state') && req.method === 'PUT') {
+      const call = scheduleCalls.get(path.split('/')[3]!)
+      if (!call) return error(404, 'not_found')
+      if (!b.result || Object.keys(b).length !== 1) return error(400, 'invalid_request')
+      call.result = b.result; return detail(call)
+    }
     if (path.endsWith('/batch')) return Response.json({ results: (b.items ?? []).map(() => ({ id: ++seq })) })
     if (path === '/v1/conversations/by-chat/1') return detail({ id: 'conv', members: ['joey', member] })
     if (path === '/v1/messages' && req.method === 'POST') return detail({ id: String(++seq), delivery: 'sent' })
@@ -142,7 +150,7 @@ export function fakeItems(member = 'adam', token = 'test-member', extra?: (req: 
     if (delayTake && path === base + '/take') await Bun.sleep(delayTake)
     return answer
   } })
-  return { base: 'http://127.0.0.1:' + server.port, rows, calls, history, add, change, now: () => now,
+  return { base: 'http://127.0.0.1:' + server.port, rows, calls, scheduleCalls, history, add, change, now: () => now,
     advance(ms: number) { now += ms; expire() }, mode(status: number) { mode = status }, down(on: boolean) { unavailable = on },
     holdReports(on: boolean) { holdReports = on }, delayTake(ms: number) { delayTake = ms }, stop() { for (const wake of waiters) wake(); return server.stop(true) } }
 }

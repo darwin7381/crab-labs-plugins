@@ -9,6 +9,27 @@ const BASE = 'http://127.0.0.1:1'
 const report: ItemReport = { item_id: 'item-1', body: { claim_id: 'claim-1', outcome: 'completed', at: '2026-11-28T00:00:00Z' } }
 
 describe('upgrading a durable report spool', () => {
+  test('a scheduled result is retried with the same body and key after restart, before the claim completes', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'result-spool-'))
+    const requests: Array<{ path: string; body: unknown; key: string | null }> = []
+    const statuses = [503, 200, 200]
+    const cfg = { dir, agent: 'adam', base: BASE, record: true, credential: () => 'fixture', log: () => {},
+      fetch: (async (url: string, init: RequestInit) => {
+        requests.push({ path: new URL(url).pathname, body: JSON.parse(String(init.body)), key: new Headers(init.headers).get('Idempotency-Key') })
+        return Response.json({}, { status: statuses.shift() })
+      }) as typeof fetch }
+    const result = { outcome: 'failed', body: { format: 'markdown' as const, text: 'disk full' } }
+    const c = new OnsenClient(cfg)
+    expect(c.recordCall({ call_id: '71', run_id: '93', event: 's', idem: 'call:run:93:result', body: { result } })).toBe(true)
+    expect(c.recordItemReport(report)).toBe(true)
+    await c.syncNow(true); c.stop()
+    const restarted = new OnsenClient(cfg)
+    await restarted.syncNow(true); restarted.stop()
+    const put = { path: '/v1/calls/71/state', body: { result }, key: 'call:run:93:result' }
+    expect(requests).toEqual([put, put, { path: '/v1/items/item-1/report', body: report.body, key: 'ir:item-1:claim-1:completed' }])
+    expect(restarted.pendingBytes()).toBe(0)
+  })
+
   test('old receipts advance locally, an unacknowledged claim survives two refusals and replays after restart', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'spool-upgrade-'))
     const old = ['d', 'w', 'c', 'a', 'r', 'blocked'].map(k => ({ k, r: { id: 'old' } }))

@@ -22,6 +22,7 @@ import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSyn
 import { randomUUID } from 'crypto'
 import { basename, join } from 'path'
 import type { ItemReport } from './onsen-receive.ts'
+import type { Step } from './lanes-boundary.ts'
 
 // ------------------------------------------------------------------ records (the contract posted on WO-139)
 export type OnsenAttachment = { name?: string; mime?: string; size?: number; file_id?: string }
@@ -77,7 +78,8 @@ export type SpoolLine = { k: 'm'; r: OnsenItem; fw?: 1 } | { k: 'e'; r: OnsenEve
   | { k: 't'; r: Record<string, unknown> & { thread: string; dedupe: string } }
   | { k: 'ir'; r: ItemReport }
   | { k: 'd'; r: DeliveryFact } // historical, still readable by the local status view
-  | { k: 'a' | 'r' | 'w' | 'blocked' | 'c'; r: unknown } // historical spool entries, read only
+  | { k: 'c'; r: CallStateLine | CallResultLine }
+  | { k: 'a' | 'r' | 'w' | 'blocked'; r: unknown } // historical spool entries, read only
 const SPOOL_KINDS = new Set(['ir', 'blocked', 'm', 'e', 'l', 'u', 'd', 's', 'a', 'w', 't', 'c', 'r'])
 /** WO-175 (Onsen contract v1 §4, §9; Onsen 0.24.1: a pulled item carries its `call_id`): the Call a received item is, as the item names it */
 export type CallRef = { kind: 'peer_call' | 'scheduled' | 'alert' | 'board'; id: string }
@@ -88,6 +90,10 @@ export type CallStateName = 'accepted' | 'running' | 'completed' | 'failed'
  *  what moment of which item this is) */
 export type CallStateLine = { call_id: string; kind: CallRef['kind']; event: string; idem: string
   body: { state: CallStateName; session_id: string | null; result?: { outcome?: string; body?: { format: 'markdown'; text: string } }; at: string } }
+/** Settled 58. Progress comes from Item reports. A result can arrive before or after the terminal report. */
+export type CallResultLine = { event: string; idem: string; call_id: string | null; run_id?: string
+  body: { state?: never; result: { outcome: string; steps?: Step[]; body?: { format: 'markdown'; text: string }; attachment_file_ids?: string[] } } }
+export type ScheduledResultLine = CallResultLine & { run_id: string }
 /** WO-175 (Chiron 05:55Z: a receipt goes to Onsen only): what became of one spooled Call line. took: Onsen answered 2xx (its state then);
  *  refused: a 4xx (Onsen's sentence; the line is in rejected.jsonl); pending: no answer, or 5xx, within the wait (the line stays in the spool and
  *  goes when Onsen answers); nocred: this daemon has no mesh credential (a broken setup) */
@@ -552,6 +558,7 @@ export class OnsenClient {
     return s
   }
   recordEvent(ev: OnsenEvent): void { this.append({ k: 'e', r: ev }) }
+  recordCall(line: CallResultLine): boolean { return this.append({ k: 'c', r: line }) }
   recordLine(line: SpoolLine | null): void { if (line) this.append(line) }
   recordStatus(f: StatusFact): void { if (this.append({ k: 's', r: f })) { this.stats.status_recorded++; this.fastStatus(f) } }
   /** WO-164: thread events (lanes-threads.ts threadEvents), one spool line each, posted in order as /threads/events batches; false = not all spooled */
@@ -845,6 +852,27 @@ export class OnsenClient {
           continue
         }
         return this.failStatus(r, path)
+      }
+      if (t.line.k === 'c' && t.line.r.body?.result && !('state' in t.line.r.body)) {
+        const c = t.line.r as CallResultLine
+        let id = c.call_id
+        if (!id && c.run_id) {
+          const path = '/v1/calls?ref_kind=run&ref_value=' + encodeURIComponent(c.run_id) + '&limit=5'
+          const r = await this.get(path, cred, 'hook').catch(e => ({ status: 0, json: { error: errText(e) } }))
+          if (r.status !== 200 && !refusedForGood(r)) return this.failStatus(r, path)
+          id = r.status === 200 && Array.isArray(r.json?.items) ? r.json.items.find((call: any) => call?.id != null)?.id : null
+          if (!id) this.reject(t.line, `GET ${path}: ${r.status === 200 ? 'no Call for this scheduler run' : 'HTTP ' + r.status}`)
+        } else if (!id) this.reject(t.line, 'Call result has no call_id or run_id')
+        if (id) {
+          const path = '/v1/calls/' + encodeURIComponent(id) + '/state'
+          const r = await this.put(path, { result: c.body.result }, cred, undefined, { 'Idempotency-Key': c.idem })
+            .catch(e => ({ status: 0, json: { error: errText(e) } }))
+          if (r.status >= 200 && r.status < 300) this.stats.posted++
+          else if (refusedForGood(r)) this.reject(t.line, `PUT ${path}: HTTP ${r.status} ${callSaid(r.json)}`, { kind: 'c', path, status: r.status, code: errCode(r.json) })
+          else return this.failStatus(r, path)
+        }
+        this.writeCursor(t.end); this.ok(); i++
+        continue
       }
       // These records were drained before cutover. A restored pre-cutover spool
       // must advance past them without replaying an obsolete delivery or projection.
