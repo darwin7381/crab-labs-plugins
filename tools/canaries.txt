@@ -194,7 +194,7 @@ plugins/telegram-http/server.ts::if (it.say && it.reply_to && typeof it.reply_to
 plugins/telegram-http/server.ts::...(p.reply_to && typeof p.reply_to === 'object' ? { reply_to: p.reply_to } : {}) }
 plugins/telegram-http/onsen-connector.ts::export class BridgeSwitch {
 plugins/telegram-http/onsen-connector.ts::async waitReport(id: string, conv: string): Promise<Said> {
-plugins/telegram-http/onsen-connector.ts::`/v1/conversations/${cid}/messages/by-client-id/${encodeURIComponent(s)}`
+plugins/telegram-http/onsen-connector.ts::`/v1/conversations/${encodeURIComponent(cid)}/messages/by-client-id/${encodeURIComponent(s)}`
 plugins/telegram-http/server.ts::const CONNECTOR = !INBOX_ONLY && !ROAMER
 plugins/telegram-http/server.ts::if (!TOKEN && ROAMER) {
 plugins/telegram-http/server.ts::new (await import('./roamer-telegram.ts')).RoamerTelegram(

@@ -374,8 +374,6 @@ const visibleOn = (name: OnsenVisible.Switch): boolean => !!onsen && onsen.cfg.r
 const ONSEN_VISIBLE = { forms: visibleOn('ONSEN_FORM_LINKS') }
 const ONSEN_FORM_HOSTS = OnsenVisible.formHosts(process.env)
 if (ONSEN_VISIBLE.forms) log('info', `onsen: form links on for ${ONSEN_AGENT} (${[...ONSEN_FORM_HOSTS].join(', ')})`)
-/** WO-145: a page answer's id (form-<Onsen message id>): not a Telegram message */
-const FORM_REF = /^form-.+$/
 /** WO-145 (ONSEN_FORM_LINKS): a reply's links to our pages get their one-time form keys (POST /forms, 3 s at most; without one in time the link goes as
  *  written). Telegram gets the keyed text; `redact` makes Onsen record the text without the keys (Onsen.withSender's extra). */
 async function formLinks(chat: string, text: string, who: string): Promise<{ text: string; redact: Array<[string, string]> }> {
@@ -618,7 +616,7 @@ async function connectorConversation(chat: string): Promise<string> {
  *  bridge draws it (createForumTopic) or, when it cannot, puts its messages in the main chat with its name first. Never fails for Telegram */
 async function connectorOpenThread(chat: string, name: string): Promise<number> {
   const cid = await connectorConversation(chat)
-  const r = await onsen!.request('POST', `/v1/conversations/${cid}/threads`, { name: name.slice(0, 128) }, 10_000)
+  const r = await onsen!.request('POST', `/v1/conversations/${encodeURIComponent(cid)}/threads`, { name: name.slice(0, 128) }, 10_000)
   const t = r && r.status < 300 ? (r.json?.data?.thread ?? r.json?.thread) : undefined
   if (t == null || !/^\d+$/.test(String(t))) throw new Error(`Onsen did not open the thread (${Connector.why(r)})`)
   log('info', `connector: thread ${t} 「${name}」 opened in conversation ${cid} (the bridge draws it)`)
@@ -626,7 +624,7 @@ async function connectorOpenThread(chat: string, name: string): Promise<number> 
 }
 async function connectorThreadState(chat: string, thread: number, state: 'open' | 'closed', name?: string): Promise<string> {
   const cid = await connectorConversation(chat)
-  const r = await onsen!.request('PUT', `/v1/conversations/${cid}/threads/${thread}`, { state, ...(name ? { name: name.slice(0, 128) } : {}) }, 10_000)
+  const r = await onsen!.request('PUT', `/v1/conversations/${encodeURIComponent(cid)}/threads/${thread}`, { state, ...(name ? { name: name.slice(0, 128) } : {}) }, 10_000)
   if (!r || r.status >= 300) throw new Error(`Onsen did not take the thread's ${state} (${Connector.why(r)})`)
   return `thread ${thread} ${state} in Onsen (the bridge sets the topic's icon)`
 }
@@ -650,7 +648,7 @@ async function connectorThreadLink(chat: string, thread: number): Promise<string
   const end = Date.now() + 3_000
   const bot = botName() || await bridgeBotName()
   while (bot) {
-    const r = await onsen!.request('GET', `/v1/conversations/${cid}/threads?limit=100`, undefined, 3_000).catch(() => null)
+    const r = await onsen!.request('GET', `/v1/conversations/${encodeURIComponent(cid)}/threads?limit=100`, undefined, 3_000).catch(() => null)
     const it = (r?.json?.items ?? r?.json?.data?.items ?? []).find((x: any) => String(x?.thread) === String(thread))
     if (it?.client_thread) return topicLink(bot, Number(it.client_thread))
     if (Date.now() + 500 > end) break
@@ -679,7 +677,7 @@ const onsenJoeyOf: OnsenStatus.JoeyOf = meta => {
   if (!meta) return null
   const chat = String(meta.chat_id ?? ''), id = String(meta.message_id ?? ''), uid = String(meta.user_id ?? '')
   // WO-145: a page answer (via web-form) is Joey's message too; its id is form-<Onsen message id> (Onsen keys its delivery facts that way)
-  if (!chat || !(/^\d+$/.test(id) || ((meta.via === 'web-form' || meta.via === 'onsen') && FORM_REF.test(id))) || !uid) return null
+  if (!chat || !(/^\d+$/.test(id) || ((meta.via === 'web-form' || meta.via === 'onsen') && Connector.FORM_REF.test(id))) || !uid) return null
   if (Date.now() - onsenAllow.at > 5_000) { try { onsenAllow.ids = loadAccess().allowFrom.map(String) } catch {} ; onsenAllow.at = Date.now() }
   return onsenAllow.ids.includes(uid) ? { chat, id } : null
 }
@@ -2210,8 +2208,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'reply': {
         const chat_id = args.chat_id as string
         const text = args.text as string
-        // WO-145: a page answer's id (form-<n>) is not a Telegram message: Telegram threads the reply under its echo; the lanes match the answer itself
-        const formRef = ONSEN_VISIBLE.forms && FORM_REF.test(String(args.reply_to ?? ''))
+        // A form tag carries the original Onsen message ID. Keep it intact for the router and the reply.
+        const formRef = CONNECTOR && Connector.FORM_REF.test(String(args.reply_to ?? ''))
         const reply_to = formRef ? undefined : args.reply_to != null ? Number(args.reply_to) : undefined
         const lanesReplyTo: unknown = formRef ? String(args.reply_to) : reply_to
         const files = (args.files as string[] | undefined) ?? []
@@ -2257,7 +2255,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           // WO-197 (a connector): the whole reply and its files written into Onsen (conversation_id); the bridge draws it on Telegram (parts, files,
           // reply, silence) and reports its numbers: answered as before. None within 3 s: said all the same (Onsen has it; the Stop check does not hold)
           const r = await connectorReply({ chat: chat_id, sender: 'main', text: fl.text, redact: fl.redact, rich: useRich, files,
-            replyTo: formRef ? String(args.reply_to) : args.reply_to != null ? String(args.reply_to) : null, topic: topicF.message_thread_id,
+            replyTo: args.reply_to != null ? String(args.reply_to) : null, topic: topicF.message_thread_id,
             silent: !!handoffTier?.silent, turn_id: mainTurnNow() })
           if (r.held || !r.ids.length) {
             if (Lanes.LANES_ON && !INBOX_ONLY) Lanes.mainReplied(handoffTier, `onsen:${r.onsenId}`, lanesReplyTo, text, chat_id)

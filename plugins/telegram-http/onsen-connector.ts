@@ -30,7 +30,8 @@ export const TRY_MS = 5_000
 export const CACHE_MS = 10 * 60_000
 export const HELD = '已寫進 Onsen（網頁看得到）；Telegram 還沒送到，會再送'
 export const NOT_TAKEN = 'Onsen 沒收下，這一則沒有送出'
-export const ONSEN_CHAT = /^onsen:(\d+)$/
+export const ONSEN_CHAT = /^onsen:(.+)$/
+export const FORM_REF = /^form-(.+)$/
 /** Telegram's reaction set (the Bot API's ReactionTypeEmoji): the bridge can draw nothing else */
 export const REACTIONS = new Set(['👍', '👎', '❤', '🔥', '🥰', '👏', '😁', '🤔', '🤯', '😱', '🤬', '😢', '🎉', '🤩', '🤮', '💩', '🙏', '👌', '🕊', '🤡', '🥱',
   '🥴', '😍', '🐳', '❤‍🔥', '🌚', '🌭', '💯', '🤣', '⚡', '🍌', '🏆', '💔', '🤨', '😐', '🍓', '🍾', '💋', '🖕', '😈', '😴', '😭', '🤓', '👻', '👨‍💻', '👀', '🎃',
@@ -105,13 +106,13 @@ export class OnsenIds {
   /** the Onsen message a client message number stands for (`onsen:<id>` as it is), or null when Onsen has none */
   async message(chat: string, n: string): Promise<string | null> {
     const s = String(n ?? '').trim()
-    const direct = /^onsen:(\d+)$/.exec(s)
+    const direct = ONSEN_CHAT.exec(s) ?? FORM_REF.exec(s)
     if (direct) return direct[1]!
     if (!s) return null
     const cid = await this.conversation(chat)
     const key = `${cid}:${s}`, had = this.msg.get(key)
     if (had && this.fresh(had)) return had.id
-    const r = await this.o.request('GET', `/v1/conversations/${cid}/messages/by-client-id/${encodeURIComponent(s)}`, undefined, TRY_MS)
+    const r = await this.o.request('GET', `/v1/conversations/${encodeURIComponent(cid)}/messages/by-client-id/${encodeURIComponent(s)}`, undefined, TRY_MS)
     if (r && r.status === 404) return null
     const id = r && r.status === 200 ? r.json?.data?.id : undefined
     if (id == null) throw new Error(`Onsen did not say which message ${s} is (${why(r)})`)
@@ -128,7 +129,7 @@ export class OnsenIds {
     const cid = await this.conversation(chat)
     const key = `${cid}:${clientThread}`, had = this.threads.get(key)
     if (had && this.fresh(had)) return had.id
-    const r = await this.o.request('GET', `/v1/conversations/${cid}/threads?client_thread=${encodeURIComponent(clientThread)}`, undefined, TRY_MS)
+    const r = await this.o.request('GET', `/v1/conversations/${encodeURIComponent(cid)}/threads?client_thread=${encodeURIComponent(clientThread)}`, undefined, TRY_MS)
     const it = r && r.status === 200 ? (r.json?.items ?? r.json?.data?.items ?? [])[0] : undefined
     if (!it?.thread) return null
     this.learnThread(cid, clientThread, String(it.thread))
@@ -202,7 +203,7 @@ export class ConnectorSay {
     const end = Date.now() + (this.o.waitMs ?? WAIT_MS)
     let last = 'pending'
     while (true) {
-      const r = await this.o.request('GET', `/messages/${id}`, undefined, Math.max(500, Math.min(TRY_MS, end - Date.now()))).catch(() => null)
+      const r = await this.o.request('GET', `/messages/${encodeURIComponent(id)}`, undefined, Math.max(500, Math.min(TRY_MS, end - Date.now()))).catch(() => null)
       const st = r?.status === 200 ? r.json?.delivery?.state : undefined
       if (st === 'sent') {
         const nums = numbersOf(r!.json)
@@ -222,7 +223,7 @@ export class ConnectorSay {
   async react(chat: string, n: string, emoji: string): Promise<string> {
     const id = await this.o.ids.message(chat, n)
     if (id == null) throw new Error(`message ${n} is not a message Onsen knows in chat ${chat}: no reaction written`)
-    const r = await this.o.request('POST', `/v1/messages/${id}/reactions`, { emojis: [emoji] }, TRY_MS)
+    const r = await this.o.request('POST', `/v1/messages/${encodeURIComponent(id)}/reactions`, { emojis: [emoji] }, TRY_MS)
     if (!r || r.status >= 300) throw new Error(`Onsen did not take the reaction (${why(r)})`)
     this.stats.reacted++
     return id
@@ -231,7 +232,7 @@ export class ConnectorSay {
   async edit(chat: string, n: string, text: string): Promise<string> {
     const id = await this.o.ids.message(chat, n)
     if (id == null) throw new Error(`message ${n} is not a message Onsen knows in chat ${chat}: not edited`)
-    const r = await this.o.request('PUT', `/v1/messages/${id}`, { text }, TRY_MS)
+    const r = await this.o.request('PUT', `/v1/messages/${encodeURIComponent(id)}`, { text }, TRY_MS)
     if (!r || r.status >= 300) throw new Error(`Onsen did not take the edit (${why(r)})`)
     this.stats.edited++
     return id
