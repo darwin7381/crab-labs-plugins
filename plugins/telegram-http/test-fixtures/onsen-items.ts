@@ -9,7 +9,7 @@ type Row = InboxItem & { waiter: string; preview: string; line: string; created_
 const iso = (ms: number) => new Date(ms).toISOString()
 
 /** A disposable member inbox. Server time, ownership, versions and idempotency live on this side of HTTP. */
-export function fakeItems(member = 'adam') {
+export function fakeItems(member = 'adam', actionPort?: number) {
   let now = Date.now(), seq = 0, claimSeq = 0, owner = '', seen = 0
   const rows = new Map<string, Row>(), writes = new Map<string, Response>(), terminal = new Map<string, string>()
   const givenByPull = new Set<Row>()
@@ -66,6 +66,8 @@ export function fakeItems(member = 'adam') {
     const detail = (data: unknown) => Response.json({ ...envelope(), data })
     calls.push({ path, query: q, body: b, key })
     if (req.headers.get('authorization') !== 'Bearer test-member') return error(401, 'not_authenticated')
+    if (actionPort && path.startsWith('/v1/actions')) return fetch(`http://127.0.0.1:${actionPort}${url.pathname}${url.search}`, {
+      method: req.method, headers: req.headers, ...(req.method !== 'GET' ? { body: JSON.stringify(b) } : {}) })
     if (unavailable || holdReports && path.endsWith('/report')) return error(503, 'service_unavailable')
     expire()
     // Existing resources used by the real tg daemon alongside the Item API.
