@@ -113,6 +113,18 @@ export class ResumeItems {
     return true
   }
 
+  endInput(session: string): void {
+    const pending = this.entries().filter(e => e.session === session && e.awaitingInput && e.id)
+    if (!pending.length) return
+    for (const { id } of pending) {
+      if (!id) continue
+      const reached = this.delivered(id)
+      if (!reached) this.receiver()?.claims.report(id, 'superseded')
+      this.resolveInput(id, reached)
+    }
+    this.sync()
+  }
+
   remember(id: string, text: string): void {
     const entries = this.entries()
     const prior = entries.find(e => e.id === id)

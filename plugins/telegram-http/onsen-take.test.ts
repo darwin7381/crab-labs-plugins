@@ -27,7 +27,7 @@ function rig() {
   const mode = new TakeMode('adam', client.request.bind(client), () => {}, line => logs.push(line), 'mac-mini')
   const file = join(dir, 'claims.json')
   let main: MainApi | undefined
-  const claims = new Claims(file, client, id => { misses.push(id); main?.offerMissed(id) }, () => {}, f.now, id => main?.unboundOutcome(id) ?? 'not_taken')
+  const claims = new Claims(file, client, (id, outcome) => { misses.push(id); main?.offerMissed(id, outcome) }, () => {}, f.now, id => main?.unboundOutcome(id) ?? 'not_taken')
   client.watchItemReports(r => claims.replay(r), (r, ok) => claims.acknowledged(r, ok))
   const receiver = new ItemReceiver(mode, claims, time => deadlines.push(time))
   clean.push(() => { mode.stop(); claims.stop(); client.stop(); f.stop(); rmSync(dir, { recursive: true, force: true }) })
@@ -267,6 +267,7 @@ test('C4 an offline unbound resume remembers the continuation and expires as sup
   await r.m.pump()
   r.f.down(true)
   await r.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] })
+  await r.hook('Stop', { prompt_id: 'automatic', phase: 'final' })
   expect(r.client.hasItemReports()).toBe(false)
   r.f.advance(25_000); r.claims.start()
   await until(() => r.client.hasItemReports())
@@ -400,6 +401,7 @@ test('C4 a claimed offer that never reaches a turn is superseded', async () => {
   await claimed.m.pump()
   expect(claimed.offers).toHaveLength(1)
   await claimed.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] })
+  await claimed.hook('Stop', { prompt_id: 'automatic', phase: 'final' })
   expect(claimed.client.hasItemReports()).toBe(false)
   claimed.f.advance(20_001); claimed.claims.start()
   await until(() => claimed.client.hasItemReports())
@@ -443,6 +445,62 @@ test.each([true, false])('settled 59: continuation during the stream write repor
   }
   await r.sync()
   expect(r.outcomes(r.row.id)).toEqual(written ? ['in_session', 'completed'] : ['superseded'])
+})
+
+test.each(['late receipt', 'session end'])('settled 59: a long independent turn leaves the queued input open for its %s', async end => {
+  const r = await accountCut()
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 }); await r.m.pump()
+  const did = r.offers[0].params.meta.did
+  await r.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] })
+  r.f.advance(20_001); r.claims.start()
+  await until(() => r.client.hasItemReports()); await r.sync()
+  expect(r.row.state).toBe('waiting')
+  expect(r.outcomes(r.row.id)).toEqual(['not_taken'])
+  if (end === 'late receipt') {
+    await r.hook('Stop', { prompt_id: 'automatic', phase: 'final' })
+    await r.hook('UserPromptSubmit', { prompt_id: 'queued-text', dids: [did] })
+    await r.hook('Stop', { prompt_id: 'queued-text', phase: 'final' })
+    r.f.advance(REGISTRY_SETTLE_MS + 1); r.status('idle'); await r.sync()
+    expect(r.outcomes(r.row.id)).toEqual(['not_taken', 'in_session', 'completed'])
+    expect(r.row.state).toBe('completed')
+  } else {
+    await r.hook('SessionEnd'); await r.sync()
+    expect(r.row).toMatchObject({ state: 'cancelled', reason: 'superseded' })
+  }
+  expect(r.offers).toHaveLength(1)
+})
+
+test.each(['waiting', 'already claimed'])('settled 59: after a blocked claim spool the late receipt completes an Item that is %s', async state => {
+  const r = await accountCut()
+  r.client.stop()
+  r.mode.writeItem = write => r.client.recordItemWrite(write)
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 }); await r.m.pump()
+  const did = r.offers[0].params.meta.did
+  await r.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] })
+  r.f.advance(20_001); r.claims.start(); await until(() => r.claims.blocked())
+  await r.hook('Stop', { prompt_id: 'automatic', phase: 'final' })
+  await r.hook('UserPromptSubmit', { prompt_id: 'received-late', dids: [did] })
+  await r.hook('Stop', { prompt_id: 'received-late', phase: 'final' })
+  await r.sync()
+  if (state === 'already claimed') {
+    const held = await r.mode.req('POST', r.mode.path + '/take', { connector: r.mode.connector, item_ids: [r.row.id], wait: 0, limit: 1 },
+      3000, { 'Idempotency-Key': crypto.randomUUID() })
+    expect(held?.json.data.items).toHaveLength(1)
+    await r.m.pump()
+    const takes = () => r.f.calls.filter(c => c.path.endsWith('/take')).length
+    const before = takes()
+    await r.m.pump()
+    expect(takes()).toBe(before)
+    const released = await fetch(r.f.base + '/v1/items/' + r.row.id + '/report', { method: 'PUT',
+      headers: { Authorization: 'Bearer test-member', 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+      body: JSON.stringify({ claim_id: held!.json.data.claim_id, outcome: 'not_taken', at: new Date(r.f.now()).toISOString() }) })
+    expect(await released.json()).toMatchObject({ data: { state: 'waiting' } })
+  }
+  r.m.initMain(); r.m.routeResume(itemRef(r.row), r.row.payload.text)
+  await until(() => r.claims.inSession(r.row.id)); await r.sync()
+  r.f.advance(REGISTRY_SETTLE_MS + 1); r.status('idle'); await r.sync()
+  expect(r.outcomes(r.row.id)).toEqual([...(state === 'already claimed' ? ['not_taken'] : []), 'not_taken', 'in_session', 'completed'])
+  expect(r.offers).toHaveLength(1)
 })
 
 async function waitingModelCut() {
