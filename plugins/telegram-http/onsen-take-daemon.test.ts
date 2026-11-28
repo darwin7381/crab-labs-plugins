@@ -98,8 +98,11 @@ for (const cfg of [{ GENESIS_LANES: '0' }, { ONSEN_RECORD: '0' }, { CHANNEL_INBO
     const health = await (await fetch(d.base + '/healthz')).json()
     expect(health.take).toEqual({ state: 'off', active: false, reason })
     const alerts = d.f.calls.filter(c => c.path === '/v1/messages' && c.body.sender === 'system:alert')
-    if (cfg.CHANNEL_INBOX_ONLY) expect(alerts).toHaveLength(0)
-    else expect(alerts.map(c => c.body)).toEqual([expect.objectContaining({ to: 'test-ops', body: expect.stringContaining(reason) })])
+    expect(alerts).toEqual([])
+    if (cfg.GENESIS_LANES === '0') {
+      await waitFor(() => d.f.calls.some(c => c.path.endsWith('/observation')))
+      expect(d.f.calls.filter(c => c.path.endsWith('/observation')).every(c => !('connector' in c.body) && !('held_item_ids' in c.body))).toBe(true)
+    }
   })
 }
 
@@ -615,10 +618,13 @@ for (const code of [404, 409, 0]) test('daemon waits for the Item endpoint after
   expect(d.f.calls.some(c => c.path.startsWith('/inbox'))).toBe(false)
   if (code === 409) {
     expect((await (await fetch(d.base + '/healthz')).json()).take).toEqual({ state: 'pull-refused', active: false, reason: 'not_take_member' })
-    await waitFor(() => d.f.calls.some(c => c.body.sender === 'system:alert'))
-    expect(d.f.calls.filter(c => c.body.sender === 'system:alert').map(c => c.body)).toEqual([
-      expect.objectContaining({ to: 'test-ops', body: expect.stringContaining('mac-mini/adam') }),
-    ])
+    const observations = () => d.f.calls.filter(c => c.path.endsWith('/observation'))
+    await waitFor(() => observations().length > 0)
+    for (const c of observations()) {
+      expect(c.body).not.toHaveProperty('connector')
+      expect(c.body).not.toHaveProperty('held_item_ids')
+    }
+    expect(d.f.calls.filter(c => c.body.sender === 'system:alert')).toEqual([])
   }
 })
 

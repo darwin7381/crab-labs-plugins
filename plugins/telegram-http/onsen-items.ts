@@ -82,13 +82,7 @@ export class ItemPeek {
       this.request = new AbortController()
       const r = await this.mode.req('GET', this.mode.path + '?' + q, undefined, (this.waitSeconds + 10) * 1000, undefined, this.request.signal)
       if (g !== this.generation || !this.mode.active) return
-      if (r?.status === 409) {
-        const why = r.json?.error?.code
-        if (why === 'not_take_member' || why === 'not_current_connector') {
-          this.mode.pause(why, why === 'not_current_connector' ? 45_000 : 60_000)
-          return
-        }
-      }
+      if (this.mode.pauseIfRefused(r)) return
       if (r?.status !== 200 || !Array.isArray(r.json.items) || typeof r.json.changed_after !== 'string' || !r.json.changed_after) { delay = 2000; return }
       const known = this.index()
       // Later pages can miss rows committed since page one. Resume from page one's token.

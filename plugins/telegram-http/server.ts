@@ -66,7 +66,7 @@ import { ScreenStatus, Since, composeRecord, isVerdictMenu, judgeFor, screenJudg
 import { Claims } from './onsen-claims.ts'
 import { ItemReceiver } from './onsen-receive.ts'
 import { ItemPeek, itemRef, type ItemRef, type InboxItem } from './onsen-items.ts'
-import { machineName, takeAlert, takeOff, TakeMode } from './onsen-take.ts'
+import { machineName, takeOff, TakeMode } from './onsen-take.ts'
 import { ObservationPut } from './onsen-observation.ts'
 import { MentionCards } from './onsen-mentions.ts'
 import { JevJudge, QUESTIONS_PATH_DEFAULT } from './screen-judge-jev.ts'
@@ -3686,11 +3686,7 @@ function liveSetting(k: LiveKey): string | undefined {
   }
   return liveFile.v[k]
 }
-if (CONNECTOR) {
-  const unavailable = (reason: string) => takeAlert(machineName() + '/' + ONSEN_AGENT, reason, text => { void ownerSay('system:alert', text) })
-  if (takeMode) { takeMode.onUnavailable = unavailable; void takeMode.probe() }
-  else unavailable(takeOffReason)
-}
+if (takeMode) void takeMode.probe()
 const jevScreenValue = (): string | undefined => liveSetting('JEV_SCREEN')
 if (!INBOX_ONLY && (Lanes.LANES_ON || onsen?.cfg.record)) registry.start()
 if (onsen && onsen.cfg.record && !INBOX_ONLY) {
@@ -3726,11 +3722,11 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   // /v1/members/<agent>/observation with the credential of /status/batch, as the record is handed out (feed) when it changed, else every 15 s (the
   // record computed again); one in flight, the newest after it, nothing queued, no spool. ONSEN_OBSERVATION lists the agent (re-read as JEV_SCREEN)
   const obsExceptions = join(process.env.LANES_DIR ?? join(AGENT_WORKSPACE_DIR, '.lanes'), 'run', 'screen-exceptions.jsonl')
-  const obsPut = new ObservationPut({ agent: ONSEN_AGENT, on: () => takeMode?.observationRequired || switchOn(liveSetting('ONSEN_OBSERVATION'), ONSEN_AGENT),
+  const obsPut = new ObservationPut({ agent: ONSEN_AGENT, on: () => takeMode ? takeMode.probed : switchOn(liveSetting('ONSEN_OBSERVATION'), ONSEN_AGENT),
     put: async (body, timeoutMs) => {
       const r = await onsen.putBytes(`/v1/members/${encodeURIComponent(ONSEN_AGENT)}/observation`, new TextEncoder().encode(JSON.stringify(body)), 'application/json', timeoutMs,
         body.connector ? { 'Idempotency-Key': randomBytes(16).toString('hex') } : undefined)
-      if (body.connector && r?.status === 409 && r.json?.error?.code === 'not_current_connector') takeMode?.pause('not_current_connector', 45_000)
+      if (body.connector) takeMode?.pauseIfRefused(r)
       return r
     },
     refresh: () => { try { feed(compute()) } catch (e) { log('warn', `onsen: status: ${e}`) } },
@@ -3744,7 +3740,7 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     if (takeMode?.active) Object.assign(r.observation, { connector: takeMode.connector, held_item_ids: itemClaims!.held() })
     lastView = pub; lastObservation = r.observation
     status.update(pub)
-    if (!takeMode || takeMode.active) obsPut.update(r.observation)                                          // WO-180: the same point, the same object (sent only if it changed or the beat is due)
+    obsPut.update(r.observation)                                          // WO-180: the same point, the same object (sent only if it changed or the beat is due)
     screenStatus?.programChanged(v)
     // the Esc wrap-up reads the record when it changes, not only at its 2 s tick (WO-169 criterion 4: the next item within 2 s of an interruption seen).
     // WO-177 一: and M1 offers what it held the moment the record says the main can take it: the edge is the member state (decideWake's: a wall or a

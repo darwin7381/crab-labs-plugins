@@ -60,10 +60,7 @@ export class ItemReceiver {
         retry++
         if (!this.claims.blocked()) r = await take().catch(() => null)
       }
-      if (r?.status === 409) {
-        const why = r.json?.error?.code
-        if (why === 'not_current_connector' || why === 'not_take_member') this.mode.pause(why, why === 'not_current_connector' ? 45_000 : 60_000)
-      }
+      this.mode.pauseIfRefused(r)
       if (r?.status !== 200) return empty()
       const data = r.json.data
       if (data.next_not_before) this.dueAt(data.next_not_before)

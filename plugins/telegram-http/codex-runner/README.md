@@ -8,7 +8,7 @@ Codex (OpenAI Codex CLI) is the Onsen member `codex`. This program is the part o
 
 ## What it does
 
-1. The runner peeks at `GET /v1/members/codex/items`. When a worker and the Item’s thread are free it takes that Item by ID. Other work waits in Onsen. A member still on pull alerts its configured owner and retries after 60 seconds. A competing connector waits 45 seconds. The loopback `GET /healthz` reports the take state, reason and held claims. Read the listening port from `<state dir>/health-port`.
+1. The runner peeks at `GET /v1/members/codex/items`. When a worker and the Item’s thread are free it takes that Item by ID. Other work waits in Onsen. A member still on pull sends observations without a connector and retries after 60 seconds. A competing connector waits 45 seconds. The loopback `GET /healthz` reports the take state, reason and held claims. Read the listening port from `<state dir>/health-port`.
 2. Calls use their thread’s Codex session. A Call without a thread starts a new one and its reply carries the new thread. Page and Telegram messages use the chat’s existing session, or the Onsen conversation if the message has no chat. The request, quoted context and attachments come from the Item granted by take.
 3. The runner reports `in_session` when it accepts a job, then downloads attachments, prepares the repository and starts `codex exec`. Its member observation renews held Item IDs every 15 seconds, including during intake pauses. At most `CODEX_RUNNER_MAX` sessions run concurrently.
 4. A peer receives a reply linked to the Call and thread. A person receives a reply in their conversation. Alerts and schedules record their result on the Call. Once work finishes, the runner spools `Call.result` and a `completed` Item report with the confirmed response message IDs. A failed job records outcome `failed`. Three successful reply responses without a valid ID end the job with a diagnostic in its report.
@@ -67,7 +67,6 @@ bun codex-runner.ts --profile       # once: display name Codex, role 外部模�
 | `CODEX_RUNNER_CREDENTIAL_FILE` | `~/.config/mesh/codex.credential` | the `codex` mesh credential; read again when the file changes |
 | `ONSEN_BASE` | `https://core.kbro.ai/api/onsen` | |
 | `ONSEN_HOST` | the host name | the member's machine in Onsen (the plist sets `macmini`) |
-| `ONSEN_OWNER` | mapped Telegram ops recipient | Onsen member who receives intake alerts. Set it in the runner's environment when its Telegram access list has no mapped ops recipient. |
 | `ONSEN_RECORD`, `ONSEN_AGENTS` | on, `*` | disabling recording for this member pauses intake |
 | `CODEX_RUNNER_HEALTH_PORT` | `0` | loopback port for `/healthz`. Zero selects an available port at startup. |
 | `CODEX_RUNNER_ROOT` | `~/onsen-codex` | one folder per conversation |

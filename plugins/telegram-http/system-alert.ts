@@ -148,10 +148,10 @@ let _notify: Notify = () => {}
 let _log: Log = () => {}
 const recent = new Map<string, { suppressed: number; lastSentAt: number }>()
 
-function sendAlert(msg: string, source: string, onTransition?: Notify): void {
+function sendAlert(msg: string, source: string): void {
   const key = dedupeKey(msg)
   const now = Date.now()
-  const entry = onTransition ? undefined : recent.get(key)
+  const entry = recent.get(key)
   if (entry && now - entry.lastSentAt < DEDUPE_WINDOW_MS) {
     entry.suppressed++
     return
@@ -159,9 +159,8 @@ function sendAlert(msg: string, source: string, onTransition?: Notify): void {
   const suffix = entry?.suppressed
     ? `\n（同類警告過去 ${Math.round(DEDUPE_WINDOW_MS / 60000)} 分鐘內另發生 ${entry.suppressed} 次，已合併）`
     : ''
-  if (!onTransition) recent.set(key, { suppressed: 0, lastSentAt: now })
-  const notify = onTransition ?? _notify
-  notify(`⚠️ 系統警告${onTransition ? '' : '（claude TUI 自身輸出，非 AI 回覆）'}\n${msg.slice(0, MAX_ALERT_CHARS)}\n(${source})${suffix}`)
+  recent.set(key, { suppressed: 0, lastSentAt: now })
+  _notify(`⚠️ 系統警告（claude TUI 自身輸出，非 AI 回覆）\n${msg.slice(0, MAX_ALERT_CHARS)}\n(${source})${suffix}`)
   _log('info', `system-alert forwarded: ${key.slice(0, 80)}`)
 }
 
@@ -196,9 +195,8 @@ export function relayTuiAlert(msg: string, source: string): void {
  * (delivery-triggered, empty queue). Both shapes argued for the same fix:
  * detection without notification is not detection.
  */
-export function sendOpsAlert(msg: string, source: string, onTransition?: Notify): void {
-  // A caller observing transitions already suppresses repeats. Its owner route also works before the optional TUI watcher starts.
-  sendAlert(msg, source, onTransition)
+export function sendOpsAlert(msg: string, source: string): void {
+  sendAlert(msg, source)
 }
 
 // ---- PRIMARY layer: OTLP/HTTP JSON logs receiver ---------------------------

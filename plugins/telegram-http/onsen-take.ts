@@ -1,6 +1,5 @@
 import { hostname } from 'os'
 import type { ActionReq } from './onsen-client.ts'
-import { sendOpsAlert } from './system-alert.ts'
 
 export function machineName(host = process.env.ONSEN_HOST): string {
   return (host?.trim() || hostname().replace(/\.local$/, '')).toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+/, '').slice(0, 32) || 'unknown'
@@ -12,19 +11,14 @@ export type TakeHealth = { state: 'take' | 'pull-refused' | 'off'; active: boole
 export function takeOff(reason: string): TakeHealth {
   return { state: 'off', active: false, reason }
 }
-export function takeAlert(connector: string, reason: string, notify: (text: string) => void): void {
-  sendOpsAlert(`${connector} 已停止領取 Onsen Item（${reason}）。請檢查成員的 take 設定與 connector 狀態。`, 'onsen-take', notify)
-}
-
 export class TakeMode {
   readonly path: string
   readonly connector: string
   active = false
-  observationRequired = false
   private stopped = false
   private timer?: ReturnType<typeof setTimeout>
   private reason = 'probing'
-  onUnavailable?: (reason: string) => void
+  get probed(): boolean { return this.reason !== 'probing' }
 
   health(): TakeHealth {
     if (this.active) return { state: 'take', active: true, reason: null }
@@ -42,18 +36,26 @@ export class TakeMode {
   async probe(): Promise<void> {
     const query = new URLSearchParams({ limit: '1', connector: this.connector })
     const r = await this.req('GET', this.path + '?' + query, undefined, 5000).catch(() => null)
-    if (this.stopped) return
+    if (this.stopped || this.pauseIfRefused(r)) return
     if (r?.status !== 200) {
       const code = r?.json?.error?.code
       const reason = r?.status === 409 && typeof code === 'string' ? code : r ? `HTTP ${r.status} ${code ?? 'probe refused'}` : 'probe unavailable'
-      this.pause(reason, code === 'not_current_connector' ? 45_000 : 60_000)
+      this.pause(reason, 60_000)
       return
     }
     clearTimeout(this.timer)
     this.reason = ''
-    this.active = this.observationRequired = true
+    this.active = true
     this.log('onsen take: started ' + this.connector)
     this.changed(true)
+  }
+
+  pauseIfRefused(r: Awaited<ReturnType<ItemRequest>>): boolean {
+    if (r?.status !== 409) return false
+    const code = r.json?.error?.code
+    if (code !== 'not_take_member' && code !== 'not_current_connector') return false
+    this.pause(code, code === 'not_current_connector' ? 45_000 : 60_000)
+    return true
   }
 
   pause(reason: string, ms: number): void {
@@ -62,11 +64,11 @@ export class TakeMode {
     const newReason = reason !== this.reason
     if (newReason) this.log(`onsen take: ${this.connector} ${reason}; retry in ${ms / 1000}s`)
     this.reason = reason
-    if (this.active) { this.active = false; this.changed(false) }
+    this.active = false
+    if (newReason) this.changed(false)
     clearTimeout(this.timer)
     this.timer = this.later(() => { this.timer = undefined; void this.probe() }, ms)
     this.timer.unref()
-    if (newReason) this.onUnavailable?.(reason)
   }
 
   stop(): void {

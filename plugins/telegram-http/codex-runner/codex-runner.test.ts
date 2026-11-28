@@ -729,19 +729,21 @@ describe('restart', () => {
   })
 })
 
-for (const recording of [true, false]) test('a Codex intake outage alerts the owner and is visible over /healthz, recording=' + recording, async () => {
-  const { cfg, onsen, log } = setup({ record: recording, owner: 'test-ops' })
+for (const recording of [true, false]) test('a Codex intake refusal is visible over /healthz without an alert, recording=' + recording, async () => {
+  const { cfg, onsen, log } = setup({ record: recording })
   onsen.items.mode(409)
   onsen.items.add('unclaimed')
   const r = runner(cfg)
   await r.start()
   const reason = recording ? 'not_take_member' : 'recording_off'
-  await until(() => onsen.records.length > 0)
+  if (recording) await until(() => onsen.observations.length > 0)
   expect(log.some(line => line.includes(reason))).toBe(true)
   const port = readFileSync(join(cfg.stateDir, 'health-port'), 'utf8')
   const health = await (await fetch('http://127.0.0.1:' + port + '/healthz')).json()
   expect(health.take).toEqual({ state: recording ? 'pull-refused' : 'off', active: false, reason, held: [] })
-  expect(onsen.records).toEqual([expect.objectContaining({ to: 'test-ops', sender: 'system:alert', body: expect.stringContaining(reason) })])
+  expect(onsen.records).toEqual([])
+  expect(onsen.observations.every(o => !('connector' in o) && !('held_item_ids' in o))).toBe(true)
+  expect(onsen.items.calls.filter(c => c.query.has('wait'))).toEqual([])
   expect(onsen.paths.filter(p => p.endsWith('/items'))).toHaveLength(recording ? 1 : 0)
   expect(onsen.items.rows.get('unclaimed')!.state).toBe('waiting')
 })
@@ -797,7 +799,7 @@ test('alerts and schedules complete with their Call result and no peer reply', a
   expect(onsen.records).toHaveLength(0)
 })
 
-test('acceptance binds before downloads and a paused probe keeps renewing the held claim', async () => {
+test('acceptance binds before downloads and refusal stops renewing the held claim', async () => {
   const { cfg, onsen, codexLog } = setup({ heartbeatMs: 75, now: () => Date.now() + 21_000 })
   const row = onsen.push({ sender: 'eve', call_id: 'slow', payload: { text: 'check', msg_id: 71 },
     attachments: [{ name: 'slow.txt', url: onsen.base + '/v1/files/slow' }] })
@@ -809,15 +811,16 @@ test('acceptance binds before downloads and a paused probe keeps renewing the he
   try {
     await until(() => !!row.in_session_at)
     expect(codexLog()).toEqual([])
-    onsen.items.mode(409); onsen.items.add('wake-peek', 'mail')
-    await until(() => !(r.health().take as any).active)
-    for (let n = 0; n < 2; n++) {
-      const before = row.claim!.expires_at
-      onsen.items.advance(25_000)
-      await until(() => row.claim?.expires_at !== before)
-    }
-    expect(row.state).toBe('claimed')
-    expect(onsen.observations.at(-1).held_item_ids).toContain(row.id)
+    await until(() => onsen.items.polling() > 0)
+    onsen.items.mode(409)  // Only the heartbeat sees the refusal. An empty poll is already in flight.
+    await until(() => !(r.health().take as any).active && onsen.items.polling() === 0)
+    expect(r.health().take).toMatchObject({ state: 'pull-refused', active: false, reason: 'not_take_member', held: [row.id] })
+    const deadline = row.claim!.expires_at
+    const after = onsen.observations.length
+    await until(() => onsen.observations.length > after)
+    expect(onsen.observations.at(-1)).not.toHaveProperty('connector')
+    expect(onsen.observations.at(-1)).not.toHaveProperty('held_item_ids')
+    expect(row.claim!.expires_at).toBe(deadline)
   } finally { release() }
   await until(done(onsen, 'slow'))
   expect(onsen.statesOf('slow')).toEqual(['in_session', 'completed'])
@@ -916,13 +919,5 @@ describe('the folder', () => {
       root: '/h/onsen-codex', stateDir: '/h/onsen-codex/.runner', max: 3, timeoutMs: 1_800_000, killGraceMs: 10_000, sandbox: 'workspace-write', codexBin: 'codex' })
     const d = configFromEnv({ HOME: '/h', CODEX_RUNNER_MAX: '2', CODEX_RUNNER_TIMEOUT_S: '60', ONSEN_BASE: 'http://x/api/onsen/', CODEX_RUNNER_CREDENTIAL_FILE: '/c' })
     expect(d).toMatchObject({ max: 2, timeoutMs: 60_000, base: 'http://x/api/onsen', credentialFile: '/c' })
-  })
-
-  test('ops alerts use the configured owner or a mapped, allowlisted ops recipient', () => {
-    const { dir } = setup()
-    writeFileSync(join(dir, 'access.json'), JSON.stringify({ allowFrom: ['1828173984', '6736970916'], alertTo: ['6736970916'] }))
-    const env = { HOME: dir, TELEGRAM_STATE_DIR: dir }
-    expect(configFromEnv(env).owner).toBe('joey-test')
-    expect(configFromEnv({ ...env, ONSEN_OWNER: 'test-ops' }).owner).toBe('test-ops')
   })
 })

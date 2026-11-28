@@ -71,7 +71,7 @@ export function fakeItems(member = 'adam', token = 'test-member', extra?: (req: 
     if (path.endsWith('/commands')) return detail({ name: member, kind: 'agent' })
     const base = '/v1/members/' + member + '/items'
     const connector = b.connector ?? q.get('connector')
-    if (connector && path.startsWith(base) && mode !== 200) return error(mode, mode === 409 ? 'not_take_member' : mode === 400 ? 'invalid_request' : 'not_found')
+    if (connector && (path.startsWith(base) || path.endsWith('/observation')) && mode !== 200) return error(mode, mode === 409 ? 'not_take_member' : mode === 400 ? 'invalid_request' : 'not_found')
     if (connector) {
       if (owner && owner !== connector && now < seen + 45_000) return error(409, 'not_current_connector', { current: owner })
       owner = connector; seen = now
@@ -150,7 +150,7 @@ export function fakeItems(member = 'adam', token = 'test-member', extra?: (req: 
     if (delayTake && path === base + '/take') await Bun.sleep(delayTake)
     return answer
   } })
-  return { base: 'http://127.0.0.1:' + server.port, rows, calls, scheduleCalls, history, add, change, now: () => now,
+  return { base: 'http://127.0.0.1:' + server.port, rows, calls, scheduleCalls, history, add, change, polling: () => waiters.size, now: () => now,
     advance(ms: number) { now += ms; expire() }, mode(status: number) { mode = status }, down(on: boolean) { unavailable = on },
     holdReports(on: boolean) { holdReports = on }, delayTake(ms: number) { delayTake = ms }, stop() { for (const wake of waiters) wake(); return server.stop(true) } }
 }
