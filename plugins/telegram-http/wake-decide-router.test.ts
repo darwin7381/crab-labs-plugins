@@ -1,6 +1,6 @@
 // WO-157 phase 2 (Chiron's decisions, mesh-12029), the router in this process (lanes.ts, role tg) with LANES_WAKE_DECIDE on for this agent: every decision
 // goes through decideWake and its route row says decided_by new with the rule wake:<id>; the doing code is today's. One test per decision:
-//   1 a colleague's no_reply reply WITH reply_to wakes the line that asked (old: the ledger); the daemon's own notice (the router's interim) is sent
+//   1 a colleague's no_reply reply WITH reply_to wakes the line that asked; the daemon's own notice (the router's interim) is sent
 //     urgency silent and a silent item is recorded only
 //   2 (13:46Z) one state source, statusOf (the server's mainStatus): main / lane / record / hold and now / after this step; the 此刻 line and the
 //     same-matter gate read it too; keep-warm on a busy main is recorded only; no status computed here = the old path
@@ -50,7 +50,7 @@ test('the switch: on for this agent (a list naming it)', () => {
   expect(L.wakeDecideOn()).toBe(true)
 })
 
-test('decision 1: a no_reply reply WITH reply_to to the main\'s own call wakes the main (old path: the ledger); its row says decided_by new, rule wake:owner', async () => {
+test('decision 1: a no_reply reply WITH reply_to to the main\'s own call wakes the main and its row says decided_by new, rule wake:owner', async () => {
   await idle()
   member = 'idle'
   // the main called eve (its outbound, as /lanes/outbound records it), eve answers no_reply with reply_to
@@ -252,7 +252,7 @@ test('switch off for the agent: the old rules, decided_by old', async () => {
     expect(L.wakeDecideOn()).toBe(false)
     st.outbound['88003'] = { owner: 'main', thread: null } as any
     const ev = mesh('eve', '回 #88003：好', { no_reply: true, reply_to_id: '88003' })
-    expect(await L.routeEvent(ev)).toMatchObject({ target: 'ledger', rule: 'mesh-no-reply' })
+    expect(await L.routeEvent(ev)).toMatchObject({ target: 'main', rule: 'mesh-no-reply' })
     expect(rowOf(ev.id)).toMatchObject({ decided_by: 'old' })
     expect(rowOf(ev.id).wake_target).toBeUndefined()
   } finally { process.env.LANES_WAKE_DECIDE = `someone-else,${AGENT}` }
