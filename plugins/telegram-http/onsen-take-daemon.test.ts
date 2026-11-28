@@ -150,10 +150,12 @@ test('real daemon completes an idle main person item with its reply after the fi
   expect(offers.filter(n => n.content.includes(row.id))).toHaveLength(1)
 }, 25000)
 
-test('a bound item whose observation stops for 45 s is not delivered twice or reported to an expired claim', async () => {
+test('after 45 s without renewal the main completes its original claim with one delivery and no re-take', async () => {
   const { d, row, offers, stop } = await activePerson('lease-expiry')
   await waitFor(() => d.f.calls.some(c => c.path.endsWith('/observation') && c.body.held_item_ids?.includes(row.id)))
-  const claim = row.claim!.id, last = d.f.calls.length
+  const originalClaimId = row.claim!.id
+  const itemPath = '/v1/items/' + row.id
+  const lastRenewal = d.f.calls.length
   // Server time advances with no observation in the interval.
   const untilExpiry = Date.parse(row.claim!.expires_at) - d.f.now()
   d.f.advance(untilExpiry - 1)
@@ -161,14 +163,19 @@ test('a bound item whose observation stops for 45 s is not delivered twice or re
   d.f.advance(1)
   expect(row).toMatchObject({ state: 'waiting', reason: 'cut', claim: null })
   expect(row.events!.at(-1)?.kind).toBe('lease_expired')
-  expect(d.f.calls.slice(last).some(c => c.path.endsWith('/observation'))).toBe(false)
-  await waitFor(() => d.f.calls.slice(last).some(c => c.path === '/v1/items/' + row.id))
-  const beforeStop = d.f.calls.length
+  expect(d.f.calls.slice(lastRenewal).some(c => c.path.endsWith('/observation'))).toBe(false)
+  await waitFor(() => d.f.calls.slice(lastRenewal).some(c => c.path === itemPath))
   await stop()
-  await waitFor(() => row.state === 'completed' || d.f.calls.slice(beforeStop).some(c =>
+  await waitFor(() => d.f.calls.slice(lastRenewal).some(c =>
     c.path.endsWith('/observation') && Array.isArray(c.body.held_item_ids) && !c.body.held_item_ids.includes(row.id)), 18_000)
+
+  const afterExpiry = d.f.calls.slice(lastRenewal)
   expect(offers.filter(n => n.content.includes(row.id))).toHaveLength(1)
-  expect(d.f.calls.slice(last).filter(c => c.path.endsWith('/report') && c.body.claim_id === claim).map(c => c.body.outcome)).toEqual([])
+  expect(afterExpiry.filter(c => c.path.endsWith('/take') && c.body.item_ids.includes(row.id))).toHaveLength(0)
+  const reports = afterExpiry.filter(c => c.path === itemPath + '/report').map(c => c.body)
+  expect(reports).toEqual([expect.objectContaining({ outcome: 'completed', claim_id: originalClaimId })])
+  expect(d.f.history.filter(h => h.item_id === row.id).map(h => h.body.outcome)).toEqual(['in_session', 'completed'])
+  expect(row.state).toBe('completed')
 }, 35_000)
 
 for (const [name, cfg, reason] of [
