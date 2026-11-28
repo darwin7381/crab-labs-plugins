@@ -71,8 +71,8 @@ test('switch, prerequisites, stable machine/member and all probe refusals', asyn
   expect(takeRefusal(valid)).toBeUndefined()
   expect(machineName('  --Mac_Mini  ')).toBe('mac-mini')
   const { path, connector, req } = r.mode
-  for (const status of [400, 404, 409]) { r.f.mode(status); expect(await deliveryMode(req, path, connector)).toBe('pull') }
-  expect(await deliveryMode(async () => { throw Error('offline') }, path, connector)).toBe('pull')
+  for (const status of [400, 404, 409]) { r.f.mode(status); expect(await deliveryMode(req, path, connector)).toMatchObject({ take: false, status }) }
+  expect((await deliveryMode(async () => { throw Error('offline') }, path, connector)).take).toBe(false)
   r.f.mode(200); await r.mode.probe()
   expect(r.mode.active).toBe(true)
   expect(r.f.calls.every(c => c.query.get('connector') === 'mac-mini/adam' && c.query.get('limit') === '1')).toBe(true)
@@ -145,6 +145,25 @@ test('a routing failure retries its waiting row after the cursor advances withou
   expect(routed).toEqual(['one', 'two', 'three', 'four', 'two', 'two'])
   expect(r.f.calls.some(c => c.query.has('changed_after'))).toBe(true)
 }, 7000)
+
+test('the probe clock corrects both not_before and the 20-second unbound claim deadline', async () => {
+  const r = rig()
+  r.f.advance(3600_000)
+  await r.mode.probe()
+  const now = r.mode.now
+  expect(Math.abs(now() - r.f.now())).toBeLessThan(100)
+  const claims = new Claims(join(r.dir, 'skew.json'), r.client, () => {}, () => {}, now)
+  clean.push(() => claims.stop())
+  const row = r.f.add('skew'), taken = new Date(r.f.now() - 20_001).toISOString()
+  claims.taken({ ...row, claim: { id: 'skew-claim', connector: r.mode.connector, session_id: null, taken_at: taken, expires_at: taken } }, itemRef(row))
+  await until(() => r.client.hasItemReports())
+  row.not_before = new Date(now() + 120).toISOString()
+  const routed: string[] = []
+  const peek = new ItemPeek(r.mode, () => new Map(), async it => { routed.push(it.id) }, () => true)
+  clean.push(() => peek.stop())
+  await peek.poll(); expect(routed).toEqual([])
+  await until(() => routed.includes(row.id))
+})
 
 test('an unchanged row in the overlap produces about one peek per second over ten seconds', async () => {
   const r = rig()

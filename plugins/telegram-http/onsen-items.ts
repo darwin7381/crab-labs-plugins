@@ -63,7 +63,7 @@ export class ItemPeek {
   }
 
   dueAt(time: string): void {
-    this.wake(Date.parse(time))
+    this.wake(Date.now() + (Date.parse(time) - this.mode.now()))
   }
 
   private wake(ms: number): void {
@@ -109,7 +109,7 @@ export class ItemPeek {
       this.nextChangedAfter ??= r.json.changed_after
       for (const it of r.json.items as InboxItem[]) {
         if (g !== this.generation || !this.canRead()) return
-        if (it.not_before && Date.parse(it.not_before) > Date.now()) { this.dueAt(it.not_before); continue }
+        if (it.not_before && Date.parse(it.not_before) > this.mode.now()) { this.dueAt(it.not_before); continue }
         const version = known.get(it.id)
         if (version === undefined || it.version > version) {
           const failure = this.failures.get(it.id)

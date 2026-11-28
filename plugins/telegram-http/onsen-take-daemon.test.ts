@@ -41,7 +41,7 @@ async function waitFor(ok: () => boolean | Promise<boolean>, ms = 5000) {
   while (!await ok() && Date.now() < end) await Bun.sleep(15)
   expect(await ok()).toBe(true)
 }
-async function daemon(env: Record<string, string> = {}, initialMode = 200, setup?: (root: string, f: ReturnType<typeof fakeItems>) => Record<string, string>) {
+async function daemon(env: Record<string, string> = {}, initialMode = 200, setup?: (root: string, f: ReturnType<typeof fakeItems>) => Record<string, string> | Promise<Record<string, string>>) {
   const f = fakeItems(), root = mkdtempSync(join(tmpdir(), 'take-daemon-')), state = join(root, 'tg'), lanes = join(root, '.lanes')
   clean.push(async () => { try { await f.stop() } finally { rmSync(root, { recursive: true, force: true }) } })
   f.mode(initialMode)
@@ -49,7 +49,7 @@ async function daemon(env: Record<string, string> = {}, initialMode = 200, setup
   writeFileSync(join(state, 'access.json'), JSON.stringify({ dmPolicy: 'allowlist', allowFrom: ['1'], groups: {}, pending: {}, ackReaction: '' }))
   copyFileSync(join(import.meta.dir, 'lanes-router.fleet.json'), join(lanes, 'router.json'))
   const port = await freePort()
-  const settings = setup?.(root, f)
+  const settings = await setup?.(root, f)
   const childEnv: Record<string, string | undefined> = {
     PATH: process.env.PATH, GIT_ALLOW_PROTOCOL: 'file', TMPDIR: root, HOME: join(root, 'home'), TELEGRAM_HTTP_PORT: String(port), TELEGRAM_STATE_DIR: state,
     AGENT_WORKSPACE_DIR: root, GENESIS_LANES: '1', LANES_AGENT: 'adam', ONSEN_HOST: 'Mac-Mini', ONSEN_TAKE: '*',
@@ -121,7 +121,7 @@ test('daemon probes only once on an old server and keeps observation on the lega
   await waitFor(() => d.f.calls.some(c => c.path.endsWith('/observation')))
   expect(d.f.calls.filter(c => c.path.endsWith('/items'))).toHaveLength(1)
   expect(d.f.calls.find(c => c.path.endsWith('/observation'))!.body.connector).toBeUndefined()
-  expect(d.log().split('\n').filter(l => l.includes('mode probe did not return 200'))).toHaveLength(1)
+  expect(d.log().split('\n').filter(l => l.includes('mode probe: HTTP 400'))).toHaveLength(1)
 })
 
 test('real daemon routes one unclaimed notification per album at count or 1.5 s and replaces a newer waiting edit', async () => {
@@ -171,13 +171,22 @@ test('a deferred mail hand-back is reattached as a batched unclaimed M1 item', a
 })
 
 test('stopped and over-budget threads and a missing lane hand their queued items back', async () => {
-  const ids = ['stopped', 'budget', 'gone']
-  const d = await daemon({}, 200, (root, f) => {
+  const ids = ['stopped', 'budget', 'gone', 'owned-gone']
+  const d = await daemon({}, 200, async (root, f) => {
     const journal = new Journal(join(root, 'tg', 'lanes', 'state.jsonl'))
     const lanes: Record<string, any> = {}, threads: Record<string, any> = {}
     for (const id of ids) {
       const row = f.add(id, 'call', { from: 'eve' }), lane = 'adam.worker.' + row.number
-      if (id !== 'gone') {
+      if (id === 'owned-gone') {
+        const taken = await fetch(f.base + '/v1/members/adam/items/take', { method: 'POST',
+          headers: { Authorization: 'Bearer test-member', 'Idempotency-Key': id },
+          body: JSON.stringify({ connector: 'mac-mini/adam', item_ids: [id], wait: 0, limit: 1 }) })
+        expect(taken.status).toBe(200)
+        const dir = join(root, 'tg', 'onsen')
+        mkdirSync(dir, { recursive: true })
+        writeFileSync(join(dir, 'claims.json'), JSON.stringify({ claims: { [id]: { claim_id: row.claim!.id, taken_at: row.claim!.taken_at } } }))
+      }
+      if (!id.endsWith('gone')) {
         lanes[lane] = { id: lane, kind: 'worker', status: 'idle', thread: id, session_id: randomUUID(), runs: 0 }
         threads[id] = { id, lane, fresh: id === 'budget' ? 1000 : 0, stopped: id === 'stopped' ? 'closed' : null }
       }
@@ -609,8 +618,9 @@ for (const code of [404, 409, 0]) test('daemon stays on pull after probe ' + (co
   const cfg: Record<string, string> = {}
   if (!code) cfg.ONSEN_BASE = 'http://127.0.0.1:' + await freePort()
   const d = await daemon(cfg, code || 200)
-  await waitFor(() => d.log().includes('mode probe did not return 200'))
-  expect(d.log().split('\n').filter(s => s.includes('mode probe did not return 200'))).toHaveLength(1)
+  const refusal = 'mode probe: ' + (code ? 'HTTP ' + code : 'no response')
+  await waitFor(() => d.log().includes(refusal))
+  expect(d.log().split('\n').filter(s => s.includes(refusal))).toHaveLength(1)
   expect(d.f.calls.filter(c => c.query.has('wait') || c.path.endsWith('/take'))).toHaveLength(0)
   expect(d.f.calls.filter(c => c.path.endsWith('/items'))).toHaveLength(code ? 1 : 0)
 })
