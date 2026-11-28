@@ -28,6 +28,7 @@ export class Claims implements ClaimStore {
   private done: Done[] = []
   private waits = new Map<string, { state: ReceivingState; ids: string[] }>()
   private selections: Array<{ at: number; target: ReceivingTarget | null }> = []
+  private receivers = new Map<string, string>()
   pollOffset: number | null = null
   private connector?: string
   private timers = new Map<string, ReturnType<typeof setTimeout>>()
@@ -44,6 +45,10 @@ export class Claims implements ClaimStore {
       }
       this.waits = new Map(data.waits ?? [])
       this.selections = data.selections ?? []
+      this.receivers = new Map(data.receivers ?? [])
+      // A C6 ledger from before ruling 27 can still hold an accepted or unacknowledged cut claim.
+      for (const [id, r] of Object.entries(this.rows))
+        if (r.target && r.in_session_at && r.session_id && !this.receivers.has(id)) this.receivers.set(id, r.session_id)
       this.done = data.done ?? []
       this.connector = data.connector
       this.pollOffset = data.pollOffset ?? null
@@ -75,7 +80,7 @@ export class Claims implements ClaimStore {
     const tmp = this.file + '.' + process.pid + '.tmp'
     this.done = this.done.filter(d => d.at > this.now() - week).slice(-5000)
     writeFileSync(tmp, JSON.stringify({ claims: this.rows, done: this.done, connector, pollOffset: pollOffset ?? undefined, waits: [...this.waits],
-      selections: this.selections.length ? this.selections : undefined }), { mode: 0o600 })
+      selections: this.selections.length ? this.selections : undefined, receivers: this.receivers.size ? [...this.receivers] : undefined }), { mode: 0o600 })
     renameSync(tmp, this.file)
   }
   waitingSessions() { return this.waits.keys() }
@@ -90,6 +95,10 @@ export class Claims implements ClaimStore {
   }
   lastTarget(session: string): ReceivingTarget | null {
     return this.selections.findLast(s => s.target?.session_id === session)?.target ?? null
+  }
+  firstReceiver(id: string): string | undefined { return this.receivers.get(id) }
+  recoverReceiver(id: string, session: string): void {
+    if (!this.receivers.has(id)) { this.receivers.set(id, session); this.save() }
   }
   waitingForState(session: string, id: string): boolean { return this.waits.get(session)?.ids.includes(id) ?? false }
   observeState(session: string, state: ReceivingState): void {
@@ -171,7 +180,10 @@ export class Claims implements ClaimStore {
       }
     }
     row.last_outcome = body.outcome
-    if (body.outcome === 'in_session') { row.in_session_at = body.at; row.session_id ??= body.session_id }
+    if (body.outcome === 'in_session') {
+      row.in_session_at = body.at; row.session_id ??= body.session_id
+      if (row.target && row.session_id && !this.receivers.has(id)) this.receivers.set(id, row.session_id)
+    }
   }
   /** A queued pre-C6 report has the old wire value even after the ledger has been migrated. */
   reportBody({ item_id, body }: ItemReport): ItemReport['body'] {
@@ -183,6 +195,7 @@ export class Claims implements ClaimStore {
   acknowledged(line: ItemReport, accepted: boolean): void {
     const { item_id: id, body } = line
     if (intermediate.has(body.outcome)) return
+    if (accepted && ['completed', 'stopped', 'not_applied'].includes(body.outcome)) this.receivers.delete(id)
     if (accepted && body.outcome === 'completed') {
       if (!this.done.some(d => d.claim_id === body.claim_id && d.item_id === id))
         this.done.push({ item_id: id, claim_id: body.claim_id, at: this.now() })

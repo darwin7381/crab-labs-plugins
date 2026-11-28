@@ -837,9 +837,9 @@ test('/roam without a target creates one menu Action; a returned choice is handl
   }
 }, 15000)
 
-async function target(d: Awaited<ReturnType<typeof daemon>>) {
+async function target(d: Awaited<ReturnType<typeof daemon>>, resumed?: string) {
   const child = Bun.spawn(['sleep', '300']), tmux = randomUUID()
-  let sid = tmux
+  let sid = resumed ?? tmux
   clean.push(async () => { child.kill(); await child.exited })
   const cwd = join(d.root, 'lab-project')
   const home = join(d.root, 'home', '.claude'), regs = join(home, 'sessions'), project = join(home, 'projects', cwd.replaceAll('/', '-'))
@@ -848,7 +848,7 @@ async function target(d: Awaited<ReturnType<typeof daemon>>) {
     pid: child.pid, sessionId, cwd, kind: 'interactive', status: value, statusUpdatedAt: Date.now() }))
   status('idle')
   let transcript = join(project, sid + '.jsonl')
-  writeFileSync(transcript, '')
+  if (!existsSync(transcript)) writeFileSync(transcript, '')
   const write = (fields: object) => appendFileSync(transcript, JSON.stringify({ entrypoint: 'cli', timestamp: new Date().toISOString(), ...fields }) + '\n')
   const select = () => writeFileSync(roamerState(d.root).ROAMER_STATE_FILE, JSON.stringify({ current_target: { tmux, claude_pid: child.pid, cwd, session_id: sid } }))
   const got: any[] = []
@@ -954,7 +954,6 @@ test('a session change inside the same target PID cuts the old claim and deliver
   await waitFor(() => a.got.length === 1)
   a.accept(a.got[0])
   await waitFor(() => first.claim?.session_id === a.sid)
-  first.not_before = new Date(Date.now() + 60_000).toISOString()
   const old = a.sid, oldTranscript = a.transcript
   a.status('idle', '')
   await Bun.sleep(350)
@@ -966,6 +965,8 @@ test('a session change inside the same target PID cuts the old claim and deliver
   expect(JSON.parse(readFileSync(roamerState(d.root).ROAMER_STATE_FILE, 'utf8')).current_target).toEqual({
     tmux: old, claude_pid: a.child.pid, cwd: a.cwd, session_id: a.sid })
   expect(d.f.history.filter(h => h.item_id === first.id).map(h => h.body.outcome)).toEqual(['in_session', 'cut'])
+  expect(first).toMatchObject({ state: 'waiting', reason: 'cut', session_id: 'main' })
+  expect(d.f.calls.filter(c => c.path.endsWith('/take') && c.body.item_ids.includes(first.id))).toHaveLength(1)
   a.accept(a.got[1])
   await waitFor(() => second.claim?.session_id === a.sid)
   appendFileSync(oldTranscript, JSON.stringify({ type: 'system', subtype: 'turn_duration' }) + '\n')
@@ -1082,6 +1083,53 @@ test('a busy arrival and a late first peek keep A across a switch to B and a dae
   await waitFor(() => [deferred, delayed].every(row => row.claim?.session_id === a.sid))
   expect(b.got.map(n => n.content)).toEqual([fresh.id])
 }, 16000)
+
+test('cut waits with its warning while A is gone and resumes only in A under its new PID', async () => {
+  const d = await daemon(roamerEnv, 200, roamerState), a = await target(d), b = await target(d)
+  a.select()
+  const rows = [d.f.add('preset-main'), d.f.add('filled-uuid', 'message', { session_id: null })]
+  await waitFor(() => a.got.length === 2)
+  for (const msg of a.got) a.accept(msg)
+  await waitFor(() => rows.every(row => row.claim?.session_id === a.sid))
+  b.select(); a.child.kill(); await a.child.exited
+  await waitFor(() => rows.every(row => row.state === 'waiting' && row.reason === 'cut'))
+  await d.restart(); await b.connect()
+  const fresh = d.f.add('B-stays-available')
+  await waitFor(() => b.got.length === 1)
+  expect(b.got[0].content).toBe(fresh.id)
+  for (const row of rows) {
+    expect(row.claim).toBeNull(); expect(row.reason).toBe('cut')
+    expect(d.f.calls.filter(c => c.path.endsWith('/take') && c.body.item_ids.includes(row.id))).toHaveLength(1)
+  }
+  const resumed = await target(d, a.sid)
+  expect(resumed.child.pid).not.toBe(a.child.pid)
+  await waitFor(() => resumed.got.length === 2)
+  expect(resumed.got.map(m => m.content).sort()).toEqual(rows.map(r => r.id).sort())
+  for (const msg of resumed.got) resumed.accept(msg)
+  await waitFor(() => rows.every(row => row.claim?.session_id === a.sid))
+  expect(rows.map(row => row.session_id)).toEqual(['main', a.sid])
+  expect(b.got).toHaveLength(1)
+}, 16000)
+
+test('an older cut recovers the first intake UUID from detail and keeps an ambiguous preset waiting', async () => {
+  const d = await daemon(roamerEnv, 200, roamerState), a = await target(d), b = await target(d)
+  b.select()
+  const fresh = d.f.add('new-in-B')
+  await waitFor(() => b.got.length === 1)
+  const legacy = (id: string, received: string) => {
+    const row = d.f.add(id, 'message', { reason: 'cut', failures: 1, session_id: 'main' })
+    row.events!.push({ kind: 'in_session', session_id: received, note: null }, { kind: 'cut', note: null })
+    return row
+  }
+  const known = legacy('old-known', a.sid), ambiguous = legacy('old-main-only', 'main')
+  known.events!.push({ kind: 'in_session', session_id: b.sid, note: null }, { kind: 'cut', note: null })
+  await waitFor(() => a.got.length === 1)
+  expect(a.got[0].content).toBe(known.id)
+  a.accept(a.got[0]); await waitFor(() => known.claim?.session_id === a.sid)
+  expect(b.got.map(m => m.content)).toEqual([fresh.id])
+  expect(ambiguous).toMatchObject({ state: 'waiting', reason: 'cut', claim: null })
+  expect(d.f.calls.some(c => c.path.endsWith('/take') && c.body.item_ids.includes(ambiguous.id))).toBe(false)
+}, 12000)
 
 function command(d: Awaited<ReturnType<typeof daemon>>, id: string, text: string, tgId: string) {
   return d.f.add(id, 'control', { message_id: 'm-' + id, payload: { message_id: 'm-' + id, from: 'joey', conversation_id: 'conv',

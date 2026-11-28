@@ -7,6 +7,7 @@ import { REGISTRY_SETTLE_MS, TurnWatch, type RegEntry, type Registry } from './o
 
 type Notification = { method: string; params: unknown }
 type Offer = { target: ReceivingTarget; stream: string }
+const sessionUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 /** Keep watching the original receiving turn across /roam and reconnects. All leases and reports belong to the common receiver. */
 export class RoamerItems {
@@ -50,11 +51,31 @@ export class RoamerItems {
     // Both the selection and Item.created_at use Onsen's clock, including on a delayed first peek.
     this.o.claims.recordSelection(target, at + (this.o.claims.now() - Date.now()))
   }
-  destination(row: InboxItem): string | null {
+  async destination(row: InboxItem): Promise<string | null> {
     this.recordSelection()
-    const session = this.o.claims.selectedAt(Date.parse(row.created_at ?? ''))?.session_id ?? null
+    let session = this.o.claims.firstReceiver(row.id)
+    if (!session && (row.reason === 'cut' || row.released || row.failures)) {
+      // A previous connector may have acknowledged the cut and discarded its local claim.
+      const res = await this.o.receiver.mode.req('GET', '/v1/items/' + encodeURIComponent(row.id))
+      if (res?.status === 404) return null
+      if (res?.status !== 200) throw new Error('could not read the receiving session for ' + row.id)
+      const detail: InboxItem = res.json.data
+      if (detail.state !== 'waiting') return null
+      const created = detail.events?.find(e => e.kind === 'created')
+      const first = detail.events?.filter(e => e.kind === 'in_session').sort((a, b) => Date.parse(a.at ?? '') - Date.parse(b.at ?? ''))[0]
+      if (!created) return null
+      if (first) {
+        // Older events can repeat Item.session_id. A sender preset alone cannot identify a receiver.
+        let sid = first.session_id !== created.session_id ? first.session_id : null
+        if (!sessionUUID.test(sid ?? '') && created.session_id === null) sid = detail.session_id
+        if (!sid || !sessionUUID.test(sid)) return null
+        this.o.claims.recoverReceiver(row.id, sid)
+        session = sid
+      } else if (detail.reason === 'cut' && !detail.events?.some(e => e.kind === 'taken')) return null
+    }
+    session ??= this.o.claims.selectedAt(Date.parse(row.created_at ?? ''))?.session_id
     if (session) this.pending.set(row.id, session)
-    return session
+    return session ?? null
   }
   fullList(waiting: ReadonlyMap<string, number>): void {
     for (const id of this.pending.keys()) if (!waiting.has(id)) this.pending.delete(id)
@@ -65,10 +86,11 @@ export class RoamerItems {
     const reg = this.o.registry.entries().find(e => e.pid === target.claude_pid)
     return !reg || reg.sessionId === session
   }
+  ready(session: string | null): boolean { return !!session && !!this.offerTo(session) }
   private targetFor(reg: RegEntry): ReceivingTarget {
     const last = this.o.claims.lastTarget(reg.sessionId)
     return { session_id: reg.sessionId, claude_pid: reg.pid, transcript: this.o.transcript(reg.cwd, reg.sessionId),
-      tmux: reg.tmux ?? (last?.claude_pid === reg.pid ? last.tmux : '') }
+      tmux: last?.claude_pid === reg.pid ? last.tmux : '' }
   }
   private offerTo(session: string, entries = this.o.registry.entries()): Offer | null {
     const matches = entries.filter(e => e.sessionId === session && this.o.alive(e.pid))

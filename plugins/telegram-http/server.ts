@@ -4772,7 +4772,7 @@ async function personArrived(it: { item?: ItemRef; kind?: string; seq?: number; 
     // WO-197 segment 2 (CONTRACT §7d 「指令」; sonn's ruling 7): a connector runs a person's slash command itself (the bridge's kind command, or a page
     // message whose text is one), with today's handler; one it does not know goes on as a message
     const thread = CONNECTOR ? await connectorThreadOf(p, c, chat) : undefined
-    if (CONNECTOR && (p.kind === 'command' || /^\/[A-Za-z]/.test(String(p.text ?? '').trim()))
+    if (CONNECTOR && !(it.item && roamerItems && itemClaims?.firstReceiver(it.item.onsen_item_id)) && (p.kind === 'command' || /^\/[A-Za-z]/.test(String(p.text ?? '').trim()))
       && await connectorCommand(String(p.text ?? ''), chat, ref, String(c.user_id ?? ''), c.user != null ? String(c.user) : '', thread, p.sent_at, p.via === 'web' ? 'onsen' : undefined, it.item, String(p.message_id))) {
       inboundStore.finish([key, own])
       log('info', `onsen inbound: ${shown} is a command; the connector handled it itself`)
@@ -5040,7 +5040,8 @@ async function routeInboxItem(row: InboxItem, change?: 'edited' | 'version'): Pr
     return
   }
   if (roamerItems) {
-    item.destination = roamerItems.destination(row)
+    item.destination = await roamerItems.destination(row)
+    if (row.reason === 'cut' && !roamerItems.ready(item.destination)) return
     if (!item.destination && row.kind !== 'control' && !/^\s*\/[A-Za-z]/.test(row.payload.text ?? '')) return
   }
   const payload = { ...row.payload }
