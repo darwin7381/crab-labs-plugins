@@ -36,7 +36,8 @@ export class ItemPeek {
   private request?: AbortController
 
   constructor(readonly mode: TakeMode, readonly index: () => Map<string, number>,
-    readonly route: (it: InboxItem, edit: boolean) => Promise<void>, readonly canRead: () => boolean) {}
+    readonly route: (it: InboxItem, edit: boolean) => Promise<void>, readonly canRead: () => boolean,
+    readonly waitingReady?: () => void) {}
 
   reset(): void {
     this.generation++
@@ -91,12 +92,14 @@ export class ItemPeek {
       }
       if (r?.status !== 200 || !Array.isArray(r.json.items) || typeof r.json.changed_after !== 'string' || !r.json.changed_after) { delay = 2000; return }
       const known = this.index()
+      let queued = false
       // Later pages can miss rows committed since page one. Resume from page one's token.
       this.nextChangedAfter ??= r.json.changed_after
       for (const it of r.json.items as InboxItem[]) {
         if (g !== this.generation || !this.canRead()) return
         if (it.not_before && Date.parse(it.not_before) > Date.now()) { this.dueAt(it.not_before); continue }
         const version = known.get(it.id)
+        if (version !== undefined && !this.changedAfter) queued = true
         if (version === undefined || it.version > version) {
           if (this.previous.get(it.id) !== it.version && this.seen.get(it.id) !== it.version) await this.route(it, version !== undefined)
         }
@@ -105,6 +108,7 @@ export class ItemPeek {
       }
       // A dispatched control may lift a gate and reset the cursor while this page is being routed.
       if (g !== this.generation) return
+      if (queued) this.waitingReady?.()
       this.page = r.json.next_cursor || undefined
       if (!this.page) {
         this.changedAfter = this.nextChangedAfter; this.nextChangedAfter = undefined

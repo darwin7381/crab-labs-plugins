@@ -38,6 +38,7 @@ import {
   REPORT_STEP_RE, mainAskHeld, stepsHeld, MAIL_OPEN_HELD, refusalHoldOn,
   type RemoteChange, btccOutcome, receiptCliAnswer, receiptCliRuns, schedulerAnswerOk, mainChatOn, mainSameMatterOn, mainSameMatterP, mainSameMatterRefusal,
 } from './lanes-boundary.ts'
+import { personCanProbe } from './usage-wall.ts'
 import { genuineAssistantModelFile } from './liveness.ts'
 import { CHAT_HISTORY_TOOL, FORM_CLOSE_TOOL } from './onsen-tool.ts'
 import { decideWake, legacyAgentRules, loadWakeTable, WAKE_KINDS, type WakeItem, type WakeRule, type WakeState, type WakeTable, type WakeVerdict } from './wake-decide.ts'
@@ -298,6 +299,21 @@ function logos(kind: string, rec: Record<string, unknown>): void {
 }
 const shortId = () => randomBytes(3).toString('hex')
 
+// Only pull delivery uses periodic redispatch, deadline nudges and flood summaries.
+const pullTimers: Array<ReturnType<typeof setTimeout>> = []
+const takingItems = () => itemReceiver?.mode.active === true
+export function deliveryModeChanged(): void {
+  if (D?.role !== 'tg' || !S) return
+  for (const timer of pullTimers.splice(0)) clearTimeout(timer)
+  if (probeTimer) { clearTimeout(probeTimer); probeTimer = null }
+  if (itemReceiver?.mode.checking) return
+  if (takingItems()) { pump(); return }
+  pullTimers.push(setTimeout(sweepQueue, 2_000), setInterval(sweepQueue, 10_000),
+    setInterval(followupTick, 1_000), setInterval(dueTick, 1_000), setInterval(floodTick, 10_000))
+  for (const timer of pullTimers) timer.unref()
+  if (S.wall) armProbe(Math.max(1_000, S.wall.probe_at - Date.now()))
+}
+
 // ------------------------------------------------------------------ init
 export function lanesInit(deps: LanesDeps): void {
   D = deps
@@ -326,14 +342,9 @@ export function lanesInit(deps: LanesDeps): void {
       for (const k of ['in', 'out'] as const) { try { rmSync(steerFile(id, k)) } catch {} }
     }
     if (S.steering) { S.steering = {}; saveState() }
-    setTimeout(sweepQueue, 2_000).unref()          // 002f: what the previous daemon left running is dispatched again now
-    setInterval(sweepQueue, 10_000).unref()
-    setInterval(followupTick, 1_000).unref()
+    deliveryModeChanged()
     setInterval(() => { void main.tick() }, 5_000).unref()       // M2: kill -0, the stuck rule; M1: the offer
     setInterval(() => idleCheck(), 2_000).unref()                // WO-157b: a turn statusOf shows ended with no Stop (Esc) is closed as interrupted
-    setInterval(() => dueTick(), 1_000).unref()        // M3: the one due sweep (critical ring, hand-over not taken, promised answers, commitments)
-    setInterval(() => floodTick(), 10_000).unref()      // 002k (H14): a flood episode that went quiet, a hold that ran out
-    if (S.wall) armProbe(Math.max(1_000, S.wall.probe_at - Date.now()))
     // lanes-topics (item 4): a worker closed before the previous daemon stopped, its topic not finished yet (only `pending` ones: older closed lanes untouched)
     setTimeout(() => { for (const l of Object.values(S.lanes)) if (l.status === 'closed' && l.topic_close === 'pending' && !l.topic_done && !running.has(l.id)) void finishTopic(l, '關閉時 daemon 重啟，開機後補上') },
       num('LANES_TOPIC_SWEEP_MS', 3_000)).unref()
@@ -2224,6 +2235,7 @@ function mailDue(ev: InEvent): Decision {
  *  the mailbox: woken now (wakeDeferred); it was met by an earlier turn (the main saw it, did not decide): a new hand-over, woken now; the main has it already
  *  (an open item): nothing more. Returns the hand-over the main is woken for, or null. */
 function dueWake(m: number): string | null {
+  if (takingItems()) return null
   const e = events.rows(r => waitsOf(r).some(w => w.mail_id === m && pendingWait(w))).pop()
   const w = waitsOf(e).find(x => x.mail_id === m && pendingWait(x))
   if (!e || !w || w.urgency !== 'defer' || w.due_woke) return null
@@ -2958,7 +2970,7 @@ export function holdLines(): string[] {
 /** 002l (D10): an admitted peer event that really opened (or went to) a lane: it counts as "answered" in the peer's flood episode. 002k counted every admit,
  *  ledger-only ones included, and the summary said 「6 則開了車道回覆」 for FYIs that opened nothing. */
 function noteAdmitted(ev: InEvent, d: Decision): void {
-  if (d.target !== 'lane' || !isPeerEvent(ev) || ev.no_reply) return
+  if (takingItems() || d.target !== 'lane' || !isPeerEvent(ev) || ev.no_reply) return
   const f = S.flood?.[ev.from.toLowerCase()]
   if (!f) return
   const now = Date.now()
@@ -2972,13 +2984,17 @@ function peerGate(ev: InEvent): { rule: string; note: string; episode: string; h
   if (h) {
     if (h.until != null && h.until <= now) endHold(peer, '時間到')
     else {
+      if (takingItems()) {
+        if (h.until != null) itemReceiver!.dueAt(new Date(h.until).toISOString())
+        return { rule: 'peer-hold', note: peer + ' is on hold: leaving its Item waiting', episode: h.since }
+      }
       h.count++; h.first ??= ev.id; h.last = ev.id; sampleOf(h.samples, ev)
       if (h.count === 1) ledger({ lane: 'router', thread: ev.thread ?? null, event: ev.id, kind: 'fyi', text: `${peer} 的第一則被暫停擋下的訊息（之後只計數，結束時一筆摘要）：${ev.text.slice(0, 160)}`, refs: { peer_hold: peer, held: true, btcc_msg_id: ev.btcc_msg_id ?? null } })
       saveState()
       return { rule: 'peer-hold', note: `${peer} is on hold (${h.reason}): ledger only`, episode: h.first, ...(h.count === 1 ? { head: { hold: { peer, count: 1, reason: h.reason } } } : {}) }
     }
   }
-  if (!floodOn()) return null
+  if (takingItems() || !floodOn()) return null
   // 002l (D10): design/routing 「標了『不用回』的純通知 → 帳本：只記一行，不開任何 session。零 token」. A no_reply notice opens nothing, so it is no load to
   // limit: it never touches the rate bucket, the queue count or the flood episode (G08: 40 FYIs started a flood, merged 34, rang Joey, auto-replied to Eve).
   if (ev.no_reply) return null
@@ -3017,7 +3033,7 @@ function peerGate(ev: InEvent): { rule: string; note: string; episode: string; h
 }
 /** a flood episode whose peer has been quiet is closed (one ledger row, one silent summary); a hold whose time is up ends */
 export function floodTick(now = Date.now()): void {
-  if (!S) return
+  if (!S || takingItems()) return
   for (const [peer, f] of Object.entries(S.flood ?? {})) {
     const e = f.episode
     if (!e || now - e.last_at < num('LANES_FLOOD_QUIET_S', 120) * 1000) continue
@@ -3102,7 +3118,7 @@ export function alertWorse(seen: AlertVal[] | undefined, now: AlertVal[], frac =
   return worse.join('、')
 }
 function alertRepeat(ev: InEvent, critical: boolean): Decision | null {
-  if (critical || !isAlertEvent(ev)) return null
+  if (critical || ev.onsen_items?.length || !isAlertEvent(ev)) return null
   const fp = alertFingerprint(ev.from, ev.text)
   const rec = S.alert_fp?.[fp]
   if (!rec || rec.sev !== alertSeverity(ev)) return null
@@ -3549,7 +3565,7 @@ export function itemIndex(): Map<string, number> {
 /** the in-memory view of an event's current run record (M5): the journal is its state; this is what pump and the tools read */
 type QItem = { ev: InEvent; lane: string; state: 'queued' | 'leased' | 'done'; attempts: number; priority: number; summary?: string; enqueued: string
   /** the M5 record id of this event's current run; the process and lane run of a leased one */
-  rid?: string; pid?: number; run?: string
+  rid?: string; pid?: number; run?: string; keeperProbe?: number
   /** after a death the next run waits until then (002f backoff) */
   not_before?: number
   /** 002k: later messages of the same peer that queued for this lane while it was busy; handled in the same run */
@@ -3812,12 +3828,17 @@ function runEnded(lane: Lane | undefined, it: QItem, e: { reason: string; proces
     if (e.reason === 'died' || e.reason === 'timeout') { it.not_before = Date.now() + RETRY_BACKOFF_MS * it.attempts; setTimeout(pump, RETRY_BACKOFF_MS * it.attempts + 20) }   // 002f backoff
     queueRun(it)
   }
-  if (wall) wallUp({ kind: wall, text: e.wallText ?? '' }, e.runId ?? it.run ?? '?')
-  else if (S.wall && e.reachedModel) void wallDown(e.runId ?? it.run ?? '?')       // the first run that gets through takes the wall down, however it ended
-  if (again) return
   const itemExit = e.processExit ?? e.reason
-  const outcome = itemExit === 'normal' ? 'completed' : itemExit.startsWith('wall:') ? (['wall:server_error', 'wall:api_error'].includes(itemExit) ? 'error' : 'usage_limit') : 'cut'
-  if (refs.length && !['normal', 'closed', 'gone'].includes(e.reason)) itemReceiver?.report(refs, outcome)
+  const apiError = ['wall:server_error', 'wall:api_error', 'wall:overload'].includes(itemExit)
+  if (wall && !(takingItems() && apiError)) wallUp({ kind: wall, text: e.wallText ?? '' }, e.runId ?? it.run ?? '?')
+  else if (!wall && S.wall && e.reachedModel) void wallDown(e.runId ?? it.run ?? '?')       // the first run that gets through takes the wall down, however it ended
+  if (again) return
+  const outcome = itemExit === 'normal' ? 'completed' : apiError ? 'error'
+    : wall ? (it.keeperProbe ? 'usage_limit_probe' : 'usage_limit') : 'cut'
+  if (refs.length && !['normal', 'closed', 'gone'].includes(e.reason)) {
+    const limit = outcome === 'usage_limit' || outcome === 'usage_limit_probe'
+    itemReceiver?.report(refs, outcome, limit ? { retry_after: D.usageWall?.(0)?.resets_at ?? null } : undefined)
+  }
   releaseScheduleThread(lane, it)                                           // WO-164 point 4: a schedule's run is over: its thread lets the lane go
   const gaveUp = retryable && it.attempts >= MAX_ATTEMPTS
   asWake({ kind: 'lane_exit', rule: gaveUp ? 'exit-failed' : 'exit-owes', urgency: 'ordered', lane: lane?.id ?? it.lane }, () => {   // WO-147
@@ -3899,6 +3920,12 @@ export function wallKind(text: string): string | null {
 const WALL_WORD: Record<string, string> = { usage: '模型額度用完了', overload: '模型服務過載', error: '模型連線出錯', auth: '模型登入失效',
   rate_limit: '模型額度用完了', authentication_failed: '模型登入失效', billing_error: '模型帳務出錯', server_error: '模型服務出錯', account_on_hold: '模型帳號被暫停' }
 function wallUp(w: { kind: string; text: string }, by: string): void {
+  if (takingItems()) {
+    // The time of a real refusal gates the next person. Only the keeper measures recovery.
+    S.wall = { since: nowIso(), kind: w.kind, text: w.text, probe_at: 0, probes: 0 }
+    saveState()
+    return
+  }
   if (S.wall) {                                           // a probe hit the wall again
     S.wall.probes += 1
     const next = wallBackoffMs(S.wall.kind, S.wall.probes)            // 002l (S0 item 4): back off while it stays up
@@ -3931,7 +3958,7 @@ function armProbe(ms: number): void {
  *  empty queue a bare one-line run is. Without the second, a wall that came up on the last queued event stayed up until
  *  the next event happened to arrive, and every critical alert until then was rung through as "no lane can look". */
 function probeTick(): void {
-  if (!S?.wall || D.role !== 'tg') return
+  if (!S?.wall || D.role !== 'tg' || takingItems()) return
   if (followUsageWall('probe') !== 'own') return          // WO-141 follow-up: the daemon's usage-wall state decides first
   if (running.size > 0) { armProbe(1000); return }        // a run is still out: its result is the probe
   if ([...queue.values()].some(i => i.state === 'queued')) {
@@ -3941,7 +3968,7 @@ function probeTick(): void {
   }
   S.wall.probe_at = Date.now() + wallBackoffMs(S.wall.kind, S.wall.probes + 1); saveState()
   bareProbe(MODEL, `${D.agent}.probe`, (walled, ok) => {
-    if (!S?.wall) return
+    if (!S?.wall || takingItems()) return
     if (ok) { logos('lane.wall_probe', { ok: true, bare: true }); wallDown('probe') }
     else wallUp(walled ?? { kind: S.wall.kind, text: S.wall.text }, 'probe')
   })
@@ -4100,7 +4127,8 @@ function followUsageWall(why: 'probe' | 'clear', u: { walled: boolean; clearedMs
  *  redrew the screen (nestor 11-26: Call 401 held:wall 07:07:10Z, the clear 07:12:26Z, offered 07:25:31Z) */
 export function usageWallChanged(state: { walled: boolean; clearedMs: number | null; by: string | null } | null): void {
   if (D?.role !== 'tg') return
-  if (S?.wall) { try { followUsageWall('clear', state) } catch (e) { D.log('warn', `lanes: following the usage wall: ${e}`) } }
+  if (takingItems()) { queueMicrotask(pump); onGateOpen?.() }
+  else if (S?.wall) { try { followUsageWall('clear', state) } catch (e) { D.log('warn', `lanes: following the usage wall: ${e}`) } }
   if (main) { try { main.statusChanged(state?.walled === false ? state.clearedMs : null) } catch (e) { D.log('warn', `lanes: the usage wall's clear to M1: ${e}`) } }
 }
 async function wallDown(by: string): Promise<void> {
@@ -4120,6 +4148,7 @@ async function wallDown(by: string): Promise<void> {
  *  when the first side hits it and the recovery when the last side is through. 002p told each side's up and down: four pushes for one limit. */
 const mainWalled = (): boolean => { const g = main?.currentGen(); return !!g && g.state !== 'gone' && !!g.wall_since }
 function wallNotice(text: string, rule: string, otherWalled: boolean): void {
+  if (takingItems()) return  // S4 cannot_move / recovered are addressed to the waiting person.
   if (otherWalled) { ledger({ lane: 'router', kind: 'notify', text: `[ledger] ${text}`, refs: { tier: 'ledger', tier_rule: `${rule}+same-limit`, escalated: false } }); logos('lane.notify', { escalated: false, tier: 'ledger', tier_rule: `${rule}+same-limit` }); return }
   ledger({ lane: 'router', kind: 'notify', text: `[push] ${text}`, refs: { tier: 'push', tier_rule: rule, escalated: true } })
   void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: rule, message_id: id }))
@@ -4154,10 +4183,31 @@ export function laneSlots(): number {
   }
   return n
 }
+/** A real row can probe after a new keeper clear; a fresh human message can also probe a minute after refusal. */
+function laneMayTake(it: QItem): boolean {
+  const since = Date.parse(S.wall?.since ?? '') || 0
+  const keeper = D.usageWall?.(since)
+  it.keeperProbe = undefined
+  if (!keeper?.walled && !S.wall) return true
+  if (running.size || startingItems.size) return false
+  const clear = keeper?.clearedMs ?? 0
+  if (!keeper?.walled && clear >= Math.floor(since / 1000) * 1000 && clear > (S.wall_clear_used ?? 0)) {
+    it.keeperProbe = clear
+    return true
+  }
+  const refs = runEvents(it).flatMap(ev => ev.onsen_items ?? [])
+  if (!refs.length || !refs.every(r => r.kind === 'message' && !r.reason?.startsWith('usage_limit'))) return false
+  const last = Math.max(since, keeper?.lastWallMs ?? 0)
+  if (personCanProbe(last)) return true
+  itemReceiver!.dueAt(new Date(last + 60_000).toISOString())
+  return false
+}
+
 const startingItems = new Set<string>()
 function pump(): void {
-  if (S.wall && Date.now() < S.wall.probe_at) return      // the wall is up: nothing runs until the next probe
-  if (S.wall && daemonWall()?.walled) return              // WO-141 follow-up: the daemon's usage wall is up: its keeper probes, no run is one
+  const take = takingItems()
+  if (!take && S.wall && Date.now() < S.wall.probe_at) return      // the wall is up: nothing runs until the next probe
+  if (!take && S.wall && daemonWall()?.walled) return              // WO-141 follow-up: the daemon's usage wall is up: its keeper probes, no run is one
   const slots = laneSlots()                               // 002l (D13)
   const waiting = [...queue.values()].filter(i => i.state === 'queued')
     .sort((a, b) => a.priority - b.priority || a.enqueued.localeCompare(b.enqueued))
@@ -4169,7 +4219,8 @@ function pump(): void {
       break
     }
     if (sessionBusy(it)) continue                        // 002l (S0 item 2): never a second process on one session id
-    if (S.wall) {                                         // the probe: exactly one run; its result decides (startRun's exit handler)
+    if (take && !laneMayTake(it)) continue
+    if (!take && S.wall) {                                // the probe: exactly one run; its result decides (startRun's exit handler)
       if (running.size > 0 || chatFetching.size > 0 || startingItems.size > 0) return
       if (mainChatPending(it)) return                     // WO-144: its block first; the fetch's end pumps again
       S.wall.probe_at = Date.now() + wallBackoffMs(S.wall.kind, S.wall.probes + 1); saveState()
@@ -4218,7 +4269,7 @@ function runPrompt(it: QItem, lane: Lane, cardUpdate: string[] = [], boundary?: 
  *  the thread's lane session (a fresh lane with the ledger summary when that lane is gone or too old). Cap, queue and
  *  the lane permission (no irreversible actions) are the ordinary lane ones. */
 export function followupTick(): void {
-  if (!S?.followups) return
+  if (!S?.followups || takingItems()) return
   const now = Date.now()
   let changed = false
   for (const f of duePending(S.followups, now)) {
@@ -5100,6 +5151,7 @@ function startRun(it: QItem, acquired = false): void {
     }).catch(e => D.log('warn', 'lanes: item take: ' + e)).finally(() => { startingItems.delete(lane.id) })
     return
   }
+  if (it.keeperProbe) S.wall_clear_used = it.keeperProbe
   const runId = `${lane.id}.r${lane.runs + 1}`
   const token = randomBytes(24).toString('base64url')
   const critical = !!lane.critical
@@ -6021,7 +6073,7 @@ function mainDownMs(from: number, now: number): number {
 }
 export const __mainDown = (): { since: number | null; spans: Array<[number, number]> } => mainDown          // tests only
 export function dueTick(now = Date.now()): void {
-  if (!events || !S) return
+  if (!events || !S || takingItems()) return
   try { batchTick(now) } catch (e) { D.log('warn', `lanes: batch wake sweep: ${e}`) }   // WO-137 甲: the batch wake of cards that can wait
   const down = noteMainDown(now)                                         // WO-201 (point 5)
   for (const { e, o } of events.due(now)) {

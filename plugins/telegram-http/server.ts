@@ -366,12 +366,16 @@ if (ONSEN_TAKE_ON) {
   if (reason) log('info', `onsen take: staying on pull: ${reason}`)
   else if (onsen) {
     takeMode = new TakeMode(ONSEN_AGENT, (m, p, b, t, h, signal) => onsen.request(m, p, b, t, h, signal),
-      active => { if (active) { itemClaims!.start(); itemPeek!.reset() } else itemPeek!.stop(); registryStatusChanged?.() }, line => log('info', line))
+      active => { if (active) { itemClaims!.start(); itemPeek!.reset() } else itemPeek!.stop(); Lanes.deliveryModeChanged(); registryStatusChanged?.() }, line => log('info', line))
     itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, Lanes.offerMissed, () => registryStatusChanged?.())
-    onsen.watchItemReports(line => itemClaims!.replay(line), (line, ok) => itemClaims!.acknowledged(line, ok))
+    onsen.watchItemReports(line => itemClaims!.replay(line), (line, ok) => {
+      itemClaims!.acknowledged(line, ok)
+      // The spool advances its cursor after this callback. A waiting lane can take as soon as it drains.
+      queueMicrotask(() => { if (takeMode!.active && !itemClaims!.blocked()) Lanes.sweepQueue() })
+    })
     itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at), () => itemPeek!.reset())
     Lanes.useItemReceiver(itemReceiver)
-    itemPeek = new ItemPeek(takeMode, Lanes.itemIndex, routeInboxItem, () => !itemClaims!.blocked())
+    itemPeek = new ItemPeek(takeMode, Lanes.itemIndex, routeInboxItem, () => !itemClaims!.blocked(), Lanes.sweepQueue)
     Lanes.observeItemGates(() => itemPeek!.reset())
   }
 }
@@ -2935,11 +2939,11 @@ if (isSystemAlertEnabled()) {
     resolveFile: isRoamerEnabled() ? roamerCurrentTranscript : (Lanes.LANES_ON ? () => Lanes.mainTranscriptFile(TRANSCRIPT_DIR) : undefined),
     // 002l (D12): with lanes on, a model wall (usage limit, overload, login, API error) is told once by the lanes wall notice, which names the
     // session that hit it; the TUI's copy of the same line is not relayed as well (design/notify 「同一件事不會連發」)
-    defer: Lanes.LANES_ON && !INBOX_ONLY ? (msg: string) => Lanes.wallKind(msg) != null : undefined,
+    defer: Lanes.LANES_ON && !INBOX_ONLY ? (msg: string) => takeMode?.active === true || Lanes.wallKind(msg) != null : undefined,
     // WO-120: usage walls are one state — API errors inside one aren't forwarded one by one; enter + clear alerts (with lanes on these are the
     // main's wall notices too: mainWallNoticeOwned)
     wall: () => wallReader.state(),
-    wallAlerts: INBOX_ONLY ? undefined : (wallAlertsOn = true, new WallAlerts({ stateDir: STATE_DIR, log,
+    wallAlerts: INBOX_ONLY ? undefined : (wallAlertsOn = true, new WallAlerts({ stateDir: STATE_DIR, log, takeMode,
       enterToldElsewhere: w => (mainWallToldAt && w.sinceMs != null && Math.abs(mainWallToldAt - w.sinceMs) < 120_000 ? 'lanes main-wall-up' : null),
       // lanes on (Sonn #10731): the enter alert also says the main's messages are held, none lost; lanes off: text unchanged
       enterNote: Lanes.LANES_ON ? () => lanesEnterNote(Lanes.mainHeldCount()) : undefined })),
@@ -4380,7 +4384,7 @@ function liveSetting(k: LiveKey): string | undefined {
   }
   return liveFile.v[k]
 }
-void takeMode?.probe()
+void takeMode?.probe().then(() => { if (!takeMode?.active) Lanes.deliveryModeChanged() })
 const jevScreenValue = (): string | undefined => liveSetting('JEV_SCREEN')
 if (!INBOX_ONLY && (Lanes.LANES_ON || onsen?.cfg.record)) registry.start()
 if (onsen && onsen.cfg.record && !INBOX_ONLY) {

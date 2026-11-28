@@ -497,12 +497,42 @@ test('a real peer hold leaves no M1 or lane reference; release starts a full pee
   await waitFor(() => d.log().includes('peer-hold'))
   expect(row.state).toBe('waiting')
   expect(d.journal().some(r => (r.rec === 'msg' || r.rec === 'run') && (r.onsen_items || r.ev?.onsen_items))).toBe(false)
+  expect(JSON.parse(readFileSync(join(d.lanes, 'state.json'), 'utf8')).holds.eve.count).toBe(0)
   const since = d.f.calls.length
   const release = command(d, 'release', '/lanes release eve', '91')
   await waitFor(() => release.state === 'completed')
   await waitFor(() => d.f.history.some(h => h.item_id === row.id && h.body.outcome === 'in_session'), 9000)
   expect(d.f.calls.slice(since).some(c => c.query.has('wait') && !c.query.has('changed_after'))).toBe(true)
 }, 12000)
+
+test('a lane behind an account limit only probes on real input, once per keeper clear', async () => {
+  const d = await daemon({}, 200, root => {
+    const bin = join(root, 'limited-lane'), dir = join(root, 'walls')
+    mkdirSync(dir)
+    writeFileSync(bin, `#!/bin/sh
+echo run >> ./lane-starts
+echo '{"type":"result","is_error":true,"terminal_reason":"api_error","api_error_status":429}'
+`)
+    chmodSync(bin, 0o700)
+    return { LANES_CLAUDE_BIN: bin, AGENT_INBOX_SELF: 'adam', LANES_WALL_PROBE_MS: '60', USAGE_WALL_READ: '1', USAGE_WALL_CACHE_MS: '0', USAGE_WALL_DIR: dir }
+  })
+  const alert = (id: string) => d.f.add(id, 'alert', { from: 'alert-dispatcher', payload: { text: '[P2] ' + id, line: 'call' } })
+  const row = alert('account-refusal')
+  await waitFor(() => row.reason === 'usage_limit')
+  alert('program-waits')
+  const starts = () => readFileSync(join(d.root, 'lane-starts'), 'utf8').trim().split('\n').length
+  await Bun.sleep(300)
+  expect(starts()).toBe(1)
+  const at = new Date().toISOString()
+  writeFileSync(join(d.root, 'walls', 'adam.json'), JSON.stringify({ agent: 'adam', episode: 'limited', in_wall: false,
+    cleared_at: at, updated_at: at, cleared_by: 'probe_after_reset' }))
+  alert('after-clear')
+  await waitFor(() => d.f.history.some(h => h.body.outcome === 'usage_limit_probe'))
+  await Bun.sleep(300)
+  expect(starts()).toBe(2)
+  expect(d.f.history.filter(h => h.body.outcome === 'usage_limit_probe')).toHaveLength(1)
+  expect(d.f.calls.filter(c => c.path === '/v1/messages')).toHaveLength(0)
+})
 
 for (const [reason, outcome, code] of [
   ['cap_turns', 'cut', 0], ['cap_usd', 'cut', 0], ['died', 'cut', 1], ['timeout', 'cut', 0], ['budget', 'cut', 0],

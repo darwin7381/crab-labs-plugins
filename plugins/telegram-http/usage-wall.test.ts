@@ -1,6 +1,6 @@
 // WO-120: usage-wall.ts (reader rule, identity match, enter/clear alerts).
 import { describe, expect, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import {
@@ -94,6 +94,17 @@ describe('alerts: two per episode', () => {
     }
     return { wdir, sdir, sent, make, w }
   }
+  test('take leaves both wall notices to S4 and starts no local episode', () => {
+    const r = rig(), takeMode = { active: true }
+    const alerts = new WallAlerts({ stateDir: r.sdir, takeMode, notify: t => r.sent.push(t), log: () => {} })
+    expect(alerts.tick(r.w())).toBeNull()
+    expect(alerts.tick(r.w({ in_wall: false, cleared_at: iso(NOW), cleared_by: 'ok_turn' }))).toBeNull()
+    expect(r.sent).toEqual([])
+    expect(readdirSync(r.sdir)).toEqual([])
+    takeMode.active = false
+    expect(alerts.tick(r.w())).toBe('enter')
+    expect(r.sent).toHaveLength(1)
+  })
   test('enter once, nothing in between, clear once with the time and reason', () => {
     const r = rig()
     const a = r.make()

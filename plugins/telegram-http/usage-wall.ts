@@ -208,6 +208,7 @@ export class WallAlerts {
   private db: Record<string, AlertRec> | null = null
   constructor(private readonly o: {
     stateDir: string
+    takeMode?: { active: boolean; checking?: boolean }
     /** Default sender; system-alert.ts passes its own notify pipeline to tick() instead. */
     notify?: (text: string) => void
     log: (level: 'info' | 'warn' | 'error', msg: string) => void
@@ -241,7 +242,7 @@ export class WallAlerts {
   }
 
   tick(w: WallState | null, notify: (text: string) => void = this.o.notify ?? (() => {})): 'enter' | 'clear' | null {
-    if (!w) return null
+    if (!w || this.o.takeMode?.active || this.o.takeMode?.checking) return null
     const now = this.o.now?.() ?? Date.now()
     const db = this.load()
     const rec = db[w.episode]
