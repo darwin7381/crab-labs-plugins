@@ -91,8 +91,9 @@ const reminder = () => { const text = '讀信箱（3 封未讀，最舊的等了
     notif: { method: 'notifications/claude/channel', params: { content: text, meta: {} } } } as any }
 type Run = { id: string; lane: string; tok: any; prompt: string; argv: string[] }
 async function runOf(lane: string, before: number, id: string): Promise<Run> {
-  expect(await until(() => !!L.__runTok(lane) && L.__runTok(lane)!.evId === id && runsOf().length > before)).toBe(true)
-  const r = runsOf().filter(x => x.lane === lane).at(-1)
+  const launch = () => runsOf().slice(before).findLast(x => x.lane === lane)
+  expect(await until(() => L.__runTok(lane)?.evId === id && !!launch())).toBe(true)
+  const r = launch()
   return { id, lane, tok: L.__runTok(lane)!, argv: r.argv, prompt: r.argv[r.argv.indexOf('-p') + 1] }
 }
 async function start(ev: any): Promise<Run> {
