@@ -981,6 +981,33 @@ test('a session change inside the same target PID cuts the old claim and deliver
   expect(second.session_id).toBe('main')
 }, 16000)
 
+test('a final Stop before a same-PID switch completes the old row with only its own replies', async () => {
+  const d = await daemon({ ...roamerEnv, ONSEN_BRIDGE_WAIT_MS: '10' }, 200, roamerState), a = await target(d)
+  a.select()
+  const old = d.f.add('answered-before-clear')
+  await waitFor(() => a.got.length === 1)
+  a.accept(a.got[0]); await waitFor(() => old.claim?.session_id === a.sid)
+  const reply = async (text: string) => {
+    const result = await a.client.callTool({ name: 'reply', arguments: { chat_id: '1', text } })
+    return /onsen:(\d+)/.exec(JSON.stringify(result.content))?.[1]
+  }
+  const first = await reply('from the old session')
+  expect(first).toBeTruthy()
+  // Draining the old transcript takes several ticks. Both UUIDs share this PID and MCP stream.
+  appendFileSync(a.transcript, JSON.stringify({ type: 'assistant', message: { content: 'x'.repeat(16 << 20) } }) + '\n')
+  a.stop(); a.switchSession()
+  const nextReply = await reply('from the replacement session')
+  expect(nextReply).toBeTruthy(); expect(nextReply).not.toBe(first)
+  await waitFor(() => old.state === 'completed')
+  expect(old.response_message_ids).toEqual([first])
+  expect(d.f.history.filter(h => h.item_id === old.id).map(h => h.body.outcome)).toEqual(['in_session', 'completed'])
+  const fresh = d.f.add('for-the-replacement')
+  await waitFor(() => a.got.length === 2)
+  expect(a.got[1].content).toBe(fresh.id)
+  a.accept(a.got[1]); await waitFor(() => fresh.claim?.session_id === a.sid)
+  expect(d.f.calls.filter(c => c.path.endsWith('/take') && c.body.item_ids.includes(old.id))).toHaveLength(1)
+}, 14000)
+
 test('after a daemon restart a long turn still ends on its original target transcript', async () => {
   const d = await daemon(roamerEnv, 200, roamerState), a = await target(d), b = await target(d)
   a.select()

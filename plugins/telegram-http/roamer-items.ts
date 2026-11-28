@@ -194,8 +194,10 @@ export class RoamerItems {
     if (!stream) return null
     // Read the transcript before attaching a fast reply to its open turn.
     this.tick()
+    const entries = this.o.registry.entries()
     for (const t of this.o.claims.targets()) {
-      if (this.o.stream(t) === stream) return { session: t.session_id, turn: this.watches.get(t.session_id)?.turnFacts()?.id ?? null }
+      if (this.o.stream(t) === stream && entries.some(e => e.pid === t.claude_pid && e.sessionId === t.session_id))
+        return { session: t.session_id, turn: this.watches.get(t.session_id)?.turnFacts()?.id ?? null }
     }
     return null
   }
