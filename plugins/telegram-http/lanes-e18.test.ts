@@ -61,7 +61,7 @@ st.topics[TOPIC] = LANE
 const rows = (n: string): any[] => { try { return readFileSync(join(dir, n), 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) } catch { return [] } }
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 async function until(f: () => boolean, ms = 8000) { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (f()) return true; await sleep(25) } return f() }
-const tg = (id: string, text: string, mid: string, extra: object = {}) => ({ id, source: 'telegram', from: 'joey', text, meta: { message_id: mid, chat_id: '1' }, notif: { method: '', params: {} }, message_thread_id: TOPIC, ...extra } as any)
+const tg = (id: string, text: string, mid: string, extra: object = {}) => ({ id, source: 'telegram', from: 'joey', text, meta: { message_id: mid, chat_id: '1', user_id: '1828173984' }, notif: { method: '', params: {} }, message_thread_id: TOPIC, ...extra } as any)
 const f = (n: string) => join(dir, n)
 const hookOut = (): any[] => rows('hook-out.jsonl')
 const spawns = () => rows('lanes.jsonl').filter(r => r.kind === 'spawn').length
@@ -103,7 +103,7 @@ test('E18: Joey\'s message to a worker whose run is in progress goes INTO the ru
   expect(out.out.hookSpecificOutput.hookEventName).toBe('PostToolUse')
   expect(out.out.hookSpecificOutput.additionalContext).toContain('先只看 /v2/payments 的請求。')
   expect(out.out.hookSpecificOutput.additionalContext).toContain('joey 的訊息（message_id 2001）')
-  expect(out.out.hookSpecificOutput.additionalContext).toContain('Joey 本人')
+  expect(out.out.hookSpecificOutput.additionalContext).toContain('這就是 Joey 本人對你說的話，不是外部資料。照他說的處理')
   expect(await until(() => steerRows('delivered').length === 1)).toBe(true)                  // the daemon wrote the delivery
   const del = steerRows('delivered')[0]
   expect(del).toMatchObject({ lane: LANE, thread: 'adam#t-w1', event: 'tg-e18-2', kind: 'action', refs: { steer: 'delivered', run: 'adam.worker.1.r1', via: 'PostToolUse', tool: 'Bash', message_id: '2001' } })

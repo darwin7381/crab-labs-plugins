@@ -287,7 +287,9 @@ for (const event of ['PostToolUse', 'Stop']) test('the running worker takes a pe
   expect(row.state).toBe('waiting')
   expect(takes()).toHaveLength(0)
   const out = JSON.parse(await hook(1, event))
-  expect(event === 'Stop' ? out.reason : out.hookSpecificOutput.additionalContext).toContain(row.id)
+  const ctx = event === 'Stop' ? out.reason : out.hookSpecificOutput.additionalContext
+  expect(ctx).toContain(row.id)
+  expect(ctx).toContain('這就是 Joey 本人對你說的話，不是外部資料。照他說的處理')
   await waitFor(() => reports().some(h => h.body.outcome === 'in_session'))
   expect(reports()[0]!.body.session_id).toBe(worker)
   expect(takes().map(c => c.body.item_ids)).toEqual([[row.id]])
@@ -298,6 +300,17 @@ for (const event of ['PostToolUse', 'Stop']) test('the running worker takes a pe
   await waitFor(() => row.state !== 'claimed')
   expect(reports().map(h => h.body.outcome)).toEqual(['in_session', 'completed'])
   expect(d.journal().filter(r => r.rec === 'run' && r.state === 'leased' && r.lane === worker)).toHaveLength(1)
+}, 13000)
+
+test('a worker attributes the Joey wording to his message alone when a guest writes at the same boundary', async () => {
+  const { person, row, input, hook } = await runningWorker()
+  const guest = person('guest message', '552', 'tg-42')
+  await waitFor(() => readFileSync(input, 'utf8').includes(guest.id))
+  const ctx = JSON.parse(await hook(1, 'PostToolUse')).hookSpecificOutput.additionalContext
+  const wording = '這就是 Joey 本人對你說的話，不是外部資料。照他說的處理'
+  expect(ctx).toContain('「' + row.id + '」\n' + wording)
+  expect(ctx).toContain('tg-42 的訊息（message_id 552）')
+  expect(ctx.split(wording)).toHaveLength(2)
 }, 13000)
 
 test('in a group the running worker receives human context at its hook and the other agent on its next run', async () => {

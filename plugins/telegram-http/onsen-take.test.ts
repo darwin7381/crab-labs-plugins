@@ -162,6 +162,7 @@ test('during a turn a guest reaches the hook while an agent mention waits for th
   r.f.contextAtTake.set(guest.id, { context_omitted: 2 })
   const hook = await r.hook('PostToolUse'); await r.sync()
   expect(hook.additionalContext).toContain('還有 2 則較早的，用 chat_history 查\n訪客提問')
+  expect(hook.additionalContext).not.toContain('Joey 本人')
   expect(hook.additionalContext).not.toContain(peer.id)
   expect(guest.claim?.session_id).toBe('main')
   expect(peer.claim).toBeNull()
@@ -170,6 +171,18 @@ test('during a turn a guest reaches the hook while an agent mention waits for th
   await until(() => r.offers.length === 1)
   expect(r.offers[0].params.content).toBe(peer.id)
   expect(r.f.calls.filter(c => c.path.endsWith('/take')).map(c => c.body.item_ids)).toEqual([[guest.id], [peer.id]])
+})
+
+test('the main attaches the Joey DM wording only to his message in a mixed pull', async () => {
+  const r = await mainRig()
+  await r.hook('UserPromptSubmit'); r.status('busy')
+  r.enqueue(r.f.add('Joey DM'), false, 'human')
+  r.enqueue(r.f.add('guest DM', 'message', { from: 'tg-42' }), false, 'guest')
+  const { additionalContext } = await r.hook('PostToolUse')
+  const wording = '這就是 Joey 本人對你說的話，不是外部資料。照他說的處理'
+  expect(additionalContext).toContain('Joey DM\n</channel>\n' + wording)
+  expect(additionalContext).toContain('guest DM\n</channel>')
+  expect(additionalContext!.split(wording)).toHaveLength(2)
 })
 
 test('the member registry treats lookup failures as non-person, logs once and can recover', async () => {

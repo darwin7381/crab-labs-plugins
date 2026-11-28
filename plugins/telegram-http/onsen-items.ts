@@ -1,5 +1,5 @@
 import type { TakeMode } from './onsen-take.ts'
-import { contextMessageLine, type MemberKind } from './onsen-client.ts'
+import { contextMessageLine, memberOfTg, type MemberKind } from './onsen-client.ts'
 
 export type InboxItem = {
   id: string; number: number; member: string; session_id: string | null; kind: string; from: string
@@ -26,6 +26,14 @@ export function itemRef(it: InboxItem): ItemRef {
 /** Old references lack from_kind. An explicit null means the registry could not identify this sender. */
 export function personMessage(ref: ItemRef): boolean {
   return ref.kind === 'message' && (ref.from_kind === undefined || ref.from_kind === 'human' || ref.from_kind === 'guest')
+}
+/** The author of a person message or album. Legacy Telegram DMs identify the person by their account. */
+export function personMember(refs: ItemRef[] | undefined, meta: Record<string, string>): string | null {
+  if (refs?.length) {
+    const author = refs[0]!.from
+    return refs.every(ref => personMessage(ref) && ref.from === author) ? author : null
+  }
+  return /^\d+$/.test(meta.chat_id ?? '') ? memberOfTg(meta.user_id || meta.chat_id) : null
 }
 export function mayTakeItem(ref: ItemRef, phase: 'in_turn' | 'usage_limit'): boolean {
   if (ref.kind === 'message') return personMessage(ref)

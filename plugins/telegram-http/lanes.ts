@@ -258,7 +258,7 @@ export type MainPicker = {
 
 let D: LanesDeps
 /** lanes-golive (C2): what a lane's send carries besides to / text (the three lines of send_to_agent) */
-import { mayTakeItem, type ItemRef } from './onsen-items.ts'
+import { mayTakeItem, personMember, type ItemRef } from './onsen-items.ts'
 
 export type LaneSendFields = { line: Line; title?: string; ask?: string; because?: string; deadline?: string; touches?: string[]; ref?: string }
 let LANES_DIR = ''
@@ -3317,7 +3317,8 @@ function steerable(ev: InEvent, lane: Lane): boolean {
 }
 function steerMessage(ev: InEvent, run: string, merged = false) {
   if (merged) return { id: ev.id, kind: 'merged', ts: nowIso(), from: ev.from, text: `${incidentHead([ev], true)}\n${renderEvent(ev)}`, run }
-  return { id: ev.id, ts: nowIso(), from: ev.onsen_items?.[0]?.from ?? ev.from, text: ev.text, context: eventContext(ev), message_id: ev.meta?.message_id ?? null, quote: ev.reply_to_text ?? null, run }
+  return { id: ev.id, ts: nowIso(), from: ev.onsen_items?.[0]?.from ?? ev.from, member: personMember(ev.onsen_items, ev.meta),
+    text: ev.text, context: eventContext(ev), message_id: ev.meta?.message_id ?? null, quote: ev.reply_to_text ?? null, run }
 }
 function writeSteer(lane: string, ev: InEvent, run: string, merged = false): void {
   // The hook gets an Item's content from the daemon only once its take succeeds.
