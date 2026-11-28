@@ -40,6 +40,7 @@ export type PollerDeps = {
   onsen: OnsenClient
   state: StateStore
   unknownChatEndpoints: Set<string>
+  agents: ReadonlyMap<string, Agent>
   log: Log
   now?: () => number
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>
@@ -417,7 +418,7 @@ export class Poller {
       } else e.cache.photo = shape.kind === 'photo'
       const fo = m.forward_origin
       e.cache.body = {
-        member: a.member, client_user_id: String(m.from.id), mentions: telegramMentions(m),
+        member: a.member, client_user_id: String(m.from.id), mentions: telegramMentions(m, this.d.agents.values()),
         client_user: { username: m.from.username ?? null, display_name: [m.from.first_name, m.from.last_name].filter(Boolean).join(' ') || null },
         chat, client_msg_id: String(m.message_id), sent_at: new Date((m.date ?? 0) * 1000).toISOString(), text,
         // WO-179 (Onsen 0.39.5): a group's own name, for display (the conversation's title); null in a DM

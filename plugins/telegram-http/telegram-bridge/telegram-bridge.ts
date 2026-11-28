@@ -263,7 +263,7 @@ export class Bridge {
   private ensurePoller(a: Agent): void {
     if (this.pollers.get(a.member)?.running) return
     const p = new Poller(a, {
-      unknownChatEndpoints: this.unknownChatEndpoints,
+      unknownChatEndpoints: this.unknownChatEndpoints, agents: this.agents,
       onsen: this.onsen, state: this.state, log: (l, msg) => this.log(l, msg), now: this.deps.now, pollTimeoutS: this.cfg.pollTimeoutS,
       buttonKey: k => this.state.data.keys[k] ?? null, reRegister: () => { this.endpointsDirty = true; this.needRegister = true },
       onHandover: ag => { void this.drop(ag.member, 'its daemon polls the bot again (Telegram 409): handed over') },

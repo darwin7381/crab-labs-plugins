@@ -27,7 +27,7 @@ beforeAll(() => {
   const client = new OnsenClient(onsen.base, '')
   client.token = () => 'test'
   const agent = new Agent('alpha', dir, 'test', { token, mtime: 0 }, { bridgeDir: dir, tgOptions: { apiRoot: tg.root }, log })
-  poller = new Poller(agent, { onsen: client, state: new StateStore(dir), unknownChatEndpoints: new Set(), pollTimeoutS: 1, log })
+  poller = new Poller(agent, { onsen: client, state: new StateStore(dir), unknownChatEndpoints: new Set(), agents: new Map([[agent.member, agent]]), pollTimeoutS: 1, log })
   poller.start()
 })
 afterAll(async () => {

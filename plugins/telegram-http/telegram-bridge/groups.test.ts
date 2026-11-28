@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { Agent } from './agent.ts'
 import { FakeOnsen, FakeTelegram, until } from './fakes.ts'
 import { Bridge, configFromEnv } from './telegram-bridge.ts'
-import { messageKey } from './groups.ts'
+import { messageKey, telegramMentions } from './groups.ts'
 
 const a = '101:lab-a', b = '102:lab-b'
 const supergroup = { id: -100212, type: 'supergroup' }, group = { id: -23, type: 'group' }
@@ -176,7 +176,26 @@ test('each writer forwards all Telegram account mentions, including new ones on 
   tg.push(a, { message: { ...msg, message_id: 3, text: '小乙' } })
   tg.push(a, { message: { ...msg, message_id: 4, text: 'reply', reply_to_message: { message_id: 2, from: { username: 'lab_b_bot' } } } })
   await confirmed()
-  expect(onsen.messages.slice(1).map(m => m.mentions)).toEqual([['@remote_bot', '@remote_bot'], [], []])
+  expect(onsen.messages.slice(1).map(m => m.mentions)).toEqual([['@remote_bot', '@remote_bot'], ['@lab_b_bot'], []])
+})
+
+test('a configured name in a caption names the carried bot on each write and preserves every Telegram mention', async () => {
+  const calls = spyOn(bridge.onsen, 'req')
+  const caption = '@far_bot 小乙 @far_bot'
+  const message = { chat: group, from, date, caption, caption_entities: [
+    { type: 'mention', offset: 0, length: 8 }, { type: 'mention', offset: 12, length: 8 },
+  ] }
+  expect(telegramMentions(message)).toEqual(['@far_bot', '@far_bot'])
+  tg.push(a, { message: { ...message, message_id: 7 } })
+  await confirmed()
+  tg.push(b, { message: { ...message, message_id: 81 } })
+  await confirmed()
+  const mentions = calls.mock.calls.filter(c => c[1] === '/bridge/messages').map(c => (c[2] as any).mentions)
+  expect(mentions).toEqual([['@far_bot', '@far_bot', '@lab_b_bot'], ['@far_bot', '@far_bot', '@lab_b_bot']])
+  expect(onsen.messages).toHaveLength(1)
+  tg.push(a, { message: { ...message, message_id: 8, caption: '小乙 @LAB_B_BOT', caption_entities: [{ type: 'mention', offset: 3, length: 10 }] } })
+  await confirmed()
+  expect(onsen.messages[1]!.mentions).toEqual(['@LAB_B_BOT'])
 })
 
 test('nested rich text keeps its basic-group key when the second bot sees more mention entities', async () => {

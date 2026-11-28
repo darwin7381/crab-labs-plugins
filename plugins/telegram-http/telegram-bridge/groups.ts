@@ -80,7 +80,7 @@ function collectRichMentions(node: any, accounts: string[]): void {
 }
 
 /** Send the Telegram account references in order. Onsen resolves them against every bridge's endpoints. */
-export function telegramMentions(m: any): string[] {
+export function telegramMentions(m: any, agents: Iterable<Agent> = []): string[] {
   const text: string = m.text ?? m.caption ?? ''
   const accounts: string[] = []
   for (const e of (m.text != null ? m.entities : m.caption_entities) ?? []) {
@@ -88,6 +88,18 @@ export function telegramMentions(m: any): string[] {
     if (account) accounts.push(account)
   }
   collectRichMentions(m.rich_message?.blocks, accounts)
+  if (!text) return accounts
+  const explicit = new Set(accounts.map(account => account.toLowerCase()))
+  for (const bot of agents) {
+    if (!bot.accepted || bot.state === 'conflict' || !bot.username) continue
+    const account = '@' + bot.username
+    if (explicit.has(account.toLowerCase()) || explicit.has(bot.botId)) continue
+    for (const pattern of bot.access()?.mentionPatterns ?? []) {
+      try {
+        if (new RegExp(pattern, 'i').test(text)) { accounts.push(account); break }
+      } catch { /* Ignore an invalid access.json pattern and try the next one. */ }
+    }
+  }
   return accounts
 }
 
