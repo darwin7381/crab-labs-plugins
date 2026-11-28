@@ -195,6 +195,17 @@ test('C4 routes only the member’s own resumes to M1 across all session targets
   expect(d.f.calls.some(c => c.path.endsWith('/take'))).toBe(false)
 })
 
+test('member-authored Items read their body only from payload.text', async () => {
+  const d = await daemon()
+  await waitFor(() => d.f.calls.some(c => c.query.has('wait')))
+  d.f.add('flat-resume', 'resume', { from: 'adam', payload: { format: 'markdown', text: '正本內文', body: { text: '巢狀副本' } } })
+  d.f.add('nested-self', 'self', { from: 'adam', payload: { body: { text: '巢狀副本' } } })
+  const delivery = (id: string) => d.journal().find(r => r.rec === 'msg' && r.onsen_items?.[0]?.onsen_item_id === id && r.notif)
+  await waitFor(() => !!delivery('flat-resume') && !!delivery('nested-self'))
+  expect(delivery('flat-resume').notif.params.content).toBe('正本內文')
+  expect(delivery('nested-self').notif.params.content).not.toContain('巢狀副本')
+})
+
 test('C4 main hooks create a waiting resume; an independent turn after fixture restart cancels it without a take', async () => {
   const session_id = randomUUID()
   const d = await daemon({}, 200, root => {
