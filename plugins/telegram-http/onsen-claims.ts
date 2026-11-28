@@ -80,7 +80,8 @@ export class Claims implements ClaimStore {
     const row = this.rows[id]
     if (!this.owns(id)) return false
     if (row.last_outcome === outcome) return true
-    const body = { claim_id: row.claim_id, outcome, at: new Date(this.now()).toISOString(), ...fields }
+    const body = { claim_id: row.claim_id, outcome, at: new Date(this.now()).toISOString(),
+      ...(outcome === 'completed' ? { response_message_ids: row.replies ?? [] } : {}), ...fields }
     if (!this.spool.recordItemReport({ item_id: id, body })) throw new Error('could not spool item report for ' + id)
     this.replay({ item_id: id, body })
     this.save(); this.clock(id)
@@ -130,7 +131,7 @@ export class Claims implements ClaimStore {
       if (!this.owns(id) || !row.stop || this.now() < row.stop.at + settleMs) continue
       const count = background(row.registry_session!)
       if (count == null) continue
-      this.report(id, count > 0 ? 'background' : 'completed', count > 0 ? {} : { response_message_ids: row.replies ?? [] })
+      this.report(id, count > 0 ? 'background' : 'completed')
       delete row.stop
       this.save()
     }

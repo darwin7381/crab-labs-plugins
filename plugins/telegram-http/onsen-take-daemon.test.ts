@@ -524,6 +524,25 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"done"}'
   expect(row.reason).toBe('not_answered')
 })
 
+for (const owed of [false, true]) test('a lane completion carries the reply sent by its run, owed=' + owed, async () => {
+  const d = await daemon({}, 200, scriptedLane)
+  const row = d.f.add('lane-answer', 'alert', { from: 'alert-dispatcher',
+    payload: { text: '[P2] get status', line: 'call', conversation_id: 'conv' } })
+  await waitFor(() => row.in_session_at != null)
+  if (owed) {
+    expect(JSON.parse(await laneHook(d.root, 1, 'Stop')).decision).toBe('block')
+    await waitFor(() => row.reason === 'owed')
+  }
+  writeFileSync(join(d.root, 'release-lane'), '')
+  await waitFor(() => row.state === 'completed')
+  const report = d.f.history.filter(h => h.item_id === row.id).at(-1)!.body
+  expect(report.outcome).toBe('completed')
+  expect(report.response_message_ids).toHaveLength(1)
+  expect(row.response_message_ids).toEqual(report.response_message_ids!)
+  expect(row.answered).toBe(true)
+  expect(row.reason).toBeNull()
+})
+
 test('a silent Item lane reports stuck and is stopped once; its cut names the restart', async () => {
   const d = await daemon({}, 200, root => {
     const bin = join(root, 'stalled-lane')
