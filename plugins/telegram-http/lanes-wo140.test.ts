@@ -104,10 +104,10 @@ test('WO-140 (3c): an explicit line=mail on a call event is honoured (a mail); a
   const c = run({ line: 'call', btcc: null })
   await L.callLaneTool(c.tok, 'reply_agent', { to: 'chiron', title: 't', ask: 'a', text: ANSWER })
   expect(meshed.at(-1)).toMatchObject({ to: 'chiron', line: 'mail' })
-  // An explicit feed stays a feed. An explicit call to this run's caller gets the same reply reference.
+  // An explicit feed stays a feed. An explicit new pull Call keeps its own reply obligation.
   const ev = { ...a.ev }
   expect(L.answerToCallArgs({ line: 'feed', title: 't', text: 'x' }, ev)).toEqual({ line: 'feed', title: 't', text: 'x' })
-  expect(L.answerToCallArgs({ line: 'call', to: 'chiron', because: 'b', text: 'x' }, ev)).toEqual({ line: 'call', to: 'chiron', because: 'b', text: 'x', reply_to: ev.btcc_msg_id })
+  expect(L.answerToCallArgs({ line: 'call', to: 'chiron', because: 'b', text: 'x' }, ev)).toEqual({ line: 'call', to: 'chiron', because: 'b', text: 'x' })
   expect(L.answerToCallArgs({ to: 'chiron', text: 'x' }, undefined)).toEqual({ to: 'chiron', text: 'x' })
   expect(L.answerToCallArgs({ to: 'chiron', text: 'x' }, { ...ev, source: 'telegram' })).toEqual({ to: 'chiron', text: 'x' })
   expect(L.answerToCallArgs({ to: 'chiron', text: 'x' }, { ...ev, no_reply: true })).toEqual({ to: 'chiron', text: 'x' })   // a no_reply call owes no answer: stays a mail

@@ -41,7 +41,7 @@ beforeAll(async () => {
     const b: any = req.method === 'POST' ? await req.json().catch(() => ({})) : {}
     if (path === '/lanes/call-answered') {
       asked.push(b)
-      if (b.to === 'chiron' && b.reply_to == null) return Response.json({ reply_to: 'item-122-v1', call: '9' })
+      if (b.to === 'chiron' && b.reply_to == null && !b.explicit_work) return Response.json({ reply_to: 'item-122-v1', call: '9' })
       return Response.json({ call: b.to === 'chiron' ? callOf[String(b.reply_to)] ?? null : null })
     }
     return Response.json({})
@@ -109,8 +109,13 @@ test('the main\'s send_to_agent with reply_to: the daemon asks the router which 
   expect(asked.at(-1)).toEqual({ to: 'chiron' })
   expect(lastSend()).toMatchObject({ to: 'chiron', refs: { call: '9' }, no_reply: true, payload: { no_reply: true, text: '12' } })
   expect(lastSend().payload.reply_to_id).toBeUndefined()
+  expect(await send({ line: 'call', to: 'chiron', because: '另一件事', text: '請做 B' })).toMatch(/^delivered/)
+  expect(asked.at(-1)).toEqual({ to: 'chiron', explicit_work: true })
+  expect(lastSend().refs?.call).toBeUndefined()
+  expect(lastSend().no_reply).not.toBe(true)
+  expect(lastSend().payload.reply_to_id).toBeUndefined()
   expect(await send({ line: 'call', to: 'eve', because: 'eve 在等', text: '新的事' })).toMatch(/^delivered/)
-  expect(asked.at(-1)).toEqual({ to: 'eve' })
+  expect(asked.at(-1)).toEqual({ to: 'eve', explicit_work: true })
   expect(lastSend().refs?.call).toBeUndefined()
   expect(await send({ line: 'call', to: 'eve', reply_to: '12601', text: '回 eve' })).toMatch(/^delivered/)
   expect(lastSend().refs?.call).toBeUndefined()                                             // the router names no Call of eve's

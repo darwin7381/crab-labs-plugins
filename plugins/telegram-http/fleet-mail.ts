@@ -24,7 +24,7 @@ export type CallFn = (to: string, text: string, replyTo?: number, noReply?: bool
 export type CallReply = { reply_to: string; call: string }
 export interface FleetDeps {
   call: CallFn; btcc: BtccCall; core: CoreCall
-  callReply?: (to: string, replyTo: unknown) => Promise<CallReply | null>
+  callReply?: (to: string, replyTo: unknown, explicitWork?: boolean) => Promise<CallReply | null>
   /** WO-124: who opens mail through these tools. 'lane' = the agent's mail lane (lanes mode): its open is 車道讀過, not 主線已讀 */
   openBy?: 'lane'
   /** WO-126: the lane (lane.id) calling, when openBy is 'lane': a lane item or a card names it */
@@ -332,7 +332,7 @@ export function takeAfterSend(responses: any[]): AfterSend[] {
 const SENT_RE = /^(delivered|queued in )/
 async function sendCall(args: Record<string, unknown>, deps: FleetDeps) {
   const to = String(args.to ?? '').trim(), message = String(args.text ?? '').trim()
-  const match = to ? await deps.callReply?.(to, args.reply_to) : null
+  const match = to ? await deps.callReply?.(to, args.reply_to, args.line === 'call' && has(args.because) && !has(args.reply_to)) : null
   const ref = has(args.reply_to) ? args.reply_to : match?.reply_to
   const answers = !!match || isReplyRef(ref)
   if (args.line === 'call' && !has(args.because) && !answers) return text(BECAUSE_MISSING, true)

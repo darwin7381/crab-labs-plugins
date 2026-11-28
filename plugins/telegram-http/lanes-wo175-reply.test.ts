@@ -108,6 +108,8 @@ test('the main\'s send: the Call from its delivery\'s did (m-…) or the BTCC nu
   expect(j.get('msg', did(a))?.event).toBe(a.id)
   const outbound: any[] = []
   const deps = { callReply: L.resolveMainCall, call: async (...args: any[]) => { outbound.push(args); return 'delivered' } } as FleetDeps
+  await sendToAgent({ line: 'call', to: 'chiron', because: '另一件事', text: '請做 B' }, deps, false)
+  expect(outbound.at(-1)).toEqual(['chiron', '因為：另一件事\n請做 B', undefined, false, undefined, undefined])
   await sendToAgent({ line: 'call', to: 'chiron', text: 'answer from main' }, deps, false)
   expect(outbound.at(-1)).toEqual(['chiron', 'answer from main', undefined, true, undefined, '427'])
   await sendToAgent({ line: 'call', to: 'chiron', reply_to: '12604', text: 'earlier call' }, deps, false)
@@ -129,7 +131,7 @@ test('Chiron\'s lab: an item with a call id and no BTCC number, answered by repl
   await end(lane)
 })
 
-for (const mode of ['pull', 'take', 'take with BTCC id']) test(mode + ' binds a call back to its caller even when only because names the event', async () => {
+for (const mode of ['pull', 'take', 'take with BTCC id']) test(mode + ' routes explicit work to the caller according to its delivery mode', async () => {
   const ev = item({ call_id: '9', btcc: mode === 'take with BTCC id' ? '12608' : undefined })
   const f = fakeItems()
   const client = new OnsenClient({ dir, agent: 'adam', record: true, base: f.base, credential: () => 'test-member', log: () => {} })
@@ -147,7 +149,11 @@ for (const mode of ['pull', 'take', 'take with BTCC id']) test(mode + ' binds a 
       if (mode === 'take') expect(ev.id).toBe('item-122-v1')
       const sent = await L.callLaneTool(tok, 'reply_agent', { line: 'call', to: 'chiron', because: ev.id, text: '23 × 7 = 161' })
       expect(sent).toContain('delivered')
-      expect(sentFor('chiron')).toMatchObject({ reply_to: ev.btcc_msg_id ?? ev.id, call: '9', no_reply: true })
+      if (mode === 'pull') {
+        expect(sentFor('chiron').reply_to).toBeUndefined()
+        expect(sentFor('chiron').call).toBeUndefined()
+        expect(sentFor('chiron').no_reply).toBe(false)
+      } else expect(sentFor('chiron')).toMatchObject({ reply_to: ev.btcc_msg_id ?? ev.id, call: '9', no_reply: true })
     } finally { await end(lane) }
   } finally { L.useItemReceiver(undefined); claims.stop(); take.stop(); client.stop(); await f.stop() }
 })

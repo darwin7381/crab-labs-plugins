@@ -5844,9 +5844,10 @@ function boundReplyRef(to: unknown, events: { id: string; from?: string; no_repl
   return call?.btcc_msg_id || call?.id
 }
 
-function mainCallReply(to: string, replyTo: unknown): CallReply | null {
+function mainCallReply(to: string, replyTo: unknown, explicitWork = false): CallReply | null {
   let ref = String(replyTo ?? '').trim()
   if (!ref) {
+    if (explicitWork && !takingItems()) return null
     const turn = mainTurn()
     if (!turn || !turn.items.some(row => row.prompt_id === turn.prompt)) return null
     const bound = turn.events.filter(e => e.call?.kind === 'peer_call')
@@ -5857,9 +5858,9 @@ function mainCallReply(to: string, replyTo: unknown): CallReply | null {
   return call ? { reply_to: ref, call: call.id } : null
 }
 
-export async function resolveMainCall(to: string, replyTo: unknown): Promise<CallReply | null> {
-  if (D?.role === 'tg') return mainCallReply(to, replyTo)
-  const r = await peerCall(TG_PORT, '/lanes/call-answered', 'POST', { to, reply_to: replyTo })
+export async function resolveMainCall(to: string, replyTo: unknown, explicitWork = false): Promise<CallReply | null> {
+  if (D?.role === 'tg') return mainCallReply(to, replyTo, explicitWork)
+  const r = await peerCall(TG_PORT, '/lanes/call-answered', 'POST', { to, reply_to: replyTo, ...(explicitWork ? { explicit_work: true } : {}) })
   const ref = String(r?.reply_to ?? replyTo ?? '').trim()
   return ref && /^\d{1,18}$/.test(String(r?.call ?? '')) ? { reply_to: ref, call: String(r.call) } : null
 }
@@ -6864,7 +6865,7 @@ export function laneSendArgs(a: any): { ok: true; f: LaneSendFields; to: string;
 }
 /** Replies to the caller of this run use its BTCC number or router event id. Both pull and take record the Onsen Call on that event. */
 export function answerToCallArgs(a: any, ...bound: (InEvent | undefined)[]): any {
-  if (String(a?.line ?? '').trim() && lineOf(a.line) !== 'call') return a
+  if (String(a?.line ?? '').trim() && (lineOf(a.line) !== 'call' || (!takingItems() && String(a.because ?? '').trim()))) return a
   const calls = bound.filter((e): e is InEvent => !!e && e.source === 'mesh' && (e.line ?? 'call') === 'call' && !e.synthetic && !e.reply_to_id && !e.answers_call
     && (!e.item_kind || e.item_kind === 'peer_call') && !!(e.btcc_msg_id || callOfEvent(e.id)))
   const ref = boundReplyRef(a?.to, calls)
@@ -9028,7 +9029,7 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
     }
     if (p === '/lanes/call-answered' && req.method === 'POST') {          // WO-175 item 2: the Call the main's send_to_agent answers (inbox role)
       const b = await readBody(req)
-      sendJson(res, 200, mainCallReply(String(b.to ?? ''), b.reply_to) ?? { call: null }); return true
+      sendJson(res, 200, mainCallReply(String(b.to ?? ''), b.reply_to, b.explicit_work === true) ?? { call: null }); return true
     }
     if (p === '/lanes/outbound-check' && req.method === 'POST') {        // the main's send_to_agent on a thread, asked by the inbox daemon (002w C: the one gate)
       const b = await readBody(req)
