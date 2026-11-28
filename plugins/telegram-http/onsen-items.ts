@@ -2,7 +2,7 @@ import type { TakeMode } from './onsen-take.ts'
 import { contextMessageLine, memberOfTg, type MemberKind } from './onsen-client.ts'
 
 export type InboxItem = {
-  id: string; number: number; member: string; session_id: string | null; kind: string; from: string
+  id: string; number: number; member: string; session_id: string | null; kind: string; from: string; from_kind?: MemberKind | null
   state: string; reason: string | null; version: number; updated_at: string; not_before?: string | null
   deadline?: string | null; half_done?: boolean; relay?: string | null; refs: Array<{ kind: string; value: string }>
   message_id?: string | null; action_id?: string | null; call_id?: string | null; mail_id?: string | null
@@ -17,13 +17,15 @@ export type ItemRef = {
 }
 export function itemRef(it: InboxItem): ItemRef {
   const note = it.events?.findLast(e => e.kind === 'reassigned')?.note
+  const kind = it.from_kind
   return { onsen_item_id: it.id, onsen_version: it.version, kind: it.kind, from: it.from,
+    ...(it.kind === 'message' ? { from_kind: kind === 'human' || kind === 'guest' || kind === 'agent' || kind === 'system' ? kind : null } : {}),
     ...(it.session_id === 'main' ? { main: true, note } : {}), ...(it.deadline ? { deadline: it.deadline } : {}),
     ...(it.reason ? { reason: it.reason } : {}), ...(it.half_done ? { half_done: true } : {}),
     ...(it.payload.conversation_id != null ? { conversation: String(it.payload.conversation_id) } : {}) }
 }
 
-/** Old references lack from_kind. An explicit null means the registry could not identify this sender. */
+/** Old journal references lack from_kind. A new message with no recognizable kind waits for idle. */
 export function personMessage(ref: ItemRef): boolean {
   return ref.kind === 'message' && (ref.from_kind === undefined || ref.from_kind === 'human' || ref.from_kind === 'guest')
 }

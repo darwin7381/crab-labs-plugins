@@ -1518,45 +1518,26 @@ export type MemberKind = 'human' | 'guest' | 'agent' | 'system'
  *  /v1/members/<name>), else its member name. personOf → null while it is not known yet: asked once per member; when the answer (or no answer) is in,
  *  `changed` runs (server.ts: Lanes.refreshDmTitles) */
 export class MemberNames {
-  private members = new Map<string, { display: string; kind?: MemberKind; retryAfter: number }>()
-  private requests = new Map<string, Promise<void>>()
-  constructor(readonly o: { get: (name: string) => Promise<{ status: number; json: any } | null>; changed: () => void; log?: (m: string) => void; now?: () => number }) {}
-
-  private lookup(member: string): Promise<void> {
-    const pending = this.requests.get(member)
-    if (pending) return pending
-    const request = this.read(member).finally(() => this.requests.delete(member))
-    this.requests.set(member, request)
-    return request
-  }
-
-  private async read(member: string): Promise<void> {
-    let m
-    let reason = ''
-    try {
-      const r = await this.o.get(member)
-      if (r?.status === 200) m = r.json?.data ?? r.json
-      else reason = r ? ` (HTTP ${r.status})` : ' (no answer)'
-    } catch (e) { reason = ` (${errText(e)})` }
-    const display = typeof m?.display_name === 'string' ? m.display_name.replace(/\s+/g, ' ').trim().slice(0, 40) : ''
-    const kind = ['human', 'guest', 'agent', 'system'].includes(m?.kind) ? m.kind : undefined
-    if (!kind && !this.members.has(member)) this.o.log?.(`onsen: unknown member kind for ${member}${reason}; messages wait for idle`)
-    this.members.set(member, { display, kind, retryAfter: (this.o.now ?? Date.now)() + 30_000 })
-    try { this.o.changed() } catch {}
-  }
-
+  private names = new Map<string, string | null>()                      // member → display name ('' none, or not answered; null: being asked)
+  constructor(readonly o: { get: (name: string) => Promise<{ status: number; json: any } | null>; changed: () => void; log?: (m: string) => void }) {}
   personOf(chat: string): string | null {
     const member = memberOfTg(chat) ?? `tg-${chat}`
-    const record = this.members.get(member)
-    if (record) return record.display || member
-    void this.lookup(member)
-    return null
-  }
-
-  async kindOf(member: string): Promise<MemberKind | null> {
-    const record = this.members.get(member)
-    if (!record || (!record.kind && record.retryAfter <= (this.o.now ?? Date.now)())) await this.lookup(member)
-    return this.members.get(member)?.kind ?? null
+    if (!this.names.has(member)) {
+      this.names.set(member, null)
+      void (async () => {
+        let d = ''
+        try {
+          const r = await this.o.get(member)
+          const m = r && r.status === 200 ? (r.json?.data ?? r.json) : null
+          if (m && typeof m.display_name === 'string') d = m.display_name.replace(/\s+/g, ' ').trim().slice(0, 40)
+        } catch (e) { this.o.log?.(`onsen: the display name of ${member}: no answer (${errText(e)}); its member name is used`) }
+        this.names.set(member, d)
+        try { this.o.changed() } catch {}
+      })()
+      return null
+    }
+    const d = this.names.get(member)
+    return d == null ? null : (d || member)
   }
 }
 /** the assignees of a question sent to these Telegram chats: the members among them (in order, once each), else joey */

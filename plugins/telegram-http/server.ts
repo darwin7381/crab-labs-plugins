@@ -361,6 +361,7 @@ let takeMode: TakeMode | undefined
 let itemPeek: ItemPeek | undefined
 let itemReceiver: ItemReceiver | undefined
 let itemClaims: Claims | undefined
+const unknownItemSenders = new Set<string>()
 let registryStatusChanged: (() => void) | undefined
 if (ONSEN_TAKE_ON) {
   const reason = takeRefusal({ inbox: INBOX_ONLY, roamer: ROAMER, lanes: Lanes.LANES_ON, record: !!onsen?.cfg.record,
@@ -5080,7 +5081,10 @@ async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
   const prefix = [item.note, item.half_done ? '上一回合被打斷，接著做。' : ''].filter(Boolean).join('\n')
   if (prefix) payload.text = prefix + '\n' + (payload.text ?? '')
   if (row.kind === 'message' || row.message_id) {
-    if (row.kind === 'message') item.from_kind = await dmNames.kindOf(row.from)
+    if (row.kind === 'message' && item.from_kind === null && !unknownItemSenders.has(row.from)) {
+      unknownItemSenders.add(row.from)
+      log('warn', `onsen: unknown member kind for ${row.from}; messages wait for idle`)
+    }
     if (edit && row.reason !== 'reassigned') { Lanes.editWaitingItem(item, String(payload.text ?? ''), row.updated_at); return }
     const arrived = await personArrived({ item, kind: 'person_message', seq: row.number, dedupe: 'item:' + row.id, payload })
     if (arrived.code !== 200) throw new Error('person delivery: HTTP ' + arrived.code)

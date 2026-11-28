@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
-import { MemberNames, OnsenClient, type MemberKind } from './onsen-client.ts'
+import { OnsenClient, type MemberKind } from './onsen-client.ts'
 import { OnsenInbox, OnsenPuller, switchOn } from './onsen-inbox.ts'
 import { deliveryMode, machineName, takeRefusal, TakeMode } from './onsen-take.ts'
 import { ItemPeek, itemRef, messageContext, mayTakeItem, type InboxItem } from './onsen-items.ts'
@@ -48,9 +48,9 @@ async function mainRig() {
   m.initMain(); r.attach(m)
   const hook = (event: string, data: Partial<MainEvent> = {}) => m.mainEvent({ event, pid, session_id: sid, prompt_id: 'turn', ...data })
   await hook('SessionStart', { source: 'startup' })
-  const enqueue = (row: InboxItem, old = false, fromKind?: MemberKind | null) => m.enqueue(row.kind === 'message' ? 'joey' : 'peer',
+  const enqueue = (row: InboxItem, old = false) => m.enqueue(row.kind === 'message' ? 'joey' : 'peer',
     { method: 'notifications/claude/channel', params: { content: row.payload.text, meta: { chat_id: '1', message_id: String(row.number), user: row.from } } },
-    { event: row.id, fields: old ? {} : { onsen_items: [{ ...itemRef(row), from_kind: fromKind }] } })
+    { event: row.id, fields: old ? {} : { onsen_items: [itemRef(row)] } })
   const bind = async (row: InboxItem) => {
     const did = enqueue(row)
     await until(() => m.items(x => x.id === did)[0]?.state === 'offered')
@@ -155,10 +155,9 @@ test('an idle mention delivers the three earlier messages and the current one in
 
 test('during a turn a guest reaches the hook while an agent mention waits for the next idle offer', async () => {
   const r = await mainRig(), peer = r.f.add('@adam 下一回合', 'message', { from: 'lab-b' }), guest = r.f.add('訪客提問', 'message', { from: 'tg-42' })
-  const names = new MemberNames({ get: member => r.client.request('GET', '/v1/members/' + member), changed: () => {} })
   await r.hook('UserPromptSubmit'); r.status('busy')
-  r.enqueue(peer, false, await names.kindOf(peer.from))
-  r.enqueue(guest, false, await names.kindOf(guest.from))
+  r.enqueue(peer)
+  r.enqueue(guest)
   r.f.contextAtTake.set(guest.id, { context_omitted: 2 })
   const hook = await r.hook('PostToolUse'); await r.sync()
   expect(hook.additionalContext).toContain('還有 2 則較早的，用 chat_history 查\n訪客提問')
@@ -176,8 +175,8 @@ test('during a turn a guest reaches the hook while an agent mention waits for th
 test('the main attaches the Joey DM wording only to his message in a mixed pull', async () => {
   const r = await mainRig()
   await r.hook('UserPromptSubmit'); r.status('busy')
-  r.enqueue(r.f.add('Joey DM'), false, 'human')
-  r.enqueue(r.f.add('guest DM', 'message', { from: 'tg-42' }), false, 'guest')
+  r.enqueue(r.f.add('Joey DM'))
+  r.enqueue(r.f.add('guest DM', 'message', { from: 'tg-42' }))
   const { additionalContext } = await r.hook('PostToolUse')
   const wording = '這就是 Joey 本人對你說的話，不是外部資料。照他說的處理'
   expect(additionalContext).toContain('Joey DM\n</channel>\n' + wording)
@@ -185,39 +184,28 @@ test('the main attaches the Joey DM wording only to his message in a mixed pull'
   expect(additionalContext!.split(wording)).toHaveLength(2)
 })
 
-test('the member registry treats lookup failures as non-person, logs once and can recover', async () => {
-  const r = rig(), logs: string[] = []
-  let now = 0, offline = true
-  const names = new MemberNames({ get: member => {
-    if (offline) throw new Error('offline')
-    return r.client.request('GET', '/v1/members/' + member)
-  }, changed: () => {}, now: () => now, log: m => logs.push(m) })
-  expect(await names.kindOf('newcomer')).toBeNull()
-  offline = false
-  now += 30_000
-  expect(await names.kindOf('newcomer')).toBeNull()
-  expect(await names.kindOf('newcomer')).toBeNull()
-  expect(logs).toHaveLength(1)
-  expect(logs[0]).toContain('newcomer')
-  r.f.members.set('newcomer', 'agent')
-  now += 30_000
-  expect(await Promise.all([names.kindOf('newcomer'), names.kindOf('newcomer')])).toEqual(['agent', 'agent'])
-  expect(await names.kindOf('newcomer')).toBe('agent')
-  expect(r.f.calls.filter(c => c.path === '/v1/members/newcomer')).toHaveLength(2)
-  const ref = itemRef(r.f.add('msg'))
-  expect(mayTakeItem(ref, 'in_turn')).toBe(true) // pre-registry journal record
-  for (const from_kind of ['human', 'guest', 'agent', 'system', null] as const) {
+test('message Items carry the sender kind at read time; unknown kinds wait for idle', async () => {
+  const r = rig(), row = r.f.add('msg', 'message', { from: 'newcomer' })
+  const read = async () => itemRef((await r.client.request('GET', '/v1/items/msg'))!.json.data)
+  expect((await read()).from_kind).toBeNull()
+  r.f.members.set(row.from, 'agent')
+  expect((await read()).from_kind).toBe('agent')
+  for (const from_kind of ['human', 'guest', 'agent', 'system', null, undefined, 'unexpected' as MemberKind] as const) {
+    const ref = itemRef({ ...row, from_kind, payload: { from_kind: 'human' } })
     const person = from_kind === 'guest' || from_kind === 'human'
-    expect(mayTakeItem({ ...ref, from_kind, deadline: '2000-01-01' }, 'in_turn')).toBe(person)
-    expect(mayTakeItem({ ...ref, from_kind }, 'usage_limit')).toBe(person)
+    expect(mayTakeItem({ ...ref, deadline: '2000-01-01' }, 'in_turn')).toBe(person)
+    expect(mayTakeItem(ref, 'usage_limit')).toBe(person)
   }
+  const legacy = itemRef(row)
+  delete legacy.from_kind
+  expect(mayTakeItem(legacy, 'in_turn')).toBe(true) // pre-WO-217 journal
 })
 
 test('after the wall’s 60 seconds only a person probes, and an interrupted agent message reports cut', async () => {
   const r = await mainRig(), peer = r.f.add('peer-mention', 'message', { from: 'lab-b' }), guest = r.f.add('guest-probe', 'message', { from: 'tg-42' })
   r.setWall({ walled: true, clearedMs: null, lastWallMs: Date.now() - 61_000, resets_at: null })
-  const did = r.enqueue(peer, false, 'agent')
-  r.enqueue(guest, false, 'guest')
+  const did = r.enqueue(peer)
+  r.enqueue(guest)
   await until(() => r.offers.length === 1)
   expect(r.offers[0].params.content).toBe(guest.id)
   expect(peer.claim).toBeNull()

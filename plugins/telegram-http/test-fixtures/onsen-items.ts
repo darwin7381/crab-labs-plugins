@@ -40,7 +40,8 @@ export function fakeItems() {
     const number = ++seq
     const payload = kind === 'message' ? { message_id: 'm' + number, conversation_id: 'conv', kind: 'text', from: extra.from ?? 'joey',
       via: 'telegram', text: id, client: { name: 'telegram', chat: '1', msg_id: String(number), user_id: '1', user: 'Joey' }, sent_at: iso(now) } : { text: id }
-    const row: Row = { id, number, member: 'adam', from: 'joey', session_id: null, kind, refs: [], state: 'waiting', reason: null,
+    const row: Row = { id, number, member: 'adam', from: 'joey', get from_kind() { return members.get(this.from) ?? null },
+      session_id: null, kind, refs: [], state: 'waiting', reason: null,
       half_done: false, not_before: null, deadline: null, expires_at: null, failures: 0, released: false, version: 0, events: [], claim: null,
       message_id: kind === 'message' ? 'm' + number : null, action_id: null, call_id: null, mail_id: null,
       answered: null, response_message_ids: [], in_session_at: null, updated_at: iso(now), payload, ...extra }

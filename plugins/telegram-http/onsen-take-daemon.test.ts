@@ -149,7 +149,7 @@ test('a missing sender is logged once and the following Joey DM reaches the jour
     ['first unknown', null], ['second unknown', null], ['following Joey DM', 'human'],
   ])
   expect(d.log().split('\n').filter(line => line.includes('unknown member kind for missing-member'))).toHaveLength(1)
-  expect(d.f.calls.filter(c => c.path === '/v1/members/missing-member')).toHaveLength(1)
+  expect(d.f.calls.filter(c => c.path === '/v1/members/missing-member')).toHaveLength(0)
 })
 
 test('daemon handles a control at dispatch and immediately completes a re-served done id', async () => {
