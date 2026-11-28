@@ -103,8 +103,9 @@ test('every source: one wake row each, decided_by new (rule wake:<id>) with the 
   for (const d of [on, off]) for (const ev of MESH()) expect((await route(d, ev)).target).toBeDefined()
   const ids = ['tg-1828-7101', 'tg-1828-form-9201', ...MESH().map(e => e.id)]
   for (const d of [on, off]) expect(await until(() => ids.every(id => routing(d).some(r => r.event === id)), 20000)).toBe(true)
-  for (const who of ['on', 'off'] as const) expect(await until(() => ids.every(id => rows(who).some(r => r.refs?.event_id === id)), 30000)).toBe(true)
-  const row = (who: Who, id: string) => rows(who).filter(r => r.refs?.event_id === id)
+  // A fast lane can finish before these assertions. Its exit is a second decision on the same event ID.
+  const row = (who: Who, id: string) => rows(who).filter(r => r.refs?.event_id === id && r.source_kind !== 'lane_exit')
+  for (const who of ['on', 'off'] as const) expect(await until(() => ids.every(id => row(who, id).length > 0), 30000)).toBe(true)
   // one row per decision, decided_by on every row
   for (const id of ids) { expect(row('on', id).length).toBe(1); expect(row('off', id).length).toBe(1) }
   for (const r of rows('on')) expect(r.decided_by).toBe('new')

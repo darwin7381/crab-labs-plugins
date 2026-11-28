@@ -767,6 +767,7 @@ test('PL1 B04, T1-R P-201, T2-R E2/E11, T3-R E9: a no_reply notice is in the dig
   const answer = mk('eve', '收到，謝謝（不用回）', { no_reply: true, thread: th, hop: 2 })
   expect(await L.routeEvent(answer)).toMatchObject({ rule: 'mesh-no-reply', target: 'lane', lane: p.lane })
   expect(E().get(answer.id)).toMatchObject({ owner: 'router', answers: p.lane, thread: th, lane: p.lane, obligations: [] })
+  expect(rows().filter(r => r.event === answer.id && r.kind === 'fyi')).toMatchObject([{ lane: 'router', thread: th, refs: { answers: p.lane } }])
   expect(L.activityList(undefined)).toContain('收到，謝謝')
   expect(await until(() => L.__runTok(p.lane)?.evId === answer.id)).toBe(true)
   await end(p.lane)
