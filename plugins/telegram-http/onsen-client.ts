@@ -481,6 +481,11 @@ export class OnsenClient {
   }
   writtenItemId(key: string): string | undefined { return this.itemWrites.id(key) }
   recordItemWrite(write: ItemWrite): void {
+    if ((write.outcome || write.complete) && !write.id) {
+      const id = this.writtenItemId(write.key)
+      if (id) write = { ...write, id }
+      else if (this.hasPendingItemCreate(new Set([write.key]))) write = { ...write, pending_create: true }
+    }
     if (!this.append({ k: 'item', r: write })) throw new Error('could not record the Onsen Item')
   }
   recordItemReport(line: ItemReport): boolean {
@@ -911,7 +916,11 @@ export class OnsenClient {
 
   private async pass(): Promise<void> {
     const todo = this.unsent()
-    if (!todo.length) { this.rotateIfDrained(); return }
+    if (!todo.length) {
+      this.rotateIfDrained()
+      if (this.interval) await this.itemWrites.reconcile()
+      return
+    }
     const cred = this.cfg.credential()
     if (!cred) {
       if (Date.now() - this.credWarnAt > HOUR) {
@@ -1005,6 +1014,7 @@ export class OnsenClient {
           else if (refusedForGood(r)) this.reject(t.line, `PUT ${path}: HTTP ${r.status} ${callSaid(r.json)}`, { kind: 'ir', path, status: r.status, code })
           else return this.failStatus(r, path)
         }
+        if (ok) this.itemWrites.observe(r.json?.data)
         this.itemAck?.(line, ok)
         this.writeCursor(t.end)
         this.itemReports = Math.max(0, this.itemReports - 1)

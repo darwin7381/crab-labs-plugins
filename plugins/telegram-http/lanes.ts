@@ -3531,32 +3531,33 @@ export function useItemReceiver(receiver: typeof itemReceiver, client?: ItemClie
   itemReceiver = receiver
   itemClient = client
   itemWriter = client?.recordItemWrite.bind(client)
-  if (client) client.onItemCreateSettled = (key, id) => {
-    const f = S?.followups[key]
-    if (!id) useLocalReminder(key)
-    if (!f) return
-    if (id && id !== f.onsen_item_id) { f.onsen_item_id = id; saveState() }
-    if (waitingForFollowupId) { waitingForFollowupId = false; onGateOpen?.() }
-  }
+  if (client) client.onItemCreateSettled = settleReminderWrite
   restoreRejectedReminders()
 }
 
-function useLocalReminder(key: string): void {
+function settleReminderWrite(key: string, id?: string): void {
   const f = S?.followups[key]
-  if (f?.onsen === 'submitted' && f.state === 'pending' && !f.onsen_item_id) {
-    delete f.onsen
-    f.local_reminder = true
-    saveState()
+  if (f) {
+    if (id && id !== f.onsen_item_id) { f.onsen_item_id = id; saveState() }
+    if (!id && f.onsen === 'submitted' && f.state === 'pending' && !f.onsen_item_id) {
+      delete f.onsen
+      f.local_reminder = true
+      saveState()
+    }
+    if (waitingForFollowupId) { waitingForFollowupId = false; onGateOpen?.() }
+    return
   }
   if (!events || !key.startsWith('promise:')) return
   const event = key.slice('promise:'.length, key.lastIndexOf(':'))
   const ob = events.get(event)?.obligations?.find((o: Ob) => o.self?.key === key)
-  if (ob) events.set(event, ob.id, { self: undefined, local_reminder: true })
+  if (!ob?.self || ob.self.id) return
+  if (id) events.set(event, ob.id, { self: { ...ob.self, id } })
+  else events.set(event, ob.id, { self: undefined, local_reminder: true })
 }
 
 function restoreRejectedReminders(): void {
   if (!S || !events || !itemClient) return
-  for (const key of itemClient.rejectedSelfCreates()) if (!itemClient.writtenItemId(key)) useLocalReminder(key)
+  for (const key of itemClient.rejectedSelfCreates()) if (!itemClient.writtenItemId(key)) settleReminderWrite(key)
 }
 export function offerMissed(id: string): void { main.offerMissed(id) }
 let onGateOpen: (() => void) | undefined

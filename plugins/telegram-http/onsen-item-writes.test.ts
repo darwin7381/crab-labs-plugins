@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from 'bun:test'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
-import { appendFileSync, mkdtempSync, rmSync } from 'node:fs'
+import { appendFileSync, mkdtempSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { OnsenClient } from './onsen-client.ts'
@@ -119,6 +119,8 @@ test('self writes survive a disconnected connector and close the same Item on re
     c.recordItemWrite({ ...write, complete: true })
     await c.syncNow(true)
     expect(row.state).toBe('completed')
+    expect(c.writtenItemId(write.key)).toBeUndefined()
+    expect(readdirSync(join(dir, 'item-ids'))).toHaveLength(0)
     expect(fake.calls.filter(call => call.key === write.key)).toHaveLength(posted)
     expect(fake.calls.find(call => call.body.outcome === 'completed')?.path).toBe('/v1/items/' + row.id)
     c.recordItemWrite({ ...write, item: { ...write.item, waiter: 'ken' } })
@@ -130,8 +132,39 @@ test('self writes survive a disconnected connector and close the same Item on re
     await c.syncNow(true)
     c.stop(); c = client(); fake.down(false)
     await c.syncNow(true)
-    expect(fake.rows.get(c.writtenItemId(offline.key)!)!.state).toBe('completed')
+    expect(c.writtenItemId(offline.key)).toBeUndefined()
+    expect([...fake.rows.values()].filter(r => r.kind === 'self').map(r => r.state)).toEqual(['completed', 'completed'])
     expect(fake.calls.filter(call => call.path === '/v1/items/' + row.id && call.body.outcome === 'completed')).toHaveLength(1)
+  } finally { c.stop(); rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('terminal claim reports and an expiry while offline clear only the ended Item receipts', async () => {
+  fake = fakeItems()
+  const dir = mkdtempSync(join(tmpdir(), 'ended-item-'))
+  const client = () => new OnsenClient({ dir, agent: 'adam', base: fake.base, record: true, credential: () => 'test-member', log: () => {} })
+  let c = client()
+  try {
+    c.recordItemWrite({ key: 'report', item: ownItem('self', 'main', 'report', null) })
+    await c.syncNow(true)
+    const id = c.writtenItemId('report')!
+    const { data } = await (await request('POST', base + '/take', { connector: 'bench/adam', item_ids: [id], limit: 1, wait: 0 }, 'take')).json()
+    const claim = { claim_id: data.claim_id, at: new Date(fake.now()).toISOString(), session_id: 'main' }
+    c.recordItemReport({ item_id: id, body: { ...claim, outcome: 'in_session' } })
+    await c.syncNow(true)
+    expect(c.writtenItemId('report')).toBe(id)
+    c.stop(); c = client()
+    c.recordItemReport({ item_id: id, body: { ...claim, outcome: 'completed' } })
+    await c.syncNow(true)
+    expect(c.writtenItemId('report')).toBeUndefined()
+    const warm = ownItem('keepwarm', 'main', 'warm', null)
+    c.recordItemWrite({ key: 'expire', item: { ...warm, expires_at: new Date(fake.now() + 1000).toISOString() } })
+    await c.syncNow(true)
+    const expiring = c.writtenItemId('expire')!
+    c.stop(); fake.advance(1001)
+    expect(fake.rows.get(expiring)!.state).toBe('cancelled')
+    c = client(); c.start(); await c.syncNow(true)
+    expect(c.writtenItemId('expire')).toBeUndefined()
+    expect(readdirSync(join(dir, 'item-ids'))).toHaveLength(0)
   } finally { c.stop(); rmSync(dir, { recursive: true, force: true }) }
 })
 
@@ -167,7 +200,8 @@ test('an older followup spool recovers an accepted row or posts once with only O
       payload: { text: sent.item.body!.text }, not_before: sent.item.not_before, deadline: null })
     for (const write of [sent, pending, pending]) appendFileSync(c.spool, JSON.stringify({ k: 'self', r: write }) + '\n')
     await c.syncNow(true)
-    expect(c.writtenItemId(sent.key)).toBe(existing.id)
+    expect(existing.state).toBe('completed')
+    expect(c.writtenItemId(sent.key)).toBeUndefined()
     const posts = fake.calls.filter(call => call.path === base && call.key !== null)
     expect(posts.map(call => call.key)).toEqual([pending.key])
     expect(posts[0]!.body.refs).toEqual([{ kind: 'item', value: origin.id }])
@@ -177,6 +211,7 @@ test('an older followup spool recovers an accepted row or posts once with only O
     c.recordItemWrite({ ...pending, outcome: 'withdrawn' })
     await c.syncNow(true)
     expect(fake.rows.get(id)!.reason).toBe('withdrawn')
+    expect(c.writtenItemId(pending.key)).toBeUndefined()
   } finally { c.stop(); rmSync(dir, { recursive: true, force: true }) }
 })
 
@@ -192,7 +227,7 @@ test('a pre-receipt commitment closes by matching its original waiting Item with
       not_before: item.not_before, deadline: item.deadline, payload: { body: { text: item.body!.text } } })
     c.recordItemWrite({ key: 'pre-upgrade', item, complete: true })
     await c.syncNow(true)
-    expect(c.writtenItemId('pre-upgrade')).toBe(row.id)
+    expect(c.writtenItemId('pre-upgrade')).toBeUndefined()
     expect(fake.rows.get(row.id)!.state).toBe('completed')
     expect(fake.rows.get(other.id)!.state).toBe('waiting')
     expect(nested.state).toBe('waiting')

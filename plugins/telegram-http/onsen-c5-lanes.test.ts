@@ -103,6 +103,8 @@ test('the main tool and a handed peer answer keep their actual waiter and finish
   await client.syncNow(true)
   const row = selfRows().find(r => r.waiter === 'eve')!
   expect(row).toMatchObject({ deadline: due, not_before: due, state: 'waiting' })
+  const self = L.__events().get(id)!.obligations[0].self
+  expect(self.id).toBe(row.id)
   expect(await L.callMainTool('commitment_done', { commitment_id: id }, 'test-main')).toContain('marked done')
   L.__events().open('handed', { class: 'peer', owner: 'main', thread: 't', obligations: [
     { kind: 'peer', level: 'answer', state: 'handed', what: '回信', to: 'cain', due_at: Date.parse(due) }] })
@@ -111,6 +113,8 @@ test('the main tool and a handed peer answer keep their actual waiter and finish
   expect(row.state).toBe('completed')
   const peer = selfRows().find(r => r.waiter === 'cain')!
   expect(peer.state).toBe('completed')
+  expect(client.writtenItemId(self.key)).toBeUndefined()
+  expect(L.__events().get(id)!.obligations[0].self.id).toBe(row.id)
   f.advance(700_000)
   expect(notices(row.id)).toHaveLength(0)
   expect(notices(peer.id)).toHaveLength(0)
