@@ -15,7 +15,7 @@ import { spawnSync } from 'child_process'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { startBotApiMock, type BotApiMock } from './test-fixtures/tg-bot-api-mock.ts'
-import { startTgDaemon, until, freePort, type TgDaemon } from './test-fixtures/tg-daemon.ts'
+import { peerRow, startTgDaemon, until, freePort, type TgDaemon } from './test-fixtures/tg-daemon.ts'
 import { checkObservation } from './test-fixtures/status-v1-check.ts'
 
 const HAS_TMUX = spawnSync('tmux', ['-V'], { encoding: 'utf8' }).status === 0
@@ -184,15 +184,11 @@ test.skipIf(!HAS_TMUX)("lanes on: a menu on the pane keeps a colleague's call wa
     TYPESAFE_API_KEY: 'test-key-not-real', TYPESAFE_KEY_FILE: '', TYPESAFE_BASE_URL: `http://127.0.0.1:${jevPort}` }).catch(e => { api2.stop(); throw e })
   try {
     expect(await until(() => statuses('bea').some(s => s.state === 'waiting' && s.detail?.waitingFor === 'model_picker'), 15000)).toBe(true)
-    const tok = 'test-loopback'
-    const route = (ev: any) => fetch(`http://127.0.0.1:${b.port}/lanes/route`, { method: 'POST', headers: { authorization: `Bearer ${tok}`, 'content-type': 'application/json' }, body: JSON.stringify(ev) }).then(r => r.json())
-    const mesh = (id: string, from: string, text: string, verified: boolean) => ({ id, source: 'mesh', from, text, meta: { user: from }, verified, line: 'call', btcc_msg_id: id.slice(5),
-      notif: { method: 'notifications/claude/channel', params: { content: text, meta: { user: from } } } })
-    await route(mesh('mesh-61001', 'eve', '維護幾點？', false))
-    await route(mesh('mesh-61002', 'eve', '週報那件事你知道嗎？', true))
+    peerRow(b, 61001, 'eve', '維護幾點？', { unverified: true })
+    peerRow(b, 61002, 'eve', '週報那件事你知道嗎？')
     const routing = () => lines(join(b.ws, '.lanes', 'routing.jsonl'))
-    expect(await until(() => routing().some(r => r.event === 'mesh-61001') && routing().some(r => r.event === 'mesh-61002'), 8000)).toBe(true)
-    expect(routing().find(r => r.event === 'mesh-61001')).toMatchObject({ rule: 'wake:unverified', decided_by: 'new', wake_target: 'held:waiting' })
+    expect(await until(() => routing().some(r => r.event === 'item-61001-v1') && routing().some(r => r.event === 'item-61002-v1'), 8000)).toBe(true)
+    expect(routing().find(r => r.event === 'item-61001-v1')).toMatchObject({ rule: 'wake:unverified', decided_by: 'new', wake_target: 'held:waiting' })
     expect(wakes).toEqual([])
     expect(onsenNow('bea')).toMatchObject({ state: 'waiting' })
     // WO-169 part 2: the observation of the lanes daemon: the held call is in the main's queue, the main blocked by the menu

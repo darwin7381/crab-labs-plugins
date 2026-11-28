@@ -13,7 +13,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { OnsenClient, inboundItem, outboundRecord, restartHead } from './onsen-client.ts'
 import { startBotApiMock } from './test-fixtures/tg-bot-api-mock.ts'
-import { startTgDaemon, freePort } from './test-fixtures/tg-daemon.ts'
+import { peerRow, startTgDaemon, freePort } from './test-fixtures/tg-daemon.ts'
 process.env.LANES_FLOOD_CONTROL = '0'
 const L = await import('./lanes.ts?wo144') as typeof import('./lanes.ts')
 const B = await import('./lanes-boundary.ts')
@@ -326,16 +326,12 @@ describe('part 2: a real Telegram daemon', () => {
     const dArgv = join(root, 'argv.jsonl'), dBin = join(root, 'lane.py')
     writeFileSync(dBin, `#!/usr/bin/env python3\nimport json, sys\nwith open('${dArgv}', 'a') as f: f.write(json.dumps(sys.argv[1:]) + '\\n')\nprint(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': 'ok'}), flush=True)\n`)
     chmodSync(dBin, 0o755)
-    mkdirSync(join(root, 'cred'), { recursive: true }); writeFileSync(join(root, 'cred', 'mesh-credential'), CRED + '\n')
     const api = startBotApiMock({}, { pollHoldMs: 300 })
-    const d = await startTgDaemon(api, root, 1828, { ONSEN_BASE: `http://127.0.0.1:${port}/api/onsen`, ONSEN_CREDENTIAL_FILE: join(root, 'cred', 'mesh-credential'),
-      LANES_CLAUDE_BIN: dBin, ONSEN_RECORD: '0' })
+    const d = await startTgDaemon(api, root, 1828, { ONSEN_BASE: `http://127.0.0.1:${port}/api/onsen`, FIXTURE_MEMBER_TOKEN: CRED,
+      LANES_CLAUDE_BIN: dBin })
     try {
-      const tokFile = join(root, 'tok', String(d.port))
-      expect(await until(() => { try { return !!readFileSync(tokFile, 'utf8').trim() } catch { return false } })).toBe(true)
-      const r = await fetch(`http://127.0.0.1:${d.port}/lanes/route`, { method: 'POST', headers: { authorization: `Bearer ${readFileSync(tokFile, 'utf8').trim()}`, 'content-type': 'application/json' },
-        body: JSON.stringify(reminder()) })
-      expect(await r.json()).toMatchObject({ target: 'lane' })
+      const ev = reminder()
+      peerRow(d, 144, ev.from, ev.text, { kind: 'mail', payload: { no_reply: true, wake: 'mail', line: 'mail' } })
       const rows = (): string[][] => { try { return readFileSync(dArgv, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) } catch { return [] } }
       expect(await until(() => rows().length > 0, 15000)).toBe(true)
       const argv = rows()[0], prompt = argv[argv.indexOf('-p') + 1]

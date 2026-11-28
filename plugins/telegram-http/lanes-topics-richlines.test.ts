@@ -9,7 +9,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync } from '
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { startBotApiMock, dm, type BotApiMock } from './test-fixtures/tg-bot-api-mock.ts'
-import { startTgDaemon, until, type TgDaemon } from './test-fixtures/tg-daemon.ts'
+import { telegramWorkOrderRouter, startTgDaemon, until, type TgDaemon } from './test-fixtures/tg-daemon.ts'
 
 const JOEY = 1828
 const BODY = (lane: string) => `## T3 完成 ${lane}\n\n| 項目 | 狀態 |\n|---|---|\n| 報表 | **完成** |\n\n下一步：**寄出**`
@@ -39,22 +39,24 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 're
 `)
   chmodSync(bin, 0o755)
   api = startBotApiMock({ has_topics_enabled: true, allows_users_to_create_topics: false })
-  d = await startTgDaemon(api, root, JOEY, { ROAMER_MODE: '1', LANES_AGENT: 'sonn_lab', AGENT_INBOX_SELF: 'sonn_lab', LANES_CLAUDE_BIN: bin, TELEGRAM_SEND_TIMEOUT_S: '1',
+  d = await startTgDaemon(api, root, JOEY, { ROAMER_MODE: '1', FIXTURE_MEMBER_TOKEN: 'test-member', LANES_ROUTER: telegramWorkOrderRouter(root), LANES_AGENT: 'sonn_lab', AGENT_INBOX_SELF: 'sonn_lab', LANES_CLAUDE_BIN: bin, TELEGRAM_SEND_TIMEOUT_S: '1',
     LANES_RETRY_BACKOFF_MS: '600000', LANES_CLOSE_GRACE_MS: '300' })
 }, 40000)
 afterAll(async () => { await d?.stop(); api?.stop() })
 
 async function workOrder(n: number): Promise<any> {
-  const tok = readFileSync(join(root, 'tok', String(d.port)), 'utf8').trim()
-  const text = `[board][WO-${n}] 請 sonn_lab 整理名單`
-  return fetch(`http://127.0.0.1:${d.port}/lanes/route`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${tok}` },
-    body: JSON.stringify({ id: `mesh-rl-${n}`, source: 'mesh', from: 'board', verified: true, text, meta: {}, line: 'call', notif: { method: 'notifications/claude/channel', params: { content: text, meta: {} } } }) }).then(r => r.json())
+  api.push(dm(JOEY, n, `[board][WO-${n}] 請 sonn_lab 整理名單`))
+  const find = () => {
+    try { return readFileSync(join(d.ws, '.lanes', 'routing.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l)).find(r => r.event === 'tg-' + JOEY + '-' + n) } catch {}
+  }
+  await until(() => !!find())
+  return find()
 }
 const richFor = (lane: string) => api.of('sendRichMessage').filter(c => String(c.body.rich_message?.markdown ?? '').includes(lane))
 const plainFor = (lane: string) => api.of('sendMessage').filter(c => String(c.body.text ?? '').includes(lane))
 
 test('a worker\'s line with a heading, a table and bold goes out as a rich message in its topic; the label is its own first line; it rings', async () => {
-  expect(await workOrder(1)).toMatchObject({ rule: 'mesh-board', target: 'lane' })
+  expect(await workOrder(1)).toMatchObject({ rule: 'tg-work-order', target: 'lane' })
   expect(await until(() => richFor('sonn_lab.worker.1').length === 1, 15000)).toBe(true)
   const c = richFor('sonn_lab.worker.1')[0]
   expect(c.body.message_thread_id).toBe(7001)

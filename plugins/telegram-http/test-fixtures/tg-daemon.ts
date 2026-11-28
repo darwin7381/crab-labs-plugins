@@ -33,6 +33,22 @@ export function personRow(d: TgDaemon, payload: Record<string, any>) {
   const id = String(payload.message_id)
   return d.items.add(id, payload.kind === 'command' ? 'control' : 'message', { from: payload.from, message_id: id, payload })
 }
+export function peerRow(d: TgDaemon, number: number, from: string, text: string, opts: {
+  kind?: string; unverified?: boolean; payload?: Record<string, unknown>; refs?: Array<{ kind: string; value: string }>
+} = {}) {
+  return d.items.add(String(number), opts.kind ?? 'call', { from, unverified: opts.unverified, refs: opts.refs ?? [],
+    payload: { text, msg_id: number, logged: true, ...opts.payload } })
+}
+
+/** In the native Telegram topic tests, a message from the mock bot can open a work order. */
+export function telegramWorkOrderRouter(root: string): string {
+  const cfg = JSON.parse(readFileSync(join(PLUGIN, 'lanes-router.fleet.json'), 'utf8'))
+  const board = cfg.rules.find((r: { id: string }) => r.id === 'mesh-board')
+  cfg.rules.unshift({ ...board, id: 'tg-work-order', match: { ...board.match, source: 'telegram' } })
+  const file = join(root, 'work-order-router.json')
+  writeFileSync(file, JSON.stringify(cfg))
+  return file
+}
 export function actionRow(d: TgDaemon, payload: { action_id: string; option_id: string; version: number }) {
   return d.items.add('press-' + payload.action_id + '-' + payload.version, 'control', { action_id: payload.action_id, payload })
 }

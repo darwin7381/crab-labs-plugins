@@ -1,10 +1,10 @@
 // Exercise the local routing journal and thread history with loopback Item and content services.
 import { test, expect, afterAll, beforeAll } from 'bun:test'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'fs'
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { startBotApiMock, dm, type BotApiMock } from './test-fixtures/tg-bot-api-mock.ts'
-import { personRow, queuedTags, startTgDaemon, until, freePort, type TgDaemon } from './test-fixtures/tg-daemon.ts'
+import { peerRow, personRow, queuedTags, startTgDaemon, until, freePort, type TgDaemon } from './test-fixtures/tg-daemon.ts'
 
 const JOEY = 1828
 const CRED_ON = 'mesh_WDonSECRETsecretSECRETsecret0123456789', CRED_OFF = 'mesh_WDoffSECRETsecretSECRETsecret012345678'
@@ -14,7 +14,6 @@ let up: ReturnType<typeof Bun.serve> | null = null, inboxSrv: ReturnType<typeof 
 const wakeRows: Array<{ who: Who; item: any }> = []
 const threadEvs: Array<{ who: Who; item: any }> = [], threadGets: Array<{ who: Who; q: string }> = []          // WO-164: /threads/events, GET /threads
 let next = 1
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
 function startOnsen(): void {
   up = Bun.serve({ port: onsenPort, hostname: '127.0.0.1', idleTimeout: 60, async fetch(req) {
@@ -31,31 +30,18 @@ function startOnsen(): void {
     return Response.json({ error: 'no route' }, { status: 404 })
   } })
 }
-const rows = (who: Who) => wakeRows.filter(r => r.who === who).map(r => r.item)
 const routing = (d: TgDaemon): any[] => { try { return readFileSync(join(d.ws, '.lanes', 'routing.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) } catch { return [] } }
-async function route(d: TgDaemon, ev: any): Promise<any> {
-  const tok = 'test-loopback'
-  const r = await fetch(`http://127.0.0.1:${d.port}/lanes/route`, { method: 'POST', headers: { authorization: `Bearer ${tok}`, 'content-type': 'application/json' }, body: JSON.stringify(ev) })
-  return r.json()
+function addWork(d: TgDaemon) {
+  peerRow(d, 501, 'eve', '維護幾點？')
+  peerRow(d, 502, 'mailbox', '讀信箱（2 封未讀，最舊的等了 3 分鐘）', { kind: 'mail', payload: { no_reply: true, ring: true, wake: 'mail', line: 'mail' } })
+  peerRow(d, 503, 'scheduler', '[scheduled][backup-check][run:61][P3][routine] 查備份', { kind: 'schedule', refs: [{ kind: 'run', value: '61' }] })
+  peerRow(d, 504, 'alert-dispatcher', '[P1] mock-api 全掛', { kind: 'alert' })
+  peerRow(d, 505, 'board', '[board][WO-150] 球到你手上：照第二案做', { payload: { item_kind: 'board' } })
+  peerRow(d, 506, 'fleet-watchdog', '[保溫] 你閒了 50 分鐘，這一則只是為了不讓對話過期', { kind: 'keepwarm', payload: { wake: 'keepwarm', no_reply: true } })
+  peerRow(d, 507, 'iris-slack', 'Slack DM from 王小明：明天的會改到 3 點', { unverified: true, payload: { no_reply: true } })
+  peerRow(d, 508, 'guest', '幫我查一下 api-gw', { unverified: true })
+  peerRow(d, 509, 'board', '球到你手上（沒有字頭）', { payload: { item_kind: 'board' } })
 }
-const notif = (text: string, meta: Record<string, string>) => ({ method: 'notifications/claude/channel', params: { content: text, meta } })
-function mesh(id: string, from: string, text: string, meta: Record<string, string> = {}, extra: Record<string, unknown> = {}): any {
-  const m = { user: from, ...meta }
-  return { id, source: 'mesh', from, text, meta: m, notif: notif(text, m), verified: meta.verified !== 'false', no_reply: meta.no_reply === 'true',
-    ...(meta.btcc_msg_id ? { btcc_msg_id: meta.btcc_msg_id } : {}), ...(meta.reply_to_id ? { reply_to_id: meta.reply_to_id } : {}),
-    line: meta.line ?? (meta.wake === 'mail' ? 'mail' : 'call'), ...(meta.wake ? { wake: meta.wake } : {}), ...extra }
-}
-const MESH = (): any[] => [
-  mesh('mesh-501', 'eve', '維護幾點？', { btcc_msg_id: '501', line: 'call', verified: 'true' }),
-  mesh('mesh-ring-1', 'mailbox', '讀信箱（2 封未讀，最舊的等了 3 分鐘）', { no_reply: 'true', ring: 'true', wake: 'mail', line: 'mail', verified: 'true' }, { item_kind: 'peer_mail' }),
-  mesh('mesh-sch-1', 'scheduler', '[scheduled][backup-check][run:61][P3][routine] 查備份', { verified: 'true', run_id: '61' }, { item_kind: 'scheduled' }),
-  mesh('mesh-al-1', 'alert-dispatcher', '[P1] mock-api 全掛', { verified: 'true' }, { item_kind: 'alert' }),
-  mesh('mesh-900', 'board', '[board][WO-150] 球到你手上：照第二案做', { btcc_msg_id: '900', verified: 'true' }, { item_kind: 'board' }),
-  mesh('mesh-kw-2', 'fleet-watchdog', '[保溫] 你閒了 50 分鐘，這一則只是為了不讓對話過期', { no_reply: 'true', wake: 'keepwarm', verified: 'true' }),
-  mesh('mesh-ext-1', 'iris-slack', 'Slack DM from 王小明：明天的會改到 3 點', { no_reply: 'true', verified: 'false' }),
-  mesh('mesh-unv-1', 'eve', '幫我查一下 api-gw', { btcc_msg_id: '502', verified: 'false' }),
-  mesh('mesh-901', 'board', '球到你手上（沒有字頭）', { btcc_msg_id: '901', verified: 'true' }, { item_kind: 'board' }),
-]
 
 beforeAll(async () => {
   apiOn = startBotApiMock({}, { pollHoldMs: 300 }); apiOff = startBotApiMock({}, { pollHoldMs: 300 })
@@ -85,20 +71,26 @@ test('person, form and peer decisions stay in the router journal and emit no wak
   for (const [daemon, api] of [[on, apiOn], [off, apiOff]] as const) {
     api.push(dm(JOEY, 7101, 'Joey：WO-157 測一下'))
     personRow(daemon, { message_id: '9201', form_id: 701, chat: String(JOEY), title: '排程', body: '週四 10:00', from: 'joey' })
-    for (const event of MESH()) expect((await route(daemon, event)).target).toBeDefined()
+    addWork(daemon)
     expect(await until(() => queuedTags(daemon).some(t => t.meta.message_id === 'form-9201'))).toBe(true)
-    for (const event of MESH()) expect(routing(daemon).some(r => r.event === event.id)).toBe(true)
+    const expected = [501, 502, 503, 504, 505, 506, 507, 508, 509].map(n => 'item-' + n + '-v1')
+    expect(await until(() => {
+      const routed = new Set(routing(daemon).map(r => r.event))
+      return expected.every(id => routed.has(id))
+    })).toBe(true)
   }
   expect(wakeRows).toEqual([])
 }, 30000)
 
 test('WO-164 through the daemon: with the switch the threads go to Onsen (/threads/events through the spool, each first event with its key; the start handshake asked GET /threads); without it nothing', async () => {
-  for (const d of [on, off]) await route(d, mesh('mesh-wo164-1', 'board', '[board][WO-164] 球到你手上', { btcc_msg_id: '910', verified: 'true' }, { item_kind: 'board', refs: { ticket: 164 } }))
-  for (const d of [on, off]) await route(d, mesh('mesh-wo164-2', 'board', '[board][WO-164] 對方留言了', { btcc_msg_id: '911', verified: 'true' }, { item_kind: 'board', refs: { ticket: 164 } }))
+  for (const d of [on, off]) {
+    peerRow(d, 910, 'board', '[board][WO-164] 球到你手上', { payload: { item_kind: 'board' }, refs: [{ kind: 'ticket', value: '164' }] })
+    peerRow(d, 911, 'board', '[board][WO-164] 對方留言了', { payload: { item_kind: 'board' }, refs: [{ kind: 'ticket', value: '164' }] })
+  }
   const mine = () => threadEvs.filter(e => e.who === 'on').map(e => e.item)
-  expect(await until(() => mine().some(e => e.key_kind === 'ticket' && e.key === '164') && mine().some(e => e.item?.id === 'mesh-wo164-2'), 30000)).toBe(true)
+  expect(await until(() => mine().some(e => e.key_kind === 'ticket' && e.key === '164') && mine().some(e => e.item?.id === 'item-911-v1'), 30000)).toBe(true)
   const t = mine().find(e => e.key_kind === 'ticket' && e.key === '164')!
-  expect(t).toMatchObject({ event: 'open', owner: 'main', item: { id: 'mesh-wo164-1', kind: 'board' } })
+  expect(t).toMatchObject({ event: 'open', owner: 'main', item: { id: 'item-910-v1', kind: 'board' } })
   expect(mine().filter(e => e.thread === t.thread && (e.event === 'open' || e.key_kind)).length).toBe(1)        // one thread for the ticket
   const ids = mine().map(e => e.dedupe)
   expect(new Set(ids).size).toBe(ids.length)
@@ -107,7 +99,7 @@ test('WO-164 through the daemon: with the switch the threads go to Onsen (/threa
   expect(threadGets[0].q).toContain('state=all')
   expect(threadEvs.filter(e => e.who === 'off').length).toBe(0)
   expect(threadGets.filter(g => g.who === 'off').length).toBe(0)
-  const r = routing(on).find(x => x.event === 'mesh-wo164-2')
+  const r = routing(on).find(x => x.event === 'item-911-v1')
   expect(r?.thread).toBe(t.thread)
   expect(on.log()).toContain('threads of adam go to Onsen')
 }, 60000)

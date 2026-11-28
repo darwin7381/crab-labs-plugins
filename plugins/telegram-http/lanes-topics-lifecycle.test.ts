@@ -8,7 +8,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { plainTopicName, stripEmoji, topicLink } from './lanes-topics.ts'
 import { startBotApiMock, dm, ICON_CHECK } from './test-fixtures/tg-bot-api-mock.ts'
-import { startTgDaemon, until as untilA } from './test-fixtures/tg-daemon.ts'
+import { telegramWorkOrderRouter, startTgDaemon, until as untilA } from './test-fixtures/tg-daemon.ts'
 process.env.LANES_FLOOD_CONTROL = '0'
 process.env.LANES_CLOSE_GRACE_MS = '30000'
 process.env.LANES_TOPIC_SWEEP_MS = '50'
@@ -136,13 +136,10 @@ test('a close a daemon restart cut off is finished at boot; a lane closed before
 test('daemon: createForumTopic with the plain name; the close looks the ✅ up, sets it with editForumTopic, posts the closing line in the topic', async () => {
   const api = startBotApiMock({ has_topics_enabled: true, allows_users_to_create_topics: false })
   const root = mkdtempSync(join(tmpdir(), 'lanes-topics-lifecycle-d-'))
-  const d = await startTgDaemon(api, root, 1828, { ROAMER_MODE: '1', LANES_CLOSE_GRACE_MS: '300', LANES_RETRY_BACKOFF_MS: '60000' })
+  const d = await startTgDaemon(api, root, 1828, { ROAMER_MODE: '1', FIXTURE_MEMBER_TOKEN: 'test-member', LANES_ROUTER: telegramWorkOrderRouter(root), LANES_CLOSE_GRACE_MS: '300', LANES_RETRY_BACKOFF_MS: '60000' })
   try {
-    const tok = readFileSync(join(root, 'tok', String(d.port)), 'utf8').trim()
-    const text = '[board][WO-77] ✅ 請 adam 整理 🚀 名單'
-    const r = await fetch(`http://127.0.0.1:${d.port}/lanes/route`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${tok}` },
-      body: JSON.stringify({ id: 'mesh-d-77', source: 'mesh', from: 'board', verified: true, text, meta: {}, line: 'call', notif: { method: 'notifications/claude/channel', params: { content: text, meta: {} } } }) }).then(x => x.json()) as any
-    expect(r).toMatchObject({ rule: 'mesh-board', target: 'lane' })
+    api.push(dm(1828, 77, '[board][WO-77] ✅ 請 adam 整理 🚀 名單'))
+    expect(await until(() => api.of('createForumTopic').length > 0)).toBe(true)
     expect(api.of('createForumTopic').map(c => c.body)).toEqual([{ chat_id: '1828', name: '工單 WO-77' }])
     const topic = 7001
     api.push(dm(1828, 90, '/lanes close 工作線#1', { command: true }))
