@@ -49,8 +49,8 @@ beforeAll(() => {
   put(join(home, 'Library', 'LaunchAgents', 'com.btai.agent-inbox.beta.plist'), plist('com.btai.agent-inbox.beta', { TELEGRAM_STATE_DIR: join(ws('beta'), '.agent-inbox-state'), LANES_AGENT: 'beta', AGENT_WORKSPACE_DIR: ws('beta') }))
   put(join(ws('beta'), '.agent-inbox-state', 'access.json'), { dmPolicy: 'allowlist', allowFrom: [], groups: {}, pending: {} })
   // Installed roamer; its local daemon has to confirm it stopped polling before the bridge can carry it.
-  put(join(home, '.claude', 'channels', 'roamer-x', '.env'), 'TELEGRAM_BOT_TOKEN=7000000021:RRroamSECRETroamSECRETroam00\n')
-  put(join(home, 'Library', 'LaunchAgents', 'com.btai.telegram-daemon.roamer-x.plist'), plist('com.btai.telegram-daemon.roamer-x', { ROAMER_MODE: '1', ROAMER_BOT_NAME: 'roamer_x', TELEGRAM_STATE_DIR: join(home, '.claude', 'channels', 'roamer-x') }))
+  put(join(home, '.claude', 'channels', 'roamer-x', '.env'), 'ROAMER_MODE=1\nROAMER_BOT_NAME=roamer_x\nTELEGRAM_BOT_TOKEN=7000000021:RRroamSECRETroamSECRETroam00\n')
+  put(join(home, 'Library', 'LaunchAgents', 'com.btai.telegram-daemon.lab.plist'), plist('com.btai.telegram-daemon.lab', { TELEGRAM_HTTP_PORT: '19001', TELEGRAM_STATE_DIR: join(home, '.claude', 'channels', 'roamer-x') }))
   put(join(ws('moved'), '.cc-agent.json'), { name: 'claude-moved', enabled: false, channels: { telegram: { state_dir: sd('moved') } } })
   tg.addBot(TOK.alpha, 'alpha_bot'); tg.addBot(TOK.beta, 'beta_bot'); tg.addBot(TOK.codex, 'lab_test_bot')
   put(join(home, '.config', 'mesh', 'telegram-bridge-macmini.credential'), CRED.mac + '\n')
@@ -91,6 +91,7 @@ describe('which agents', () => {
   test('discovery: the installed daemons (not agent-inbox, not a moved manifest); the map first; only the listed', () => {
     const d = discover(home, 'darwin')
     expect([...d.found.keys()].sort()).toEqual(['alpha', 'beta', 'roamer-x'])
+    expect(d.found.get('roamer-x')?.roamerPort).toBe(19001)
     expect(d.found.get('alpha')!.stateDir).toBe(sd('alpha'))
     const s = { list: new Set(['alpha', 'codex']), dirs: new Map([['codex', join(root, 'lab-state')], ['beta', '/elsewhere']]), errors: [] }
     const c = carried(s, d)

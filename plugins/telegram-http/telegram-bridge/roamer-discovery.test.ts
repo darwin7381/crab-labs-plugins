@@ -1,5 +1,5 @@
 import { test, expect, spyOn } from 'bun:test'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { startBotApiMock } from '../test-fixtures/tg-bot-api-mock.ts'
@@ -19,8 +19,12 @@ test('wildcard discovery follows each roamer daemon; an explicit state-dir map p
     for (const [unit, bot, port] of [['roamer-x', 'space_roamers', a.port], ['ordinary', 'time_travelers', b.port]]) {
       writeFileSync(join(dir, unit + '.service'), `[Service]\nEnvironment=ROAMER_MODE=1 ROAMER_BOT_NAME=${bot} TELEGRAM_STATE_DIR=%h/${bot} TELEGRAM_HTTP_PORT=${port}\n`)
     }
+    const stream = join(home, 'space_roamers'), alias = join(home, 'space-alias')
+    mkdirSync(stream)
+    symlinkSync(stream, alias, 'dir')
+    writeFileSync(join(dir, 'roamer-unknown.service'), '[Service]\nEnvironment=TELEGRAM_STATE_DIR=%h/no-identity\n')
     const found = discover(home, 'linux')
-    const want = carried({ list: '*', dirs: new Map([['space-roamers', join(home, 'space_roamers')]]), errors: [] }, found)
+    const want = carried({ list: '*', dirs: new Map([['space-roamers', alias + '/'], ['wrong-member', stream + '/'], ['alias-member', alias], ['nameless', join(home, 'no-identity')]]), errors: [] }, found)
     expect([...want.keys()]).toEqual(['space-roamers', 'time-travelers'])
     const x = want.get('space-roamers')!, y = want.get('time-travelers')!
     expect(await bridgeOwnsBot(x, false)).toBe(true)
@@ -39,7 +43,7 @@ test('wildcard discovery follows each roamer daemon; an explicit state-dir map p
       expect([...bridge.agents.keys()]).toEqual(['space-roamers'])
       expect([...bridge.pollers.keys()]).toEqual(['space-roamers'])
       expect(await until(() => bot.polls.length > 0)).toBe(true)
-      expect(token.mock.calls.every(([dir]) => dir === x.stateDir)).toBe(true)
+      expect(token.mock.calls.every(([dir]) => dir === stream)).toBe(true)
       spaceSwitched = false
       await bridge.reconcile()
       expect(bridge.pollers.size).toBe(0)

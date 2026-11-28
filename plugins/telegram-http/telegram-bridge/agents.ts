@@ -14,9 +14,9 @@
 //              is carried (one log line). A manifest whose daemon moved to another machine stays behind with no unit here: not this machine's.
 //   the token  TELEGRAM_BOT_TOKEN in <state dir>/.env, read in place (the daemon's parse, server.ts 125-131), kept in memory only; never
 //              copied, written or logged.
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, dirname, isAbsolute, join } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { agentName, isRoamerEnv, roamerMember } from '../onsen-client.ts'
 
 export const MEMBER_RE = /^[a-z0-9][a-z0-9-]{0,63}$/
@@ -71,6 +71,20 @@ export function readSettings(env: NodeJS.ProcessEnv = process.env, file = settin
 function listDir(p: string): string[] { try { return readdirSync(p) } catch { return [] } }
 function readText(p: string): string { try { return readFileSync(p, 'utf8') } catch { return '' } }
 
+function stateEnv(dir: string): Record<string, string> {
+  const env: Record<string, string> = Object.create(null)
+  for (const line of readText(join(dir, '.env')).split('\n')) {
+    const m = /^(\w+)=(.*)$/.exec(line)
+    if (m) env[m[1]!] ??= m[2]!
+  }
+  return env
+}
+function botToken(env: Record<string, string>): string | null {
+  const token = env.TELEGRAM_BOT_TOKEN?.trim().replace(/^(['"])(.*)\1$/, '$2')
+  return token && /^\d+:[A-Za-z0-9_-]+$/.test(token) ? token : null
+}
+function realDir(dir: string): string { try { return realpathSync(dir) } catch { return resolve(dir) } }
+
 /** the environment a launchd plist sets (its EnvironmentVariables dict: <key>K</key><string>V</string>) */
 export function plistEnv(text: string): Record<string, string> {
   const out: Record<string, string> = {}
@@ -97,7 +111,7 @@ export function unitEnv(text: string, home: string, into: Record<string, string>
 export type Found = { member: string; stateDir: string; source: string; roamerPort?: number }
 
 /** the Telegram daemons installed on this machine: member → its state dir (see the header); `dupes`: members two units claim (not carried) */
-export function discover(home: string, platform: string): { found: Map<string, Found>; dupes: string[] } {
+export function discover(home: string, platform: string) {
   const units: Array<{ source: string; env: Record<string, string> }> = []
   if (platform === 'darwin') {
     const dir = join(home, 'Library', 'LaunchAgents')
@@ -114,31 +128,40 @@ export function discover(home: string, platform: string): { found: Map<string, F
     }
   }
   const found = new Map<string, Found>()
-  const dupes = new Set<string>()
+  const dupes = new Set<string>(), roamerDirs = new Map<string, string | null>()
   for (const u of units) {
     const sd = (u.env.TELEGRAM_STATE_DIR ?? '').trim()
-    if (!sd || !isAbsolute(sd) || u.env.CHANNEL_INBOX_ONLY === '1') continue
+    if (!sd || !isAbsolute(sd) || u.env.CHANNEL_INBOX_ONLY === '1' || /agent-inbox/.test(u.source)) continue
     // an agent-inbox unit sets TELEGRAM_STATE_DIR too (its own .agent-inbox-state): only a unit whose state dir holds a bot token is a
     // Telegram daemon (the Mac mini canary found every member "claimed twice": its telegram-daemon and its agent-inbox plist)
-    const roamer = isRoamerEnv(u.env)
-    if (/agent-inbox/.test(u.source) || (!roamer && !readToken(sd))) continue
-    const member = roamer ? roamerMember(u.env) : agentName(u.env, (u.env.AGENT_WORKSPACE_DIR ?? '').trim() || dirname(sd))
+    const local = stateEnv(sd), env = { ...local, ...u.env }
+    const roamer = isRoamerEnv(env) || /roamer/i.test(u.source)
+    const member = roamer ? roamerMember({ ...env, ROAMER_MODE: '1' }) : agentName(u.env, (u.env.AGENT_WORKSPACE_DIR ?? '').trim() || dirname(sd))
+    if (roamer) {
+      const key = realDir(sd)
+      roamerDirs.set(key, roamerDirs.has(key) && roamerDirs.get(key) !== member ? null : member ?? null)
+    } else if (!botToken(local)) continue
     if (!member || !MEMBER_RE.test(member)) continue
     const had = found.get(member)
-    if (had && had.stateDir !== sd) { dupes.add(member); continue }
+    if (had && realDir(had.stateDir) !== realDir(sd)) { dupes.add(member); continue }
+    if (had?.roamerPort !== undefined && !roamer) continue
     found.set(member, { member, stateDir: sd, source: u.source, ...(roamer ? { roamerPort: Number(u.env.TELEGRAM_HTTP_PORT) || 0 } : {}) })
   }
   for (const d of dupes) found.delete(d)
-  return { found, dupes: [...dupes].sort() }
+  for (const [m, f] of found) {
+    const owner = roamerDirs.get(realDir(f.stateDir))
+    if (owner !== undefined && owner !== m) found.delete(m)
+  }
+  return { found, dupes: [...dupes].sort(), roamerDirs }
 }
 
 /** the agents to carry now: the explicit map first, then discovery; only those the list names (or all with `*`) */
-export function carried(s: Settings, d: { found: Map<string, Found> }): Map<string, Found> {
+export function carried(s: Settings, d: ReturnType<typeof discover>): Map<string, Found> {
   const out = new Map<string, Found>()
   const want = (m: string) => s.list === '*' || s.list.has(m)
   for (const [m, dir] of s.dirs) if (want(m)) {
-    const installed = [...d.found.values()].find(f => f.stateDir === dir && f.roamerPort !== undefined)
-    if (installed && installed.member !== m) continue
+    const owner = d.roamerDirs.get(realDir(dir))
+    if (owner !== undefined && (owner !== m || !d.found.has(m))) continue
     out.set(m, { ...d.found.get(m), member: m, stateDir: dir, source: 'ONSEN_BRIDGE_STATE_DIRS' })
   }
   for (const [m, f] of d.found) if (want(m) && !out.has(m)) out.set(m, f)
@@ -164,13 +187,8 @@ export function readToken(stateDir: string): { token: string; mtime: number } | 
   const f = join(stateDir, '.env')
   try {
     const mtime = statSync(f).mtimeMs
-    for (const line of readFileSync(f, 'utf8').split('\n')) {
-      const m = line.match(/^(\w+)=(.*)$/)
-      if (m && m[1] === 'TELEGRAM_BOT_TOKEN') {
-        const v = m[2]!.trim().replace(/^(['"])(.*)\1$/, '$2')
-        return /^\d+:[A-Za-z0-9_-]+$/.test(v) ? { token: v, mtime } : null
-      }
-    }
+    const token = botToken(stateEnv(stateDir))
+    if (token) return { token, mtime }
   } catch {}
   return null
 }
