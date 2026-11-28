@@ -1,0 +1,27 @@
+# WO-213 C7 · take-only delivery
+
+Branch `wo213-c7` starts at `ef79d7a`. File and line references below are on that commit, relative to `plugins/telegram-http`. Contract §4b MD5 at start was `b170644f7bd89a1846a80a10239e7538` (settled through 56). Sources are the shared C2–C7 brief, connector facts §§2–6, design v3, v3 coverage, inventory, C1 spec, C1 acceptance and C1 fix spec.
+
+## Cutover
+
+This is the last connector change. S2 supplies take and report, S3 supplies projections, S4 and C3 must have passed the bench before switching production members, and C6 must have moved the roamers. With the existing client, switch and drain each member per rulings 24/44. Include the independent Codex runner in the handoff below. Before retiring the old code, the server owner verifies **zero GET /inbox requests across all members for 24 continuous hours**, including rejected requests. Check that old clients have finished their pending hands and acks. S5 removes the server routes after C7. Existing data on disk can be inspected by the operator during the drain. The new process never replays or erases those directories.
+
+## Connector changes
+
+| Mechanism | Code at the base | Behaviour after C7 |
+| --- | --- | --- |
+| D1, D2, D3 | `server.ts:1129–1559`, SSE open, broadcast and wall ticks | Remove consumption-based re-parking, disk replay, watchdog, age/cap quarantine and the legacy pending/undeliverable stores. Delivery ownership resides with the Item. Keep attachment downloads in the inbox directory and the live MCP session transport. |
+| Pull, copy, cumulative ack and D7 | `onsen-inbox.ts:39–368`, `server.ts:2068–2087,4797–4843,4965–5100,5231–5262` | Delete both hand-over senders and receivers, local cursor, key copy, retry and ack. Route peeked persons, controls and authenticated peer Items in the Telegram daemon. Preserve the sender and supported mailbox tools. |
+| D10, O5, O6, O7 | `onsen-inbound.ts:32–294`, `server.ts:677–757,3658,4593,4654`, `onsen-visible.ts:504`, `onsen-mentions.ts:18`, `onsen-first.ts:23–end` | Retire the non-connector writer, kept facts, delayed local hand, form poll/ack, standalone mention wake and Telegram-first/retry machinery. A form answer arrives as a message Item. Albums use waiting Item references and preserve their metadata. Unread mention notifications still ride the next real delivery under ruling 6. The connector sends replies through Onsen. |
+| Startup and refusal | `server.ts:357–378,4267,4382`, `onsen-take.ts:8–63` | The receiving daemon starts the Item probe automatically. The mailbox daemon does not receive Items. A 409 not_take_member logs the member and reason and retries the same probe after 60 s. A competing connector waits 45 s. Connection errors and other refusals also retry the Item endpoint. No local take/pull switch or fallback delivery. |
+| Codex | `codex-runner/codex-runner.ts:423–426,505–646,797,968–1083` | Peek eligible call/message work. Only take a specific Item when a worker slot and its conversation/thread are free. Use the Item and its payload for sender, thread, conversation and attachments. Bind the actual run, renew held IDs with the machine/member connector, and report in_session and a terminal outcome against the granted claim. Persist unconfirmed reports and drain them before another take. Preserve reply text, files, thread continuity, restart adoption and stable reply identity. Page messages use the same path. |
+
+The facts table's GONE subset is D2, D3, D7, O5 and O6. D1, D10 and O7 retire their legacy implementations. The bridge's outage handling is D9. C1 fixes D1–D14, particularly real Item shapes, claim recovery, reassignment note (54), and observation, still merge ahead of C7. C2 owns the earlier daemon projection changes, C3–C6 own their respective delivery, timer and roamer changes.
+
+## Deploying the Codex runner
+
+Stage the new artifact beside the running version. Quiesce submissions to codex (including page messages and replies), let the old instance finish its outstanding intake and run queue, and wait through upload, reply, branch publication for dev runs, final reporting and ack. Check the existing runner state for zero lookup, queued, starting, running and finishing jobs and confirm its children have exited. This includes the run producing C7. Leave its session directories, run history, results and thread mappings in place. With admission still closed, stop the drained old instance, switch the member with the server owner and start one new instance on the same state directory. Verify its connector, observation and a bench call through completion before reopening admission. An interrupted drain resumes on the old binary. The 24-hour gate includes this cutover. Deployments and the member switch are operational actions outside this change.
+
+## Verification
+
+Use the existing loopback Item fixture and a fake Codex executable. Exercise automatic probe, refusal and subsequent recovery, person/peer/control delivery, albums, legacy route absence, forms as Items, runner slot and thread gating, lost responses, restart, reply IDs and claim renewal. Audit runtime callers of retired paths, including durable spool replay. Run changed daemon tests five consecutive times with an empty machine config. Keep the server's 24-hour count as a separate bench result. Report total lines and non-test branch tokens against the common base.
