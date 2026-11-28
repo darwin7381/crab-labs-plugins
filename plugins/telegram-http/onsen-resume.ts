@@ -26,6 +26,7 @@ type Resume = {
   text?: string
   superseded?: true
   withdrawn?: true
+  awaitingInput?: true
   rejected?: true
   awaitingRelease?: true
   create?: { kind: 'resume'; session_id: 'main'; body: { format: 'markdown'; text: string }; refs: never[]; not_before?: string }
@@ -37,7 +38,7 @@ export class ResumeItems {
   private sending = new Set<string>()
 
   constructor(readonly current: () => Row | undefined, readonly save: (entries: Resume[]) => void,
-    readonly receiver: () => ItemReceiver | undefined, readonly delivered: (id: string) => boolean,
+    readonly receiver: () => ItemReceiver | undefined, readonly delivered: (id: string) => boolean, readonly inInput: (id: string) => boolean,
     readonly retire: (id: string, reason: 'superseded' | 'withdrawn') => void, readonly ready: () => void) {}
 
   private entries(): Resume[] { return this.current()?.resume_items ?? [] }
@@ -68,7 +69,7 @@ export class ResumeItems {
   line(session: string): ResumeLine | undefined {
     const rx = this.receiver()
     if (!rx?.mode.active) return
-    const e = this.entries().find(e => e.session === session && this.undelivered(e)
+    const e = this.entries().find(e => e.session === session && !e.awaitingInput && this.undelivered(e)
       && (e.text || e.create?.body.text) && !(e.id && (rx.taking(e.id) || rx.claims.owns(e.id))))
     if (e) return { key: e.key, session, text: e.text ?? e.create!.body.text }
   }
@@ -93,13 +94,23 @@ export class ResumeItems {
   /** While a matching POST is unacknowledged, a peek cannot identify the cut from its text alone. */
   canOffer(id: string, text: string): boolean {
     const entries = this.entries(), known = entries.find(e => e.id === id)
-    if (known?.superseded || known?.withdrawn) return false
+    if (known?.superseded || known?.withdrawn || known?.awaitingInput) return false
     if (known && known.key !== id) return true // the POST identified this row
     return !entries.some(e => e.create?.body.text === text)
   }
   cancelling(id: string): 'superseded' | 'withdrawn' | undefined {
     const e = this.entries().find(e => e.id === id)
     return e?.withdrawn ? 'withdrawn' : e?.superseded ? 'superseded' : undefined
+  }
+  awaitingInput(id: string): boolean { return this.entries().some(e => e.id === id && e.awaitingInput) }
+
+  /** Once a stream write starts, its original claim waits for a matching turn or C1's unbound deadline. */
+  resolveInput(id: string, reached: boolean): boolean {
+    const entries = this.entries(), entry = entries.find(e => e.id === id && e.awaitingInput)
+    if (!entry) return false
+    this.save(entries.map(e => e === entry ? { ...e, awaitingInput: undefined, superseded: reached ? undefined : true } : e))
+    if (!reached) this.retire(id, 'superseded')
+    return true
   }
 
   remember(id: string, text: string): void {
@@ -114,11 +125,12 @@ export class ResumeItems {
 
   supersede(session: string, interruptedPrompt?: string): void {
     const entries = this.entries()
-    const pending = new Set(entries.filter(e => (!e.session || e.session === session)
+    const pending = new Set(entries.filter(e => !e.awaitingInput && (!e.session || e.session === session)
       && (!interruptedPrompt || e.prompt === interruptedPrompt) && this.undelivered(e)))
     if (!pending.size) return
-    this.save(entries.map(e => pending.has(e) ? { ...e, superseded: true } : e))
-    for (const e of pending) if (e.id) {
+    const inInput = new Set([...pending].filter(e => e.id && this.inInput(e.id) && this.receiver()?.claims.owns(e.id)))
+    this.save(entries.map(e => inInput.has(e) ? { ...e, awaitingInput: true } : pending.has(e) ? { ...e, superseded: true } : e))
+    for (const e of pending) if (e.id && !inInput.has(e)) {
       // Spool a held claim before its unbound timer fires, even when Onsen is unreachable.
       this.receiver()?.claims.report(e.id, 'superseded')
       this.retire(e.id, 'superseded')

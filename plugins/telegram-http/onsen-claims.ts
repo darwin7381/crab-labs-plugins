@@ -23,7 +23,7 @@ export class Claims implements ClaimStore {
   private timers = new Map<string, ReturnType<typeof setTimeout>>()
 
   constructor(readonly file: string, readonly spool: Spool, readonly missed: (id: string) => void,
-    readonly changed: () => void, readonly now = Date.now) {
+    readonly changed: () => void, readonly now = Date.now, readonly unboundOutcome: (id: string) => 'not_taken' | 'superseded' = () => 'not_taken') {
     try {
       const data = JSON.parse(readFileSync(file, 'utf8'))
       this.rows = Object.assign(Object.create(null), data.claims)
@@ -54,7 +54,7 @@ export class Claims implements ClaimStore {
     if (!this.owns(id) || row.in_session_at) return
     const expire = () => {
       if (!this.owns(id) || this.rows[id]?.in_session_at) return
-      try { this.report(id, 'not_taken') }
+      try { this.report(id, this.unboundOutcome(id)) }
       catch { this.timers.set(id, setTimeout(expire, 1000).unref()); return }
       this.missed(id)
     }

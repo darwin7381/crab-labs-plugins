@@ -209,7 +209,8 @@ export function createMain(E: MainEnv) {
     const g = latestMain()
     const row = J().write('main', g?.id ?? UNREGISTERED, g?.state ?? 'gone', { resume_items: entries.length ? entries : null })
     if (row) resumeWrites.set(row, (resumeWrites.get(row) ?? 0) + 1)
-  }, () => E.itemReceiver?.(), resumeDelivered, (id, reason) => {
+  }, () => E.itemReceiver?.(), resumeDelivered, id => items(r => (r.state === 'offered' || r.state === 'queued' && r.resume_input_gen)
+    && r.onsen_items?.[0]?.onsen_item_id === id).length > 0, (id, reason) => {
     for (const r of items(r => r.state !== 'done' && r.onsen_items?.[0]?.onsen_item_id === id)) closeItem(r, { reason })
   }, () => { void pump('resume-ready') })
   const aidItem = (r: Row): AidItem => { const m = metaOf(r.notif); return { mid: m.message_id || m.btcc_msg_id || r.id, kind: m.message_id ? 'tg' : m.btcc_msg_id ? 'mesh' : 'sys',
@@ -582,6 +583,7 @@ export function createMain(E: MainEnv) {
       // Sonn #11516 (1): while this offer is on its way the item is still `queued`; an edit must not rewrite it then (the main would get the old text
       // while Onsen records replaced_in_queue): replaceQueued skips the ids in flight and the edit goes as a new message
       for (const r of [it, ...riders]) if (r.onsen_items && (probe || r.keeper_probe)) J().write('msg', r.id, r.state, { keeper_probe: probe })
+      for (const r of [it, ...riders]) if (isResume(r)) J().write('msg', r.id, r.state, { resume_input_gen: g.id })
       for (const id of ids) inFlight.add(id)
       try { ok = await E.offer(notif, it.via as Via, Number(g.pid)) } catch (e) { E.log('warn', `lanes: offer of ${it.id} failed: ${e}`) }
       finally { for (const id of ids) inFlight.delete(id) }
@@ -589,9 +591,13 @@ export function createMain(E: MainEnv) {
       if (!now || now.id !== g.id) return
       if (!ok) {
         if (line && it.state === 'queued') J().write('msg', it.id, 'queued', { carried_resume: null })
-        for (const r of [it, ...riders]) if (r.onsen_items) E.itemReceiver?.()?.report(r.onsen_items, 'not_taken')
+        for (const r of [it, ...riders]) if (r.onsen_items && r.state !== 'bound' && r.state !== 'done') {
+          const id = r.onsen_items[0].onsen_item_id
+          E.itemReceiver?.()?.report(r.onsen_items, unboundOutcome(id))
+          if (r.resume_input_gen && !resumes.resolveInput(id, false)) J().write('msg', r.id, r.state, { resume_input_gen: null })
+        }
         down.add(String(it.via))
-        if (it.last_no_wake !== 'unreachable') { J().write('msg', it.id, 'queued', { last_no_wake: 'unreachable' }); J().write('wake', it.id, 'no_wake', { reason: `main gen ${g.id} has no open ${it.via} stream` }) }
+        if (it.state === 'queued' && it.last_no_wake !== 'unreachable') { J().write('msg', it.id, 'queued', { last_no_wake: 'unreachable' }); J().write('wake', it.id, 'no_wake', { reason: `main gen ${g.id} has no open ${it.via} stream` }) }
         continue
       }
       // Consume the keeper's clear only after a write. A failed lookup or a disconnected stream still owes this offer.
@@ -927,33 +933,37 @@ export function createMain(E: MainEnv) {
     return ids.has(r.id) || !!r.onsen_items?.some((ref: ItemRef) => ids.has(ref.onsen_item_id))
   }
   function beginTurn(g: Row, prompt: string, ids?: Set<string>, source?: string): void {
-    if (g.prompt_id === prompt) return
-    if (g.stopped_prompt === prompt) return continueTurn(g, prompt)
+    if (g.stopped_prompt === prompt && g.prompt_id !== prompt) continueTurn(g, prompt)
+    const open = g.prompt_id === prompt
+    if (open && !ids?.size) return
     const receiver = E.itemReceiver?.()
     const canBind = (r: Row) => {
       const named = ids && identifies(ids, r), resume = isResume(r)
-      if (source === 'task-notification' && !named) return false
+      if ((open || source === 'task-notification' || resume && resumes.awaitingInput(r.onsen_items[0].onsen_item_id)) && !named) return false
       if (resume && (ids && !named || resumes.cancelling(r.onsen_items[0].onsen_item_id))) return false
       const offered = r.state === 'offered' && r.gen === g.id
       const queued = r.state === 'queued' && forGen(r, g) && (named || !ids && resume && inFlight.has(r.id))
       return (offered || queued) && (!r.onsen_items || r.onsen_items.every((ref: ItemRef) => receiver?.claims.owns(ref.onsen_item_id)))
     }
-    if (source !== 'task-notification' && source !== 'StopFailure' && receiver) {
+    if (!open && source !== 'task-notification' && source !== 'StopFailure' && receiver) {
       syncResumes()
       // A named delivery identifies this turn even when re-taking it failed. Without a prompt hook,
       // an offered Item with its current claim identifies the delivery that reached this generation.
       if (g.resume_items && !items(r => r.kind !== 'digest' && (ids ? identifies(ids, r) : canBind(r))).length)
         resumes.supersede(g.session_id, ids ? undefined : prompt)
     }
-    if (g.prompt_id) cutTurn(g)                                     // a turn that never got Stop or StopFailure: its items ride this turn (pull, WO-157c)
-    outputs.clear(); calls.clear(); openTools.delete(g.id)                                          // the aids look at this prompt's calls only
-    starts.set(g.id, { prompt, at: new Date().toISOString(), prev: starts.get(g.id)?.at ?? null })
-    setMain(g, 'in_turn', { prompt_id: prompt, tool_open: null, stopped_prompt: null })
+    if (!open) {
+      if (g.prompt_id) cutTurn(g)                                    // a turn that never got Stop or StopFailure
+      outputs.clear(); calls.clear(); openTools.delete(g.id)
+      starts.set(g.id, { prompt, at: new Date().toISOString(), prev: starts.get(g.id)?.at ?? null })
+      setMain(g, 'in_turn', { prompt_id: prompt, tool_open: null, stopped_prompt: null })
+    }
     const accepted = items(canBind)
     for (const r of accepted) if (r.onsen_items) receiver?.bind(r.onsen_items, 'main', prompt, g.session_id)
     const at = new Date().toISOString()
     for (const r of accepted) J().write('msg', r.id, 'bound', { gen: g.id, prompt_id: prompt, bound_at: at,
       ...(r.carried_resume && (!ids || !identifies(ids, r)) ? { carried_resume: null } : {}) })
+    for (const r of accepted) if (isResume(r)) resumes.resolveInput(r.onsen_items[0].onsen_item_id, true)
     if (accepted.length) { try { E.bound?.(accepted.map(r => J().get('msg', r.id)!)) } catch (e) { E.log('warn', `lanes: bound hook: ${e}`) }; delivered() }
   }
   /** the prompt the gen last stopped is running again: a Stop hook other than ours blocked that Stop. The turn was not over: it re-opens, and
@@ -1385,13 +1395,15 @@ export function createMain(E: MainEnv) {
     return rs.map(r => r.id)
   }
 
+  function unboundOutcome(id: string): 'superseded' | 'not_taken' { return resumes.awaitingInput(id) ? 'superseded' : 'not_taken' }
   function offerMissed(id: string): void {
+    if (resumes.resolveInput(id, false)) return
     const g = currentGen()
     for (const r of items(r => (r.state === 'offered' || r.state === 'queued') && r.onsen_items?.some((ref: ItemRef) => ref.onsen_item_id === id))) {
-      J().write('msg', r.id, 'queued', { reason: 'offer_untaken', gen: null, prompt_id: null, missed_state: deliveryNow(), missed_gen: g?.id })
+      J().write('msg', r.id, 'queued', { reason: 'offer_untaken', gen: null, prompt_id: null, resume_input_gen: null, missed_state: deliveryNow(), missed_gen: g?.id })
     }
   }
-  return { offerMissed, routeResume, wallDelivery, initMain, currentGen, mainPid, mainPhase, mainUp, mainSession, markEnd, enqueue, pump, renderPulled, mainEvent, streamOpened, tick, registryChanged, statusIdle, turnWork, turnStart, openTool,
+  return { offerMissed, unboundOutcome, itemWriteSettled: resumes.settled.bind(resumes), routeResume, wallDelivery, initMain, currentGen, mainPid, mainPhase, mainUp, mainSession, markEnd, enqueue, pump, renderPulled, mainEvent, streamOpened, tick, registryChanged, statusIdle, turnWork, turnStart, openTool,
     replaceQueued, mainCanTake, deliveryNow, statusChanged, items: (pred: (r: Row) => boolean = () => true) => items(pred) }
 }
 

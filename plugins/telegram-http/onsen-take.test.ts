@@ -27,7 +27,7 @@ function rig() {
   const mode = new TakeMode('adam', client.request.bind(client), () => {}, line => logs.push(line), 'mac-mini')
   const file = join(dir, 'claims.json')
   let main: MainApi | undefined
-  const claims = new Claims(file, client, id => { misses.push(id); main?.offerMissed(id) }, () => {}, f.now)
+  const claims = new Claims(file, client, id => { misses.push(id); main?.offerMissed(id) }, () => {}, f.now, id => main?.unboundOutcome(id) ?? 'not_taken')
   client.watchItemReports(r => claims.replay(r), (r, ok) => claims.acknowledged(r, ok))
   const receiver = new ItemReceiver(mode, claims, time => deadlines.push(time))
   clean.push(() => { mode.stop(); claims.stop(); client.stop(); f.stop(); rmSync(dir, { recursive: true, force: true }) })
@@ -124,8 +124,8 @@ test('C4 a process cut records the old background count; an item failure and an 
   expect([...other.f.rows.keys()]).toEqual(['work'])
 })
 
-async function accountCut() {
-  const r = await mainRig()
+async function accountCut(onOffer?: () => Promise<boolean>) {
+  const r = await mainRig(undefined, onOffer)
   r.setWall({ walled: true, clearedMs: null })
   await r.hook('UserPromptSubmit')
   await r.hook('StopFailure', { error: 'rate_limit' })
@@ -261,18 +261,19 @@ test('C4 a delayed create acknowledgement respects an existing M1 delivery of th
   expect(r.f.calls.some(c => c.body.outcome === 'superseded')).toBe(false)
 })
 
-test('C4 a held claim is marked superseded offline before its offer lease can expire', async () => {
+test('C4 an offline unbound resume remembers the continuation and expires as superseded', async () => {
   const r = await accountCut()
   r.setWall({ walled: false, clearedMs: Date.now() + 1000 })
   await r.m.pump()
   r.f.down(true)
   await r.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] })
-  expect(r.client.hasItemReports()).toBe(true)
+  expect(r.client.hasItemReports()).toBe(false)
   r.f.advance(25_000); r.claims.start()
+  await until(() => r.client.hasItemReports())
   await r.sync()
   r.f.down(false); await r.sync()
   expect(r.outcomes(r.row.id)).toEqual(['superseded'])
-  expect(r.misses).toEqual([])
+  expect(r.misses).toEqual([r.row.id])
 })
 
 test('C4 a same-prompt independent turn supersedes the waiting row at its latest version', async () => {
@@ -399,11 +400,49 @@ test('C4 a claimed offer that never reaches a turn is superseded', async () => {
   await claimed.m.pump()
   expect(claimed.offers).toHaveLength(1)
   await claimed.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] })
+  expect(claimed.client.hasItemReports()).toBe(false)
+  claimed.f.advance(20_001); claimed.claims.start()
   await until(() => claimed.client.hasItemReports())
   await claimed.sync(); await claimed.m.tick()
   expect(claimed.outcomes(claimed.row.id)).toEqual(['superseded'])
   expect(claimed.offers).toHaveLength(1)
+})
 
+test.each(['same prompt', 'next prompt'])('settled 59: a queued resume actually enters the %s after an independent turn starts', async timing => {
+  const r = await accountCut()
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 })
+  await r.m.pump()
+  const did = r.offers[0].params.meta.did, claim = r.row.claim!.id
+  await r.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] })
+  if (timing === 'next prompt') await r.hook('Stop', { prompt_id: 'automatic', phase: 'final' })
+  await r.sync()
+  expect(r.row.state).toBe('claimed')
+  const prompt_id = timing === 'next prompt' ? 'with-text' : 'automatic'
+  await r.hook('UserPromptSubmit', { prompt_id, dids: [did] })
+  await r.hook('Stop', { prompt_id, phase: 'final' })
+  r.f.advance(REGISTRY_SETTLE_MS + 1); r.status('idle'); await r.sync()
+  expect(r.outcomes(r.row.id)).toEqual(['in_session', 'completed'])
+  expect(r.f.history.every(h => h.body.claim_id === claim)).toBe(true)
+  expect(r.offers).toHaveLength(1)
+})
+
+test.each([true, false])('settled 59: continuation during the stream write reports what reached the turn (write=%p)', async written => {
+  let finish!: (ok: boolean) => void
+  const r = await accountCut(() => new Promise(resolve => { finish = resolve }))
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 })
+  const sending = r.m.pump()
+  await until(() => r.offers.length === 1)
+  await r.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] })
+  await r.sync()
+  expect(r.outcomes(r.row.id)).toEqual([])
+  finish(written); await sending
+  if (written) {
+    await r.hook('UserPromptSubmit', { prompt_id: 'with-text', dids: [r.offers[0].params.meta.did] })
+    await r.hook('Stop', { prompt_id: 'with-text', phase: 'final' })
+    r.f.advance(REGISTRY_SETTLE_MS + 1); r.status('idle')
+  }
+  await r.sync()
+  expect(r.outcomes(r.row.id)).toEqual(written ? ['in_session', 'completed'] : ['superseded'])
 })
 
 async function waitingModelCut() {

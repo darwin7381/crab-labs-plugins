@@ -3560,6 +3560,8 @@ function restoreRejectedReminders(): void {
   for (const key of itemClient.rejectedSelfCreates()) if (!itemClient.writtenItemId(key)) settleReminderWrite(key)
 }
 export function offerMissed(id: string): void { main.offerMissed(id) }
+export function unboundOutcome(id: string): 'superseded' | 'not_taken' { return main?.unboundOutcome(id) ?? 'not_taken' }
+export function itemWriteSettled(write: ItemWrite, row?: InboxItem): void { main?.itemWriteSettled(write, row) }
 export function routeResume(ref: ItemRef, text: string): void { main.routeResume(ref, text) }
 let onGateOpen: (() => void) | undefined
 export function observeItemGates(open?: () => void): void { onGateOpen = open }

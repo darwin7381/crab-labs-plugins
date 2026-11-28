@@ -374,7 +374,7 @@ if (ONSEN_TAKE_ON) {
         } else { itemPeek!.stop(); takeKeepwarm?.stop() }
         registryStatusChanged?.()
       }, line => log('info', line))
-    itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, Lanes.offerMissed, () => registryStatusChanged?.())
+    itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, Lanes.offerMissed, () => registryStatusChanged?.(), Date.now, Lanes.unboundOutcome)
     onsen.watchItemReports(line => itemClaims!.replay(line), (line, ok) => itemClaims!.acknowledged(line, ok))
     itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at), () => itemPeek!.reset(), due => !!takeKeepwarm?.matchesWindow(due))
     Lanes.useItemReceiver(itemReceiver, onsen)
