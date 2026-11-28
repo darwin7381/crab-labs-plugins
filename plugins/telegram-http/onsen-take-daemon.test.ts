@@ -261,7 +261,8 @@ test('C5 converts a saved followup and delivers its self Item once to the origin
   const rows = [...d.f.rows.values()].filter(r => r.kind === 'self')
   expect(rows).toHaveLength(1)
   const row = rows[0]!
-  expect(row).toMatchObject({ session_id: worker, waiter: 'eve', not_before: new Date(due).toISOString(), deadline: null, state: 'waiting' })
+  expect(d.f.calls.find(c => c.key === id)!.body).not.toHaveProperty('waiter')
+  expect(row).toMatchObject({ session_id: worker, waiter: 'adam', not_before: new Date(due).toISOString(), deadline: null, state: 'waiting' })
   d.f.advance(due - d.f.now() + 1)
   await waitFor(() => d.f.history.some(h => h.item_id === row.id && h.body.outcome === 'in_session'))
   expect(d.journal().filter(r => r.rec === 'run' && r.state === 'queued' && r.ev?.followup === id)).toHaveLength(1)

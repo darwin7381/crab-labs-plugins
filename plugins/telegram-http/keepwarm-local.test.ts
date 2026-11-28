@@ -125,9 +125,9 @@ test('take keepwarm uses the member credential, replaces a stale warm window and
     clock = later + 1 + 60 * 60
     await check.run()
     expect([...f.rows.values()].filter(r => r.state === 'waiting')).toHaveLength(0)
-    writeFileSync(file, lines(joey(at), req(at + 24 * 3600), answer(at + 24 * 3600 + 1), end(at + 24 * 3600 + 2)))
-    clock = at + 24 * 3600 + 3
-    await check.run()
+    writeFileSync(file, lines(joey(later), req(later + 24 * 3600), answer(later + 24 * 3600 + 1), end(later + 24 * 3600 + 2)))
+    clock = later + 24 * 3600 + 3
+    await check.run(); await client.syncNow(true)
     expect(f.rows.size).toBe(2)
     const raceAt = clock + 60
     const old = f.add('old-warm-window', 'keepwarm', { from: 'adam', session_id: 'main', not_before: iso(clock) })
@@ -150,6 +150,29 @@ test('take keepwarm uses the member credential, replaces a stale warm window and
     expect((await receiver.receive([itemRef(old)])).given.has(old.id)).toBe(true)
     expect([mail, delivered]).toEqual([0, 0])
   } finally { mode.stop(); f.stop(); client.stop(); rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('the full cache lifetime sets expiry even when the 24-hour real-work cutoff comes first', async () => {
+  const f = fakeItems(), dir = mkdtempSync(join(tmpdir(), 'kw-expiry-')), file = join(dir, 'main.jsonl')
+  const at = Math.floor(f.now() / 1000), lastReal = at - 23 * 3600 - 45 * 60
+  let clock = at + 5
+  const client = new OnsenClient({ dir, agent: 'adam', base: f.base, record: true, credential: () => 'test-member', log: () => {} })
+  const mode = new TakeMode('adam', client.request.bind(client), () => {}, () => {})
+  const check = new LocalKeepwarm({ name: 'adam', take: { mode, write: w => client.recordItemWrite(w) }, stateDir: dir,
+    projectsDir: () => dir, transcript: () => file, mode: () => 'live', mail: async () => null, deliver: async () => false, log: () => {}, now: () => clock })
+  try {
+    await mode.probe()
+    writeFileSync(file, lines(joey(lastReal), req(at), answer(at + 1), end(at + 2)))
+    await check.run(); await client.syncNow(true)
+    const [row] = f.rows.values()
+    expect(row).toMatchObject({ kind: 'keepwarm', not_before: iso(at + 50 * 60), expires_at: iso(at + 60 * 60) })
+    expect(f.calls.find(c => c.body.kind === 'keepwarm')!.body).not.toHaveProperty('waiter')
+    clock = at + 50 * 60
+    expect(check.matchesWindow(row!.not_before!)).toBe(false)
+    f.advance(Date.parse(row!.expires_at!) - f.now() + 1)
+    expect(row!.reason).toBe('expired')
+    expect([...f.rows.values()].filter(r => r.kind === 'notice')).toHaveLength(0)
+  } finally { mode.stop(); client.stop(); f.stop(); rmSync(dir, { recursive: true, force: true }) }
 })
 
 describe('decide (keep-warm)', () => {

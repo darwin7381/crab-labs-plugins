@@ -4262,11 +4262,9 @@ function fireFollowup(f: Followup, now: number, item?: ItemRef): void {
 
 function followupWrite(f: Followup) {
   const event = events.get(f.event)
-  const origin: ItemRef | undefined = event?.onsen_items?.[0]
-  const waiter = memberWaiter(event?.promised?.at(-1)?.to) ?? origin?.waiter ?? origin?.from ?? S.threads[f.thread]?.peer ?? undefined
   const refs = [{ kind: 'item', value: f.id }, ...(event?.onsen_items ?? []).map((r: ItemRef) => ({ kind: 'item', value: r.onsen_item_id }))]
   if (f.run_id) refs.push({ kind: 'run', value: f.run_id })
-  return { key: f.id, item: ownItem('self', f.lane, followupEventText(f, f.due), f.due, waiter, null, refs) }
+  return { key: f.id, item: ownItem('self', f.lane, followupEventText(f, f.due), f.due, undefined, null, refs) }
 }
 
 function withdrawCheck(f: Followup, writer: ItemWriter, row?: InboxItem): void {

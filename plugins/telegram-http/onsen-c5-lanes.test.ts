@@ -235,7 +235,8 @@ test('followup keeps the origin lane and sender limits, and only a due Item ente
   const rows = selfRows().filter(r => r.session_id === lane)
   expect(rows).toHaveLength(3)
   const row = rows[0]!, follow = s.followups[row.refs[0]!.value]!
-  expect(row).toMatchObject({ waiter: 'eve', deadline: null, not_before: follow.due_iso, state: 'waiting' })
+  expect(f.calls.find(c => c.key === follow.id)!.body).not.toHaveProperty('waiter')
+  expect(row).toMatchObject({ waiter: 'adam', deadline: null, not_before: follow.due_iso, state: 'waiting' })
   expect(row.payload.text).toContain(follow.note)
   // Make the old local tick see an overdue check. Only the Item route can dispatch it.
   follow.due = Date.now() - 1

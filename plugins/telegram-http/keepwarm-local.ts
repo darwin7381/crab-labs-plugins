@@ -290,7 +290,7 @@ export class LocalKeepwarm {
   private async schedule({ mode, write }: NonNullable<LocalKeepwarmDeps['take']>, s: KScan | null, st: KState, now: number): Promise<void> {
     if (s?.turn_open) return
     const due = ((s?.last_req ?? 0) + KEEPWARM_AFTER_S) * 1000
-    const expires = Math.min((s?.last_req ?? 0) + CACHE_TTL_S, (st.last_real ?? 0) + STOP_AFTER_S) * 1000
+    const expires = ((s?.last_req ?? 0) + CACHE_TTL_S) * 1000
     const wanted = decide(s, st, now, true)[0] === 'poke' && due < expires
     const q = new URLSearchParams({ kind: 'keepwarm', session_id: 'main', state: 'waiting', connector: mode.connector, limit: '100' })
     let exists = false
