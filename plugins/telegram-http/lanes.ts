@@ -26,7 +26,7 @@ import { procFactsFor, type ProcFacts } from './lanes-proc.ts'
 import { createMain, mainContext, type MainApi, type MainEnv, type MainWall, type ItemKind, type Via } from './lanes-main.ts'
 import { pidAlive, type CallFacts, type TurnTrigger } from './onsen-status.ts'
 import type { CallCheck, CallRef, CallWait } from './onsen-client.ts'
-import { createEvents, matterKey, type EventsApi, type EvClass, type Ob, type Outcome } from './lanes-events.ts'
+import { createEvents, matterKey, owed, type EventsApi, type EvClass, type Ob, type Outcome } from './lanes-events.ts'
 import { anchorSlug, plainTopicName, topicLink, topicMode, type TopicVerdict } from './lanes-topics.ts'
 import { APPEND_MAX, APPENDABLE_FILE, appendText, declaredFor, readDeclared } from './lanes-append.ts'
 import {
@@ -3512,6 +3512,13 @@ function threadSummary(thread: string): string {
 // ================================================================== lane queue + runner
 let itemReceiver: import('./onsen-receive.ts').ItemReceiver | undefined
 export function useItemReceiver(receiver: typeof itemReceiver): void { itemReceiver = receiver }
+/** C1 journaled receipt obligations alongside taken Items. S3 now supplies those receipts. */
+export function retireItemReceipts(): void {
+  const pending = (o: Ob) => o.kind === 'receipt' && owed(o)
+  for (const e of events.rows(e => e.onsen_items?.length)) {
+    events.set(e.id, pending, { state: 'waived', by: 'Onsen Item' })
+  }
+}
 export function offerMissed(id: string): void { main.offerMissed(id) }
 let onGateOpen: (() => void) | undefined
 export function observeItemGates(open?: () => void): void { onGateOpen = open }
@@ -4434,7 +4441,9 @@ export function identityCard(lane: Pick<Lane, 'kind'>, _it?: unknown): string {
     receiptStepsOn()
       ? `  - receipt(run_id, outcome, steps)：例行排程的執行回執（outcome=nothing-to-do｜done｜failed）。steps 必填：指示裡的每一步照順序列一項（step＝那一步是什麼，done＝true｜false，note＝發生了什麼或為什麼沒做）。條件沒成立所以不用做的步驟算做了（done=true，note 寫條件沒成立）。指示只有一件事就列一項。`
       : `  - receipt(run_id, outcome)：例行排程的執行回執（outcome=nothing-to-do｜done｜failed）。`,
-    `- 人格檔裡「用 reply 回報 Joey」（或「在 Telegram 回報 Joey」）對你來說就是 notify_joey；「升級給 Joey」就是 ask_joey；找別隻 agent 用 reply_agent（上面那三條線）；${receiptStepsOn()
+    `- 人格檔裡「用 reply 回報 Joey」（或「在 Telegram 回報 Joey」）對你來說就是 notify_joey；「升級給 Joey」就是 ask_joey；找別隻 agent 用 reply_agent（上面那三條線）；${itemReceiver?.mode.active
+      ? '排程的開始與結束由 Onsen 依 Item 回報。用 receipt 記錄這次執行的結果，無須另用 btcc-receipt ack 或 complete'
+      : receiptStepsOn()
       ? '排程回執用 receipt(run_id, outcome, steps)；人格檔或排程訊息裡寫的 btcc-receipt complete，對你來說就是 receipt 工具（開工的 btcc-receipt ack 照舊）'
       : '排程回執用 receipt(run_id, outcome)（~/.claude/tools/btcc-receipt complete 也會經由分流器完成同一個回執，一個 run 只會完成一次）'}。人格檔中標示「主線專用」的規則不適用於你。`,
     `- 工具：用你自己的 Bash、Read（和人格檔寫的工具、指令）。這個 agent 的 daemon 介面（127.0.0.1 上的 MCP、/lanes、/inject）不是給你直接打的；對外只走上面的車道工具。`,
@@ -5588,7 +5597,7 @@ function eventObligations(ev: InEvent, cls: EvClass, task = false): any[] {
       && (D.registryNames?.() ?? []).map(n => n.toLowerCase()).includes(ev.from.toLowerCase())) obs.push({ kind: 'peer', level: 'answer', to: ev.from.toLowerCase(),
       ...(ev.btcc_msg_id ? { req: String(ev.btcc_msg_id) } : {}) })        // 002w (B): the request it answers (a later send quoting it meets it, mainSentTo)
   const run = cls === 'scheduled' && ev.meta?.run_id ? String(ev.meta.run_id) : null
-  if (run) obs.push({ kind: 'receipt', level: 'run', run_id: run })
+  if (run && !itemReceiver?.mode.active) obs.push({ kind: 'receipt', level: 'run', run_id: run })
   return obs
 }
 function openLaneEvent(ev: InEvent, lane: Lane): void {
@@ -7544,6 +7553,7 @@ function receiptNotRecorded(why: string, fate: 'refused' | 'pending' | 'nocred' 
   return fate === 'refused' ? `${why}; not sent to BTCC` : why
 }
 export async function completeRun(tok: RunTok, runId: string, outcome: string, note: unknown, via: 'receipt' | 'btcc-receipt'): Promise<{ ok: boolean; text: string; leftForMain?: boolean }> {
+  if (itemReceiver?.mode.active) return { ok: true, text: `Onsen reports run ${runId}'s progress from its Item at session entry and turn end.` }
   if (receiptLeftForMain(runId)) {                                       // 1.38.2: the main's to complete (receiptLeftForMain)
     logos('lane.receipt_left_for_main', { lane: tok.lane, run: tok.runId, run_id: runId, via, outcome })
     return { ok: false, leftForMain: true, text: leftForMainText(runId) }
@@ -7652,7 +7662,7 @@ function receiptFiled(run: string): boolean {
  *  leaves the receipt owed; a 409 「run is completed」 meets it). The run's receipt still owed on any event (the main's, or one no lane holds any more) is
  *  met: the run is completed at the scheduler. */
 function mainToolDone(name: string, input: any, response: string, error: boolean): void {
-  if (name !== 'Bash' || error || !events) return
+  if (name !== 'Bash' || error || !events || itemReceiver?.mode.active) return
   const runs = [...new Set(receiptCliRuns(String(input?.command ?? '')))]
   if (!runs.length) return
   const ans = receiptCliAnswer(response)
@@ -7675,7 +7685,7 @@ function laneHolds(evId: string): boolean {
 export function mainToolGate(name: string, input: any): string | null {
   if (name !== 'Bash' || !events) return null
   for (const run of new Set(receiptCliRuns(String(input?.command ?? '')))) {       // 1.41.1: a mention is not a call (Chiron mail #11236)
-    const held = events.rows(() => true).flatMap(e => ((e.obligations ?? []) as Ob[]).filter(o => o.kind === 'receipt' && String(o.run_id) === run).map(o => ({ e, o })))
+    const held = events.rows(() => true).flatMap(e => ((e.obligations ?? []) as Ob[]).filter(o => o.kind === 'receipt' && String(o.run_id) === run && o.state !== 'waived').map(o => ({ e, o })))
     if (!held.length) continue
     const done = held.find(x => x.o.state === 'met' || x.o.state === 'requested')
     if (done) return `排程 run ${run} 已經回執過了（${done.o.by ?? done.e.owner ?? '車道'} 送的），排程器每個 run 只收一次回執。不要再執行這個指令；其餘的事照常做。`
@@ -8374,7 +8384,7 @@ function digestLine(e: Row, whole = false): DigestLine {
   for (const o of obs.filter(o => o.kind === 'peer')) st.push(unrun(o) ?? (o.owner === 'main' ? `你答應回 ${o.to}${o.due_at ? `（${simTime(o.due_at)} 前）` : ''}${o.state === 'met' ? '：已回' : ''}`
     : o.level === 'interim' ? `分流器已告訴 ${o.to} 由主線決定` : o.state === 'handed' ? `交給主線回 ${o.to}` : o.state === 'met' ? `已${o.by === 'main' ? '由你' : ''}${o.level === 'message' ? '告訴' : '回'} ${o.to}${e.answered && o.by !== 'main' ? `：「${clip(String(e.answered), 80)}」` : ''}`
     : o.state === 'requested' ? `正在送給 ${o.to}` : o.state === 'waived' ? `沒回 ${o.to}（車道結帳時判這件不用回）` : `還沒回 ${o.to}${failed(o)}`))   // WO-177: waived
-  for (const o of obs.filter(o => o.kind === 'receipt')) st.push(unrun(o) ?? (o.state === 'met' ? `run ${o.run_id} 回執已送` : o.state === 'handed' ? `run ${o.run_id} 的回執交給主線${o.failed ? `（排程器沒收下：${clip(String(o.failed), 100)}）` : ''}` : `run ${o.run_id} 還沒回執${failed(o)}`))   // 1.41.1: why it is still owed
+  for (const o of obs.filter(o => o.kind === 'receipt' && o.state !== 'waived')) st.push(unrun(o) ?? (o.state === 'met' ? `run ${o.run_id} 回執已送` : o.state === 'handed' ? `run ${o.run_id} 的回執交給主線${o.failed ? `（排程器沒收下：${clip(String(o.failed), 100)}）` : ''}` : `run ${o.run_id} 還沒回執${failed(o)}`))   // 1.41.1: why it is still owed
   if (e.blocked && blockFactsOn()) st.push(String(e.blocked))                    // WO-125 (B): what the guard refused in the run, as the system counted it
   for (const f of (e.forms_closed ?? []) as Array<{ id?: number | null; url?: string | null; reason?: string | null; lane?: string }>)   // WO-148 review of WO-153
     st.push(`${laneLabelOf(String(f.lane ?? ''))}關了你發給 Joey 的表單 ${f.id != null ? `#${f.id}` : f.url ?? ''}${f.reason ? `（${fit(String(f.reason), 80)}）` : ''}`)

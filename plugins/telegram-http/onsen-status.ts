@@ -18,6 +18,7 @@ import { closeSync, existsSync, linkSync, mkdirSync, openSync, readdirSync, read
 import { basename, join } from 'path'
 import { idemDelivery, idemStatus, type CallLineFate, type CallRef, type CallStateLine, type CallStateName, type DeliveryFact, type DeliveryState, type RunCallLookup, type StatusFact, type StatusState } from './onsen-client.ts'
 import type { Row } from './lanes-state.ts'
+import type { TakeMode } from './onsen-take.ts'
 
 type Now = () => number
 const iso = (ms: number): string => new Date(ms).toISOString()
@@ -193,11 +194,12 @@ export class CallFacts {
   private sent = new Map<string, { state: CallStateName; result: boolean; session: string | null; idem?: string }>()
   private later = new Map<string, { call: CallRef; session: string; at: string; stopMs: number; result?: CallResult }>()
   readonly stats = { moments: 0, skipped: 0, ledger: 0 }
-  constructor(readonly o: { sink: (line: CallStateLine) => void; now?: Now; max?: number; client?: CallClient | null }) {}
+  constructor(readonly o: { sink: (line: CallStateLine) => void; now?: Now; max?: number; client?: CallClient | null; takeMode?: Pick<TakeMode, 'active'> }) {}
   private now(): number { return (this.o.now ?? Date.now)() }
   /** putBack: the one step back (running → accepted); any other moment at or behind the last one is not sent */
   /** the line's idem key, or null: not sent (at or behind the last moment) */
   private emit(event: string, call: CallRef, state: CallStateName, session: string | null, at: string, result?: CallResult, putBack = false, hand = false): string | null {
+    if (this.o.takeMode?.active) return null
     const was = this.sent.get(event)
     // a hand-over (handedOver): accepted with the new session, from running or from an accepted of another session
     const handed = hand && !!was && was.session !== session && (was.state === 'running' || was.state === 'accepted') && state === 'accepted'
@@ -246,6 +248,7 @@ export class CallFacts {
    *  then what Onsen said (the client waits ≤10 s: the first try and three more). A refused step is recorded when the Call is already where the
    *  receipt puts it (a resend); so is a receipt this daemon sent before, once Onsen took that line */
   async receipt(event: string, call: CallRef, session: string, how: 'completed' | 'failed', result?: CallResult, at = iso(this.now())): Promise<CallReceipt> {
+    if (this.o.takeMode?.active) return { ok: false, fate: 'over', why: 'Onsen projects this Call from its Item.' }
     const was = this.sent.get(event)
     const wanted = (state: string | null | undefined, res: unknown): boolean => how === 'failed' ? state === 'failed' : state === 'completed' && res != null
     let idem = this.ended(event, call, session, how, at, result), resend = false
@@ -270,6 +273,7 @@ export class CallFacts {
   findRun(run: string): Promise<RunCallLookup> { return this.o.client ? this.o.client.findRunCall(run) : Promise.resolve({ none: true }) }
   /** the main's turn that took it ended at its Stop: final once the status record shows no turn running (statusRecord), or when a new turn begins */
   completeLater(event: string, call: CallRef, session: string, at: string): void {
+    if (this.o.takeMode?.active) return
     this.later.set(event, { call, session, at, stopMs: this.now() })
     if (this.later.size > 2_000) this.later.delete(this.later.keys().next().value!)
   }

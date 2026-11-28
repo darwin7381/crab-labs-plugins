@@ -482,6 +482,41 @@ for (const take of [false, true]) test('C2 inbox scheduler start receipt on ' + 
   expect(acks()).toHaveLength(take ? 0 : 1)
 })
 
+for (const callState of ['0', '1']) test('C2 schedule uses only its Item with legacy Call state ' + callState, async () => {
+  const relays: string[] = []
+  const inbox = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(req) {
+    await req.text()
+    relays.push(new URL(req.url).pathname)
+    return Response.json({ id: 762 })
+  } })
+  clean.push(() => inbox.stop(true))
+  const d = await daemon({ LANES_INBOX_PORT: String(inbox.port), ONSEN_CALL_STATE: callState, LANES_RECEIPT_STEPS: '0' }, 200, root => {
+    const dir = join(root, 'tg/lanes')
+    mkdirSync(dir, { recursive: true })
+    const obligation = { id: 'receipt-previous', kind: 'receipt', level: 'run', run_id: '760', state: 'handed' }
+    const prior = { ts: new Date().toISOString(), rec: 'event', id: 'c1-take', state: 'open', obligations: [obligation] }
+    writeFileSync(join(dir, 'state.jsonl'), [
+      { ...prior, onsen_items: [{ onsen_item_id: 'previous-take', kind: 'schedule' }] }, { ...prior, id: 'previous-pull' },
+    ].map(e => JSON.stringify(e)).join('\n') + '\n')
+    return scriptedLane(root)
+  })
+  const schedule = d.f.add('schedule', 'schedule', { from: 'scheduler', call_id: '762', refs: [{ kind: 'run', value: '762' }],
+    payload: { text: '[scheduled][check][run:762] C2 scheduled receipt', line: 'call', run_id: '762', frequency: 'high' } })
+  await waitFor(() => d.f.history.some(h => h.item_id === schedule.id && h.body.outcome === 'in_session'))
+  writeFileSync(join(d.root, 'release-lane'), '')
+  await waitFor(() => schedule.state === 'completed')
+  expect(readFileSync(join(d.root, 'scheduler-receipt'), 'utf8')).toContain("Onsen reports run 762's progress from its Item")
+  expect(d.f.history.filter(h => h.item_id === schedule.id).map(h => h.body.outcome)).toEqual(['in_session', 'completed'])
+  expect(relays).not.toContain('/lanes/scheduler-taken')
+  expect(relays).not.toContain('/lanes/scheduler')
+  expect(d.f.calls.filter(c => c.path.startsWith('/v1/calls'))).toEqual([])
+  const events = d.journal().filter(r => r.rec === 'event')
+  expect(events.filter(r => r.id === 'previous-pull')).toHaveLength(1)
+  expect(events.filter(r => r.id === 'c1-take').at(-1).obligations[0].state).toBe('waived')
+  const arrived = events.find(r => r.onsen_items?.some((i: any) => i.onsen_item_id === schedule.id))
+  expect(arrived.obligations.some((o: any) => o.kind === 'receipt')).toBe(false)
+}, 12000)
+
 test('closing a queued mail lane releases the same waiting version to the next peek without a claim or handoff', async () => {
   const d = await daemon({ LANES_MAX: '1' }, 200, scriptedLane)
   const busy = d.f.add('busy', 'alert', { from: 'alert-dispatcher', payload: { text: '[P2] occupy slot', line: 'call' } })

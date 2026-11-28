@@ -366,7 +366,7 @@ if (ONSEN_TAKE_ON) {
   if (reason) log('info', `onsen take: staying on pull: ${reason}`)
   else if (onsen) {
     takeMode = new TakeMode(ONSEN_AGENT, (m, p, b, t, h, signal) => onsen.request(m, p, b, t, h, signal),
-      active => { if (active) { itemClaims!.start(); itemPeek!.reset() } else itemPeek!.stop(); registryStatusChanged?.() }, line => log('info', line))
+      active => { if (active) { Lanes.retireItemReceipts(); itemClaims!.start(); itemPeek!.reset() } else itemPeek!.stop(); registryStatusChanged?.() }, line => log('info', line))
     itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, Lanes.offerMissed, () => registryStatusChanged?.())
     onsen.watchItemReports(line => itemClaims!.replay(line), (line, ok) => itemClaims!.acknowledged(line, ok))
     itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at), () => itemPeek!.reset())
@@ -4383,7 +4383,7 @@ if (!INBOX_ONLY && (Lanes.LANES_ON || onsen?.cfg.record)) registry.start()
 if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   // WO-175 (ONSEN_CALL_STATE, on unless 0; lanes on): the Calls this agent received (the call id its pulled item carries, Onsen 0.24.1), their moments
   // as PUT /v1/calls/<id>/state through the spool. The router's and a lane run's end come from lanes.ts, the turn moments from the journal tap
-  const calls = CALL_STATE ? new OnsenStatus.CallFacts({ sink: line => { onsen.recordCall(line) }, client: onsen }) : null   // client: a receipt waits for Onsen's answer (WO-175, Chiron 05:55Z)
+  const calls = CALL_STATE ? new OnsenStatus.CallFacts({ takeMode, sink: line => { onsen.recordCall(line) }, client: onsen }) : null   // client: a receipt waits for Onsen's answer (WO-175, Chiron 05:55Z)
   const facts = new OnsenStatus.DeliveryFacts({ agent: ONSEN_AGENT, sink: f => { if (!takeMode?.active) onsen.recordDelivery(f) },
     changed: () => kick() })                                            // WO-162: the queued count moved: computed now, not at the next tick
   // WO-162: a detail change is written at once, last_activity_at alone at most every ONSEN_STATUS_THROTTLE_MS (1 s); a report at least every

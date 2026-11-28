@@ -19,6 +19,33 @@ function facts(t = { ms: Date.parse('2026-11-26T04:00:00.000Z') }) {
 }
 
 describe('CallFacts: the moments, only forward', () => {
+  test('C2 checks the current mode even for a scheduled end queued before activation', async () => {
+    const lines: CallStateLine[] = [], takeMode = { active: false }
+    const waits: string[] = []
+    const f = new CallFacts({ takeMode, sink: line => lines.push(line), client: {
+      callFate: async idem => { waits.push(idem); return { fate: 'took', state: 'completed' } },
+      findRunCall: async () => ({ none: true }), getCall: async () => null,
+    } })
+    f.ended('prior-receipt', SCHED, 'main', 'completed', undefined, { outcome: 'ok' })
+    f.running('old', SCHED, 'main')
+    f.completeLater('old', SCHED, 'main', new Date().toISOString())
+    takeMode.active = true
+    expect(await f.receipt('prior-receipt', SCHED, 'main', 'completed', { outcome: 'ok' })).toMatchObject({ ok: false, fate: 'over' })
+    expect(waits).toEqual([])
+    f.flushLater()
+    f.routed('new', PEER, 'lane')
+    f.running('new', PEER, 'lane')
+    f.handedOver('new', PEER)
+    f.putBack('new', PEER, 'main')
+    f.ended('new', PEER, 'main', 'completed')
+    f.completeLater('take-late', SCHED, 'main', new Date().toISOString())
+    takeMode.active = false
+    f.flushLater()
+    expect(lines.map(l => [l.event, l.body.state])).toEqual([['prior-receipt', 'completed'], ['old', 'accepted'], ['old', 'running']])
+    f.routed('pull-again', PEER, 'main')
+    expect(lines.at(-1)).toMatchObject({ event: 'pull-again', body: { state: 'accepted' } })
+  })
+
   test('a lane: routed → accepted (its full id), its run → running, its end → completed with its summary; nothing twice', () => {
     const { f, states } = facts()
     f.routed('mesh-9001', PEER, 'lab-relay.reflex.25')
