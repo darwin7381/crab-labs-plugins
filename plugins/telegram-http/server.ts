@@ -4693,8 +4693,9 @@ async function personArrived(it: { item?: ItemRef; kind?: string; seq?: number; 
     if (edit) {
       log('info', `onsen inbound: person_edit of ${shown} received from the inbox`)
       const at = Math.floor(Date.parse(String(p.edited_at ?? '')) / 1000)
+      const date = editIndex.sentAt(chat, ref) || inboundStore.get(key)?.date || Date.parse(onsen?.findInbound(chat, ref)?.sent_at ?? '') / 1000
       // the edited message as the bridge wrote it (1.59.0: no Telegram edit reaches this daemon itself any more)
-      const m = { message_id: Number(ref), chat: { id: Number(chat), type: chat.startsWith('-') ? 'supergroup' : 'private' },
+      const m = { message_id: Number(ref), ...(Number.isFinite(date) ? { date } : {}), chat: { id: Number(chat), type: chat.startsWith('-') ? 'supergroup' : 'private' },
         from: { id: Number(c.user_id) || 0, is_bot: false, ...(c.user ? { username: String(c.user) } : {}) }, text: String(p.text ?? ''), ...(Number.isFinite(at) ? { edit_date: at } : {}),
         ...(c.thread != null ? { is_topic_message: true, message_thread_id: Number(c.thread) } : {}) }
       if (/^\d+$/.test(ref)) await deliverEditedMessage(m, [String(p.message_id)])

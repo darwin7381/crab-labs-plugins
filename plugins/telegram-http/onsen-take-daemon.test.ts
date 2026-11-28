@@ -3,6 +3,8 @@ import { randomUUID } from 'crypto'
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { Journal } from './lanes-state.ts'
 import { itemRef } from './onsen-items.ts'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
@@ -104,6 +106,27 @@ for (const [name, cfg, reason] of [
   expect(log).toHaveLength(reason ? 1 : 0)
   if (reason) expect(log[0]).toContain(reason)
 })
+
+test('a pulled person_edit without a date uses the retained original arrival', async () => {
+  const d = await daemon({ ONSEN_TAKE: '', GENESIS_LANES: '0', MCP_READY_DELAY_MS: '50' }, 409)
+  const headers = { Authorization: 'Bearer test-loopback', 'Content-Type': 'application/json' }
+  const remote = new Client({ name: 'pull-edit-test', version: '1' }, { capabilities: {} })
+  const delivered: any[] = []
+  remote.fallbackNotificationHandler = async n => { if (n.method === 'notifications/claude/channel') delivered.push(n.params) }
+  await remote.connect(new StreamableHTTPClientTransport(new URL(d.base + '/mcp'), { requestInit: { headers } }))
+  clean.push(() => remote.close())
+  const from = { name: 'telegram', chat: '1', msg_id: '4400', user_id: '1', user: 'joey' }
+  const post = async (kind: string, payload: unknown) => {
+    const res = await fetch(d.base + '/onsen/person', { method: 'POST', headers, body: JSON.stringify({ kind, payload }) })
+    expect(res.status).toBe(200)
+  }
+  await post('person_message', { message_id: 'message-id', conversation_id: 'conv', client: from, from: 'joey', via: 'telegram',
+    kind: 'text', text: 'original text', sent_at: '2020-01-12T03:17:00Z' })
+  await waitFor(() => delivered.some(n => n.content === 'original text'))
+  await post('person_edit', { message_id: 'message-id', client: from, text: 'edited text', edited_at: '2020-01-14T08:23:00Z' })
+  await waitFor(() => delivered.some(n => n.meta.edited === 'true'))
+  expect(delivered.find(n => n.meta.edited === 'true').content).toBe('〔@joey 改了他 01-12 03:17Z 那一則（tg:4400）〕\nedited text')
+}, 15_000)
 
 test('the inbox daemon follows take_member and serves the take relays with its local switch unset', async () => {
   const d = await daemon({ CHANNEL_INBOX_ONLY: '1', AGENT_INBOX_SELF: 'adam', ONSEN_PULL: 'adam', ONSEN_TAKE: '' })
