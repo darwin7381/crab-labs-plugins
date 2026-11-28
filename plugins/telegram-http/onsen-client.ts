@@ -117,7 +117,14 @@ export type CallStateLine = { call_id: string; kind: CallRef['kind']; event: str
   body: { state: CallStateName; session_id: string | null; result?: { outcome?: string; body?: { format: 'markdown'; text: string } }; at: string } }
 /** A take receipt supplements the Call. Only the Item reports the turn's progress. */
 export type ScheduledResultLine = { event: string; idem: string; call_id: string | null; run_id: string
-  body: { state?: never; result: { outcome: string; steps?: Step[]; body?: { format: 'markdown'; text: string } } } }
+  body: { state?: never; result: { outcome: string; body?: { format: 'markdown'; text: string } } } }
+export function scheduledResult(outcome: string, summary: string, steps?: Step[] | null): ScheduledResultLine['body']['result'] {
+  const checklist = steps?.map(s => `- [${s.done ? 'x' : ' '}] ${s.step}${s.note ? ' — ' + s.note : ''}`).join('\n')
+  const stepText = [...(checklist ?? '')].slice(0, 4000)
+  const summaryLimit = Math.max(0, 4000 - stepText.length - (stepText.length ? 2 : 0))
+  const text = [[...summary].slice(0, summaryLimit).join(''), stepText.join('')].filter(Boolean).join('\n\n')
+  return { outcome, ...(text ? { body: { format: 'markdown', text } } : {}) }
+}
 /** WO-175 (Chiron 05:55Z: a receipt goes to Onsen only): what became of one spooled Call line. took: Onsen answered 2xx (its state then);
  *  refused: a 4xx (Onsen's sentence; the line is in rejected.jsonl); pending: no answer, or 5xx, within the wait (the line stays in the spool and
  *  goes when Onsen answers); nocred: this daemon has no mesh credential (a broken setup) */
@@ -965,6 +972,19 @@ export class OnsenClient {
     finally { if (fd != null) try { closeSync(fd) } catch {} }
   }
 
+  private async putScheduled(c: ScheduledResultLine, cred: string) {
+    let id = c.call_id
+    if (!id) {
+      const found = await this.get(callsForRun(c.run_id), cred, 'hook')
+      if (found.status !== 200) return found
+      id = firstRunCall(found.json)?.id
+      if (!id) return { status: 404, json: { error: { message: 'no Call for scheduler run ' + c.run_id } } }
+    }
+    // Receipts queued by earlier versions can still carry a structured steps array.
+    const result = c.body.result as ScheduledResultLine['body']['result'] & { steps?: Step[] }
+    const body = result.steps ? { result: scheduledResult(result.outcome, result.body?.text ?? '', result.steps) } : c.body
+    return this.put(`/v1/calls/${encodeURIComponent(id)}/state`, body, cred, undefined, { 'Idempotency-Key': c.idem })
+  }
   private async pass(): Promise<void> {
     const fifo = this.unsent()
     const todo = this.itemReports ? [...this.pendingReports(), ...fifo] : fifo
@@ -1088,19 +1108,20 @@ export class OnsenClient {
       }
       if (t.line.k === 'c') {
         const c = t.line.r
-        let id = c.call_id ?? ''
-        if ('run_id' in c && !id) {
-          // Resolve inside the spool so an outage before the lookup cannot lose the receipt.
-          const path = callsForRun(c.run_id)
-          const lookup = await this.get(path, cred, 'hook').catch(e => ({ status: 0, json: { error: errText(e) } }))
-          if (lookup.status !== 200 && !refusedForGood(lookup)) return this.failStatus(lookup, path)
-          const call = lookup.status === 200 && firstRunCall(lookup.json)
-          if (!call) {
-            this.reject(t.line, `GET ${path}: ${lookup.status === 200 ? 'no Call for this scheduler run' : callSaid(lookup.json)}`)
-            this.writeCursor(t.end); this.ok(); i++; continue
+        if ('run_id' in c) {
+          const r = await this.putScheduled(c, cred)
+          if (r.status < 200 || r.status >= 300) {
+            if (r.status >= 400 && r.status < 500 && this.refusedReportEnd !== t.end) {
+              this.cfg.log('error', `onsen: scheduler run ${c.run_id} result HTTP ${r.status}: ${callSaid(r.json)}; kept for retry`)
+              this.refusedReportEnd = t.end
+              this.writeCursor(this.readCursor())
+            }
+            return this.failStatus(r, 'scheduler run ' + c.run_id)
           }
-          id = String(call.id)
+          this.stats.calls_put++
+          this.writeCursor(t.end); this.ok(); i++; continue
         }
+        const id = c.call_id
         const r = await this.put(`/v1/calls/${encodeURIComponent(id)}/state`, c.body, cred).catch(e => ({ status: 0, json: { error: errText(e) } }))
         if (r.status >= 200 && r.status < 300) {
           const st = r.json?.data?.state

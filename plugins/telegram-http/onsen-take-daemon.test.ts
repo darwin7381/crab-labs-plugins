@@ -1550,7 +1550,7 @@ for (const [callState, outcome, namedCall] of [
   const callId = '8602', runId = '762'
   const summary = outcome === 'failed' ? 'The snapshot could not be verified.' : 'There was no new snapshot.'
   const steps = [{ step: 'Read the schedule', done: true }, { step: 'Verify the snapshot', done: outcome !== 'failed', note: summary }]
-  const result = { outcome: outcome === 'nothing-to-do' ? 'nothing_to_do' : outcome, steps, body: { format: 'markdown', text: summary } }
+  const result = { outcome: outcome === 'nothing-to-do' ? 'nothing_to_do' : outcome, body: { format: 'markdown', text: summary + '\n\n- [x] Read the schedule\n- [' + (steps[1]!.done ? 'x' : ' ') + '] Verify the snapshot — ' + summary } }
   const relays: string[] = []
   const inbox = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(req) {
     await req.text()

@@ -127,7 +127,16 @@ export function fakeItems(member = 'adam', actionPort?: number, clock?: () => nu
     if (callId && req.method === 'PUT') {
       const call = scheduleCalls.get(callId)
       if (!call) return error(404, 'not_found')
-      if (Object.keys(b).length !== 1 || !b.result) return error(400, 'invalid_request')
+      const r = b.result, body = r?.body, files = r?.attachment_file_ids
+      if (Object.keys(b).length !== 1 || !r || typeof r !== 'object' || Array.isArray(r)
+        || Object.keys(r).some(key => !['body', 'outcome', 'attachment_file_ids', 'preview'].includes(key))
+        || (body == null && r.outcome == null && !files?.length)
+        || (body != null && (Object.keys(body).some(k => !['format', 'text'].includes(k)) || ![undefined, 'markdown'].includes(body.format)
+          || typeof body.text !== 'string' || [...body.text].length > 4000))
+        || (r.outcome != null && (typeof r.outcome !== 'string' || !/^[a-z][a-z0-9_-]{0,39}$/.test(r.outcome)))
+        || (files != null && (!Array.isArray(files) || files.length > 20 || files.some(x => (typeof x !== 'string' && !Number.isInteger(x)) || !/^\d{1,18}$/.test(String(x).trim()))
+          || new Set(files.map(x => String(x).trim().replace(/^0+(?=\d)/, ''))).size !== files.length)))
+        return error(400, 'invalid_request')
       call.result = b.result
       return detail(call)
     }

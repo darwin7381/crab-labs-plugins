@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
-import { OnsenClient, roamerMember } from './onsen-client.ts'
+import { OnsenClient, roamerMember, scheduledResult } from './onsen-client.ts'
 import { OnsenInbox, OnsenPuller, switchOn } from './onsen-inbox.ts'
 import { connectorId, deliveryMode, machineName, takeRefusal, TakeMode, takeModeActive } from './onsen-take.ts'
 import { ItemPeek, itemRef, roamerSessionId, type InboxItem } from './onsen-items.ts'
@@ -1993,4 +1993,20 @@ test('a known take member keeps pull timers off on 401 and 403, including its fi
   expect(transitions).not.toContain(false)
   r.f.mode(409); await m.probe(); expect(m.active).toBe(false)
   m.stop()
+})
+
+test('scheduler results refused by Core stay pending across a restart and log the refusal', async () => {
+  const r = rig(), path = '/v1/calls/91/state'
+  const body = scheduledResult('ok', '🦀'.repeat(4000), [{ step: 'Sign off', done: true }]).body!
+  expect([...body.text]).toHaveLength(4000)
+  expect(body.text.endsWith('- [x] Sign off')).toBe(true)
+  r.f.scheduleCalls.set('91', { id: '91', run: '92', result: null })
+  expect((await r.client.request('PUT', path, { result: { outcome: 'ok', steps: [] } })).status).toBe(400)
+  r.client.recordCall({ event: 'scheduled', idem: 'result-92', call_id: '91', run_id: '92', body: { result: { outcome: 'Invalid' } } })
+  await r.sync()
+  const restarted = new OnsenClient(r.client.cfg)
+  await restarted.syncNow(true)
+  expect(restarted.pendingBytes()).toBeGreaterThan(0)
+  expect(r.logs.filter(l => l.startsWith('[error]') && l.includes('92') && l.includes('400'))).toHaveLength(1)
+  expect(r.f.scheduleCalls.get('91')!.result).toBeNull()
 })

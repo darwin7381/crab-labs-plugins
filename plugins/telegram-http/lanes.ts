@@ -25,6 +25,7 @@ import { Journal, type Row } from './lanes-state.ts'
 import { procFactsFor, type ProcFacts } from './lanes-proc.ts'
 import { createMain, mainContext, MAIN_STUCK_MS, toolSilenceMs, type MainApi, type MainEnv, type MainWall, type ItemKind, type Via } from './lanes-main.ts'
 import { pidAlive, type CallFacts, type TurnTrigger } from './onsen-status.ts'
+import { scheduledResult } from './onsen-client.ts'
 import type { CallCheck, CallRef, CallWait, OnsenClient, ScheduledResultLine } from './onsen-client.ts'
 import { createEvents, matterKey, owed, type EventsApi, type EvClass, type Ob, type Outcome } from './lanes-events.ts'
 import { anchorSlug, plainTopicName, topicLink, topicMode, type TopicVerdict } from './lanes-topics.ts'
@@ -7934,8 +7935,7 @@ export async function completeRun(tok: RunTok, runId: string, outcome: string, n
     const event = runEvents(queue.get(tok.evId)).find(ev => ev.item_kind === 'scheduled' && String(ev.meta?.run_id) === runId)
     const text = stripMarkup((via === 'receipt' && tok.receipt?.text) || String(note ?? ''))
     const normalized = btccOutcome(outcome)
-    const result = { outcome: normalized === 'nothing-to-do' ? 'nothing_to_do' : normalized,
-      ...(steps ? { steps } : {}), ...(text ? { body: { format: 'markdown' as const, text: text.slice(0, 4000) } } : {}) }
+    const result = scheduledResult(normalized === 'nothing-to-do' ? 'nothing_to_do' : normalized, text, steps)
     const ok = D.recordScheduleResult?.({ event: event?.id ?? tok.evId, call_id: event?.call_id ?? null, run_id: runId,
       idem: `call:run:${runId}:result`, body: { result } }) ?? false
     return { ok, text: ok ? `Call result queued for scheduler run ${runId}.` : `Could not queue the Call result for scheduler run ${runId}.` }

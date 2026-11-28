@@ -2,7 +2,7 @@
 // PUT /v1/calls/<id>/state through the spool. Here: the rules (CallFacts), which items are Calls (lanes.ts callRefOf: the call id the pulled item
 // carries, Onsen 0.24.1), and the spool (onsen-client.ts: in order, a refused step not retried, Onsen down retried).
 import { describe, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { CALL_LEDGER_RESULT, CallFacts } from './onsen-status.ts'
@@ -231,7 +231,8 @@ describe('a receipt goes to Onsen only (Chiron 05:55Z): what Onsen said to the l
     const c = client(o.f)
     const body = { result: { outcome: 'failed', steps: [{ step: 'Verify snapshot', done: false }],
       body: { format: 'markdown' as const, text: 'No checksum.' } } }
-    expect(c.recordCall({ run_id: '762', call_id: null, event: 'schedule', idem: 'call:run:762:result', body })).toBe(true)
+    // An older daemon left this on disk before it could look up the scheduler's Call.
+    writeFileSync(c.spool, JSON.stringify({ k: 'c', r: { run_id: '762', call_id: null, event: 'schedule', idem: 'call:run:762:result', body } }) + '\n')
     await c.syncNow(true)
     expect(c.pendingBytes()).toBeGreaterThan(0)
     expect(o.log.filter(r => r.m === 'PUT')).toHaveLength(0)
@@ -240,7 +241,8 @@ describe('a receipt goes to Onsen only (Chiron 05:55Z): what Onsen said to the l
     const restarted = new OnsenClient(c.cfg)
     await restarted.syncNow(true)
     await restarted.syncNow(true)
-    expect(o.log.filter(r => r.m === 'PUT').map(r => [r.path, r.body])).toEqual([['/v1/calls/350/state', body]])
+    expect(o.log.filter(r => r.m === 'PUT').map(r => [r.path, r.body])).toEqual([['/v1/calls/350/state',
+      { result: { outcome: 'failed', body: { format: 'markdown', text: 'No checksum.\n\n- [ ] Verify snapshot' } } }]])
     expect(restarted.pendingBytes()).toBe(0)
   })
 
