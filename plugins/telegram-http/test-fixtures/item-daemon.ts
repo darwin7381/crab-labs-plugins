@@ -6,8 +6,10 @@ import * as mcpAuth from '../mcp-auth.ts'
 process.env.GIT_ALLOW_PROTOCOL = 'file' // the daemon runs a version check at boot
 const memberToken = process.env.FIXTURE_MEMBER_TOKEN ?? 'test-member'
 const mesh = { ...identity, readOwnCredential: () => memberToken, readCredentialFile: () => memberToken }
-if (process.env.FIXTURE_SIGNED_CALLER) mesh.loadTable = () => ({ identities: { eve: { signing: true } },
-  hashes: { [identity.sha256hex(process.env.FIXTURE_SIGNED_CALLER!)]: 'eve' } })
+if (process.env.FIXTURE_SIGNED_CALLER) {
+  const caller = process.env.FIXTURE_CALLER_NAME ?? 'eve'
+  mesh.loadTable = () => ({ identities: { [caller]: { signing: true } }, hashes: { [identity.sha256hex(process.env.FIXTURE_SIGNED_CALLER!)]: caller } })
+}
 const auth = { ...mcpAuth, ensureToken: () => 'test-loopback' }
 mock.module('../mesh-identity.ts', () => mesh)
 mock.module('../mcp-auth.ts', () => auth)

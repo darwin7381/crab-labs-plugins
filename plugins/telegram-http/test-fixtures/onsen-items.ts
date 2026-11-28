@@ -17,7 +17,7 @@ export function fakeItems(member = 'adam', token = 'test-member', extra?: (req: 
   const history: ItemReport[] = [], waiters = new Set<() => void>()
   const scheduleCalls = new Map<string, { id: string; run: string; result: any }>()
   let mode = 200, unavailable = false, holdReports = false, delayTake = 0
-  const detail = (data: unknown) => Response.json({ api_version: '1', as_of: iso(now), viewer: member, read_by: null, data })
+  const detail = (data: unknown, status = 200) => Response.json({ api_version: '1', as_of: iso(now), viewer: member, read_by: null, data }, { status })
   const error = (status: number, code: string, extra = {}) => Response.json({ error: { code, message: code, retryable: status >= 500, ...extra } }, { status })
   const change = (r: Row, kind: string, note = '', updatedAt?: string) => {
     now++
@@ -100,8 +100,8 @@ export function fakeItems(member = 'adam', token = 'test-member', extra?: (req: 
     if (key && writes.has(idem)) return writes.get(idem)!.clone()
     let answer: Response
     if (path === base && req.method === 'POST') {
-      if (b.kind !== 'self' || b.body?.format !== 'markdown' || typeof b.body.text !== 'string' || !Array.isArray(b.refs)) return error(400, 'invalid_request')
-      answer = detail(add(crypto.randomUUID(), 'self', { from: member, note: b.note, refs: b.refs, payload: { text: b.body.text } }))
+      if ('note' in b || b.kind !== 'self' || b.body?.format !== 'markdown' || typeof b.body.text !== 'string' || !Array.isArray(b.refs)) return error(400, 'invalid_request')
+      answer = detail(add(crypto.randomUUID(), 'self', { from: member, refs: b.refs, payload: { ...b.body } }), 201)
     } else if (path === base + '/take' && req.method === 'POST') {
       if (!b.connector || b.wait !== 0 || !Array.isArray(b.item_ids) || b.limit !== b.item_ids.length || b.limit > 100 || b.session_id !== undefined) return error(400, 'invalid_request')
       const asked: Row[] = b.item_ids.map((id: string) => rows.get(id)).filter(eligible)

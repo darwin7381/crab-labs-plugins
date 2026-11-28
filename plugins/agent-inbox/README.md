@@ -4,7 +4,7 @@
 
 - 投遞：`POST http://127.0.0.1:<port>/inject` body `{"text": "...", "from": "<sender>"}`，
   header `X-Inject-Token`（env `CHANNEL_INJECT_TOKEN` 有設就必帶）。
-- 回傳 `injected: true` 和 `item_id` 表示已用該成員的憑證寫入一筆 `self` Item。收發都是該成員，呼叫程式記在 `note`。對話閒置時由 connector 領取。所有呼叫端遷移且連續 24 小時零呼叫後，才移除這個入口。
+- 回傳 `injected: true` 和 `item_id` 表示已用該成員的憑證寫入一筆 `self` Item。收發都是該成員。寄件人、轉送程式與訊息標籤寫在 `body.text` 第一行，`op` 和排程編號寫在 `refs`。對話閒置時由 connector 領取，agent 會收到原文和這些標籤。所有呼叫端遷移且連續 24 小時零呼叫後，才移除這個入口。
 - TUI 端：`claude --channels plugin:agent-inbox@crab-labs-plugins`（可與 telegram-http 並存），
   env `AGENT_INBOX_PORT` 指向 daemon port。
 - 這個 channel **只進不出**（無 reply/react tools）——agent 回應走它自己的 TG channel 或 BTCC。

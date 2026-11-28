@@ -3515,7 +3515,22 @@ function factsFromPayload(p: any, chat: string, ref: string, thread?: number): O
 }
 type InboundBody = { text?: string; from?: string; verified_from?: string; chat_id?: string; logged?: boolean;
   msg_id?: number; reply_to_id?: number; reply_to_from?: string; reply_to_text?: string;
-  no_reply?: boolean; op?: string | number; wake?: unknown; ring?: unknown; dedupe?: unknown; refs?: unknown; call_id?: string }
+  no_reply?: boolean; op?: string | number; wake?: unknown; ring?: unknown; dedupe?: unknown; refs?: unknown; call_id?: string
+  thread?: unknown; hop?: unknown; lane?: unknown; line?: unknown; tier?: unknown; run_id?: unknown; frequency?: unknown }
+const INJECT_HEADER = '[/inject] '
+/** One header line of channel tags, followed by the caller's original Markdown. Plain self Items have no header. */
+function readInject(text: string): { text: string; tags: Record<string, string> } | null {
+  if (!text.startsWith(INJECT_HEADER)) return null
+  const end = text.indexOf('\n')
+  if (end < 0) return null
+  try {
+    const tags = JSON.parse(text.slice(INJECT_HEADER.length, end))
+    if (typeof tags?.user !== 'string' || typeof tags.relay !== 'string' || !['true', 'false'].includes(tags.verified)
+      || !Object.values(tags).every(value => typeof value === 'string')) return null
+    return { tags, text: text.slice(end + 1) }
+  } catch { return null }
+}
+
 /** Roster callers still POST to the member's local inbox. Only the take receiver delivers the resulting self Item. */
 async function writeInject(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const answer = (status: number, body: object) => res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(body))
@@ -3527,9 +3542,9 @@ async function writeInject(req: IncomingMessage, res: ServerResponse): Promise<v
     && timingSafeEqual(Buffer.from(presented), Buffer.from(token))
   const requireSigned = process.env.MESH_REQUIRE_SIGNED === '1'
   if ((requireSigned || token) && !signed && !tokenOk) { answer(403, { error: 'bad token' }); return }
-  const b = await readJsonBody(req).catch(() => null) as InboundBody & { run_id?: unknown } | null
+  const b = await readJsonBody(req).catch(() => null) as InboundBody | null
   if (typeof b?.text !== 'string' || !b.text) { answer(400, { error: 'text required' }); return }
-  const text = b.text.slice(0, 4000)
+  const text = Array.from(b.text).slice(0, 4000).join('')
   const v = resolveInbound(auth, typeof b.from === 'string' ? b.from : undefined, typeof b.verified_from === 'string' ? b.verified_from : undefined, table)
   const forged = v.forged && process.env.MESH_ALLOW_FORGED !== '1'
   if (forged || (requireSigned && !signed)) {
@@ -3537,14 +3552,16 @@ async function writeInject(req: IncomingMessage, res: ServerResponse): Promise<v
     log('warn', `held /inject from ${v.sender} (${forged ? 'forged' : 'unsigned'})`)
     answer(200, { injected: false, held: true, ...(forged ? { dropped: 'forged-unsigned' } : {}) }); return
   }
+  const { op, run_id, ...tags } = peerTags(b, v, text)
   const refs = []
-  if (b.op != null && OP_REF_RE.test(String(b.op))) refs.push({ kind: 'op', value: String(b.op) })
-  if (b.run_id != null && /^\d+$/.test(String(b.run_id))) refs.push({ kind: 'run', value: String(b.run_id) })
+  if (op) refs.push({ kind: 'op', value: op })
+  if (run_id) refs.push({ kind: 'run', value: run_id })
+  const body = { format: 'markdown', text: INJECT_HEADER + JSON.stringify(tags) + '\n' + text }
   const key = typeof b.dedupe === 'string' && b.dedupe.trim() || (Number.isSafeInteger(b.msg_id) ? 'msg:' + b.msg_id : '')
   const trusted = tokenOk || v.verified || FORWARDERS.has(v.relay)
   const idem = 'inject:' + (key && trusted ? sha256hex(JSON.stringify([v.sender, key])) : randomUUID())
   const path = '/v1/members/' + encodeURIComponent(inboxClient.cfg.agent) + '/items'
-  const r = await inboxClient.request('POST', path, { kind: 'self', body: { format: 'markdown', text }, note: signed ?? v.sender, refs }, 10_000, { 'Idempotency-Key': idem }).catch(() => null)
+  const r = await inboxClient.request('POST', path, { kind: 'self', body, refs }, 10_000, { 'Idempotency-Key': idem }).catch(() => null)
   const id = r?.json?.data?.id
   if (r && r.status >= 200 && r.status < 300 && typeof id === 'string' && id) answer(200, { injected: true, item_id: id })
   else answer(r?.status === 409 ? 409 : 503, { injected: false, error: 'Onsen did not confirm the Item' })
@@ -3555,6 +3572,36 @@ async function logPeerArrival(row: Record<string, unknown>): Promise<number | un
     headers: { 'Content-Type': 'application/json', ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Alert-Token': process.env.CHANNEL_INJECT_TOKEN } : {}), ...meshAuth() },
     body: JSON.stringify({ ...row, to_agent: INBOX_SELF }), signal: AbortSignal.timeout(6000) }).catch(() => null)
   if (r?.ok) { const j = await r.json().catch(() => ({})) as { id?: number }; return j.id }
+}
+/** Tags exposed by the local inbox, after the caller and any forwarding identity have been resolved. */
+function peerTags(body: InboundBody, verdict: Verdict, text: string): Record<string, string> {
+  const op = String(body.op ?? '').trim()
+  const thread = typeof body.thread === 'string' && /^[a-z0-9_-]{1,32}#t-[0-9a-f]{4,16}$/i.test(body.thread) ? body.thread : undefined
+  const hop = Math.floor(Number(body.hop))
+  const wake = Lanes.wakeKind(verdict.sender, text, body.wake)
+  return {
+    chat_id: String(body.chat_id ?? loadAccess().allowFrom[0] ?? 'local-inject'), user: verdict.sender,
+    ...verdictMeta(verdict),
+    ...(typeof body.msg_id === 'number' ? { btcc_msg_id: String(body.msg_id) } : {}),
+    ...(body.no_reply === true ? { no_reply: 'true' } : {}),
+    ...(OP_REF_RE.test(op) ? { op } : {}),
+    ...(body.reply_to_id != null ? { reply_to_id: String(body.reply_to_id) } : {}),
+    ...(body.reply_to_from ? { reply_to_from: String(body.reply_to_from).slice(0, 64) } : {}),
+    ...(body.reply_to_text ? { reply_to_text: String(body.reply_to_text).slice(0, 120) } : {}),
+    ...(thread ? { thread } : {}), ...(Number.isFinite(hop) && hop > 0 ? { hop: String(hop) } : {}),
+    ...(verdict.verified && typeof body.lane === 'string' && body.lane ? { sender_lane: body.lane.slice(0, 48) } : {}),
+    ...(wake ? { wake } : {}), line: Lanes.lineOf(body.line ?? body.tier) ?? 'call',
+    ...(body.run_id != null && /^\d+$/.test(String(body.run_id)) ? { run_id: String(body.run_id) } : {}),
+    ...(typeof body.frequency === 'string' && body.frequency ? { frequency: body.frequency.slice(0, 16) } : {}),
+    ...(body.ring === true && wake === 'mail' ? { ring: 'true' } : {}),
+  }
+}
+async function deliverPeer(text: string, tags: Record<string, string>, item: ItemRef, facts: WakeFacts, ts = new Date().toISOString()): Promise<void> {
+  const notification = { method: 'notifications/claude/channel', params: {
+    content: text, meta: { ...tags, user_id: 'local-inject', via: 'local-inject', ts },
+  } }
+  if (roamerItems) { await roamerItems.offer([item], notification); return }
+  await laneDeliverMesh(notification, tags.verified === 'true', { ...facts, onsen_items: [item] })
 }
 async function routePeerItem(body: InboundBody & Record<string, unknown>, verdict: Verdict, item: ItemRef): Promise<void> {
   const text = typeof body.text === 'string' ? body.text.slice(0, 4000) : ''
@@ -3567,19 +3614,11 @@ async function routePeerItem(body: InboundBody & Record<string, unknown>, verdic
     }
     return
   }
-  const opRef = body.op != null && OP_REF_RE.test(String(body.op).trim()) ? String(body.op).trim() : ''
-  const from = verdict.sender
-  // WO-141 phase 2: BTCC's mailbox ring (body ring:true with wake=mail, through the oncall receiver). It wakes the agent's mail lane and
-  // nothing else: never a BTCC comms row (a ring is not a message), never the main. Lanes off: dropped and logged here (the watchdog's
-  // hourly 讀信箱 reminder carries no ring and reaches the main as before). Lanes on: the router's mail lane (coalesced while it runs);
-  // no router to ask: not delivered (no fleet-path fallback to the main), and the answer says so, so the mailbox tries again later.
-  const ring = body?.ring === true && Lanes.wakeKind(from, text, body?.wake) === 'mail'
-  // The sender's BTCC id (BTCC mesh push / Comms console / a peer that logged first); else the row logged below mints one
-  let btccMsgId: number | undefined = typeof body?.msg_id === 'number' ? body.msg_id : undefined
+  const tags = peerTags(body, verdict, text)
   // Receiver-side comms logging (Joey 4616: one-sided threads): EVERY inbound
   // delivery gets a BTCC row unless the sender declares logged:true (senders
   // that already log with richer context: fleet call, BTCC /send, Argus wake).
-  if (!ROAMER && body.logged !== true && !ring) {
+  if (!ROAMER && body.logged !== true && !tags.ring) {
     // PARSE rather than strip (codex r3): wake handoffs keep their priority
     // and get kind='wake' so BTCC history/UI retain the on-call semantics;
     // only bare legacy identity prefixes (【a → b】) are dropped as noise.
@@ -3598,47 +3637,12 @@ async function routePeerItem(body: InboundBody & Record<string, unknown>, verdic
     try {
       // awaited (not fire-and-forget): the minted row id travels in the channel
       // meta as btcc_msg_id so the receiving agent can quote-reply to this message
-      const row = { from_agent: from, to_agent: INBOX_SELF, kind, body: logBody.slice(0, 4000), delivery: 'delivered', reply_to_id: body?.reply_to_id ?? null, sender_verified: verdict.verified, ...(opRef ? { op: opRef } : {}) }
+      const row = { from_agent: verdict.sender, to_agent: INBOX_SELF, kind, body: logBody.slice(0, 4000), delivery: 'delivered', reply_to_id: body.reply_to_id ?? null, sender_verified: verdict.verified, ...(tags.op ? { op: tags.op } : {}) }
       const id = (await Lanes.inboxPost('/lanes/inbound-log', row))?.id
-      if (typeof id === 'number') btccMsgId = id
+      if (typeof id === 'number') tags.btcc_msg_id = String(id)
     } catch {}
   }
-  // Default chat_id = first allowFrom (the owner): if the agent finishes and
-  // reports via the reply tool, the report lands with the boss per contract.
-  const chatId = String(body?.chat_id ?? loadAccess().allowFrom[0] ?? 'local-inject')
-  // 002: thread / hop / sender-lane marker. The marker is only believed from a verified
-  // sender (it is stamped by the sender's own daemon, never by message text).
-  const b2 = body as unknown as { thread?: unknown; hop?: unknown; lane?: unknown }
-  const thread = typeof b2?.thread === 'string' && /^[a-z0-9_-]{1,32}#t-[0-9a-f]{4,16}$/i.test(b2.thread) ? b2.thread : undefined
-  const hop = Number.isFinite(Number(b2?.hop)) && Number(b2?.hop) > 0 ? Math.floor(Number(b2?.hop)) : undefined
-  const laneMarker = verdict.verified && typeof b2?.lane === 'string' ? String(b2.lane).slice(0, 48) : undefined
-  const notification = {
-    method: 'notifications/claude/channel',
-    params: {
-      content: text,
-      meta: {
-        chat_id: chatId, user: from, user_id: 'local-inject', ts: new Date().toISOString(), via: 'local-inject',
-        ...verdictMeta(verdict),
-        ...(btccMsgId != null ? { btcc_msg_id: String(btccMsgId) } : {}),
-        ...(body?.no_reply === true ? { no_reply: 'true' } : {}),
-        ...(opRef ? { op: opRef } : {}),
-        ...(body?.reply_to_id != null ? { reply_to_id: String(body.reply_to_id) } : {}),
-        ...(body?.reply_to_from ? { reply_to_from: String(body.reply_to_from).slice(0, 64) } : {}),
-        ...(body?.reply_to_text ? { reply_to_text: String(body.reply_to_text).slice(0, 120) } : {}),
-        ...(thread ? { thread } : {}), ...(hop ? { hop: String(hop) } : {}), ...(laneMarker ? { sender_lane: laneMarker } : {}),
-        // lanes-golive (C1/C2): what the router reads as fields: the wake-up kind (body.wake, else the watchdog's sender and marker) and the line
-        // (body.line / body.tier; a push without one is a call)
-        ...((w => w ? { wake: w } : {})(Lanes.wakeKind(from, text, body?.wake))),
-        line: Lanes.lineOf((body as any)?.line ?? (body as any)?.tier) ?? 'call',
-        // PL5: the scheduler's run id and frequency are structured fields of the inject body (the router reads them; no text is parsed)
-        ...((body as any)?.run_id != null && /^\d+$/.test(String((body as any).run_id)) ? { run_id: String((body as any).run_id) } : {}),
-        ...(typeof (body as any)?.frequency === 'string' && (body as any).frequency ? { frequency: String((body as any).frequency).slice(0, 16) } : {}),
-        ...(ring ? { ring: 'true' } : {}),          // WO-141: the router reads it (lanes switched off: a ring is recorded, not the main's)
-      },
-    },
-  }
-  if (roamerItems) { await roamerItems.offer([item], notification); return }
-  await laneDeliverMesh(notification, verdict.verified, { ...wakeFactsOf(body), onsen_items: [item] })
+  await deliverPeer(text, tags, item, wakeFactsOf(body))
 }
 async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
   // A page may omit the event history. Resolve the hand-over note before putting the row into M1.
@@ -3679,6 +3683,15 @@ async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
     return
   }
   if (row.kind === 'self') {
+    const injected = readInject(row.payload.text ?? '')
+    if (injected) {
+      for (const ref of row.refs) {
+        if (ref.kind === 'op') injected.tags.op = ref.value
+        if (ref.kind === 'run') injected.tags.run_id = ref.value
+      }
+      await deliverPeer(prefix ? prefix + '\n' + injected.text : injected.text, injected.tags, item, {}, row.created_at)
+      return
+    }
     await routePeerItem({ text: payload.text, logged: true, no_reply: true }, { sender: row.member, verified: true, forged: false, relay: 'direct' }, item)
     return
   }

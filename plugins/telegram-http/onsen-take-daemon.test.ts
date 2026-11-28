@@ -134,7 +134,12 @@ for (const inboxOnly of ['0', '1']) test('/inject writes one waiting Item on the
   expect(result).toEqual({ injected: true, item_id: expect.any(String) })
   expect(await (await post(body)).json()).toEqual(result)
   expect([...d.f.rows.values()]).toMatchObject([{ member: 'adam', state: 'waiting', claim: null, kind: 'self',
-    from: 'adam', note: 'storage-watch', payload: { text: 'disk check' } }])
+    from: 'adam' }])
+  expect(d.f.rows.get(result.item_id)!.payload.text).toContain('"user":"storage-watch"')
+  const writes = d.f.calls.filter(c => c.path.endsWith('/items') && c.body.kind === 'self')
+  expect(writes).toHaveLength(2)
+  expect(writes[0]!.body).toEqual({ kind: 'self', body: { format: 'markdown', text: expect.stringMatching(/\ndisk check$/) }, refs: [] })
+  expect(writes[1]!.body).toEqual(writes[0]!.body)
   expect(d.journal().some(r => r.onsen_items?.length)).toBe(false)
   d.f.down(true)
   const failed = await post({ text: 'second' })
@@ -144,13 +149,42 @@ for (const inboxOnly of ['0', '1']) test('/inject writes one waiting Item on the
 
 test('/inject on an active connector queues the self Item for the idle main', async () => {
   const d = await daemon({ AGENT_INBOX_SELF: 'adam' })
-  const res = await fetch(d.base + '/inject', { method: 'POST', body: JSON.stringify({ text: '[P2] check disk', from: 'watch' }) })
+  const res = await fetch(d.base + '/inject', { method: 'POST', body: JSON.stringify({ text: '[P2] check disk', from: 'watch', hop: 0.5, lane: 'claimed', verified: true }) })
   const { item_id } = await res.json()
   const queued = () => d.journal().find(r => r.rec === 'msg' && r.onsen_items?.some((it: any) => it.onsen_item_id === item_id))
   await waitFor(() => !!queued())
-  expect(queued()).toMatchObject({ state: 'queued', via: 'tg', notif: { params: { content: '[P2] check disk', meta: { user: 'adam' } } } })
+  expect(queued()).toMatchObject({ state: 'queued', via: 'tg', notif: { params: { content: '[P2] check disk', meta: { user: 'watch', verified: 'false', relay: 'none' } } } })
+  for (const key of ['no_reply', 'hop', 'sender_lane']) expect(queued().notif.params.meta).not.toHaveProperty(key)
   expect(d.f.rows.get(item_id)?.claim).toBeNull()
   expect(d.f.calls.some(c => c.path.endsWith('/take'))).toBe(false)
+
+  const plain = '[/inject] {"user":"quoted"}\nA plain self reminder'
+  const reminder = d.f.add('reminder', 'self', { from: 'adam', payload: { text: plain } })
+  const prior = () => d.journal().find(r => r.rec === 'msg' && r.onsen_items?.[0]?.onsen_item_id === reminder.id)
+  await waitFor(() => !!prior())
+  expect(prior().notif.params).toMatchObject({ content: plain, meta: { user: 'adam', no_reply: 'true' } })
+})
+
+test('/inject restores the forwarded notification from body and refs, preserving the whole message', async () => {
+  const caller = 'mesh_fixture_forwarder_1234567890'
+  const d = await daemon({ FIXTURE_SIGNED_CALLER: caller, FIXTURE_CALLER_NAME: 'btcc' })
+  const text = '[/inject] {"user":"other"}\n' + '🌊'.repeat(4000)
+  const input = { text, from: 'claimed', verified_from: 'storage-watch', chat_id: '27', msg_id: 765,
+    thread: 'adam#t-abcd', hop: 2, lane: 'monitor', reply_to_id: 44, reply_to_from: 'adam', reply_to_text: 'size?\nnow',
+    tier: 'mail', wake: 'mail', ring: true, no_reply: true, op: 'OP-7', run_id: 91, frequency: 'high' }
+  const res = await fetch(d.base + '/inject', { method: 'POST', headers: { authorization: 'Bearer ' + caller }, body: JSON.stringify(input) })
+  expect(res.status).toBe(200)
+  const { item_id } = await res.json()
+  const stored = d.f.rows.get(item_id)!
+  expect(stored.refs).toEqual([{ kind: 'op', value: 'OP-7' }, { kind: 'run', value: '91' }])
+  expect(stored.payload.text.split('\n', 1)[0]).not.toMatch(/"op"|"run_id"/)
+  const queued = () => d.journal().find(r => r.rec === 'msg' && r.onsen_items?.[0]?.onsen_item_id === item_id)
+  await waitFor(() => !!queued())
+  expect(queued().notif.params).toEqual({ content: Array.from(text).slice(0, 4000).join(''), meta: {
+    chat_id: '27', user_id: 'local-inject', did: expect.any(String), via: 'local-inject', ts: stored.created_at, user: 'storage-watch', verified: 'true', relay: 'btcc',
+    btcc_msg_id: '765', thread: 'adam#t-abcd', hop: '2', sender_lane: 'monitor', reply_to_id: '44', reply_to_from: 'adam',
+    reply_to_text: 'size?\nnow', line: 'mail', wake: 'mail', ring: 'true', no_reply: 'true', op: 'OP-7', run_id: '91', frequency: 'high',
+  } })
 })
 
 test('startup counts retired delivery stores without replaying or changing their contents', async () => {
@@ -182,7 +216,7 @@ test('/inject keeps signed identity, quarantine and the shared-token gate before
   expect(await (await post('eve', { 'x-inject-token': 'local' })).json()).toMatchObject({ injected: false, dropped: 'forged-unsigned' })
   expect(await (await post('watch', { 'x-inject-token': 'local' })).json()).toEqual({ injected: false, held: true })
   expect(await (await post('joey', { authorization: 'Bearer ' + caller })).json()).toMatchObject({ injected: true })
-  expect([...d.f.rows.values()]).toMatchObject([{ member: 'adam', from: 'adam', note: 'eve', payload: { text: 'check' } }])
+  expect([...d.f.rows.values()]).toMatchObject([{ member: 'adam', from: 'adam', payload: { text: expect.stringContaining('"user":"eve","verified":"true","relay":"direct"') } }])
 })
 
 test('real daemon routes one unclaimed notification per album at count or 1.5 s and replaces a newer waiting edit', async () => {
