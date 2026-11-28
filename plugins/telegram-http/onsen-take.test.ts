@@ -2074,3 +2074,28 @@ test('another Item can report while a schedule result HTTP request is still in f
   } finally { release.resolve(); await Promise.all([first, next]) }
   expect(schedule.state).toBe('completed')
 })
+
+test('one receiver keeps its process UUID private for main, lane and roamer through terminal replay', async () => {
+  const sid = crypto.randomUUID()
+  const sessions = ['main', 'adam.worker.7', roamerSessionId('adam', sid)]
+  for (const [i, session] of sessions.entries()) {
+    const r = rig()
+    await r.mode.probe()
+    const row = r.f.add('audit-' + i)
+    const ref = itemRef(row)
+    if (i === 2) ref.target = { session_id: sid, claude_pid: 7, tmux: 'fixture', transcript: '/fixture/transcript' }
+    await r.receiver.receive([ref])
+    if (i === 2) r.claims.accept(sid, [row.claim!.id], 'turn', new Date().toISOString())
+    else r.receiver.bind([ref], session, 'turn', sid)
+    const local = JSON.parse(readFileSync(r.file, 'utf8')).claims[row.id]
+    expect([local.session_id, local.registry_session]).toEqual([session, sid])
+    await r.sync()
+    r.claims.report(row.id, 'cut')
+    const restored = new OnsenClient(r.client.cfg)
+    restored.watchItemReports(line => r.claims.replay(line), (...args) => r.claims.acknowledged(...args))
+    await restored.syncNow(true)
+    const sent = r.f.history.filter(h => h.item_id === row.id).map(h => h.body)
+    expect(sent.map(b => [b.outcome, b.session_id])).toEqual([['in_session', session], ['cut', session]])
+    expect(JSON.stringify(sent)).not.toContain(sid)
+  }
+})
