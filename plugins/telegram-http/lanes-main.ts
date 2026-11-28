@@ -460,17 +460,18 @@ export function createMain(E: MainEnv) {
     const refs: ItemRef[] = rows.flatMap(r => r.onsen_items ?? [])
     if (!receiver) return rows.filter(r => !r.onsen_items)
     if (!ready()) return []
-    const { given, gone } = await receiver.receive(refs, hook, binding)
+    const { given } = await receiver.receive(refs, hook, binding, gone => {
+      for (const r of rows) if (r.state === 'queued' && r.onsen_items?.some((ref: ItemRef) => gone.has(ref.onsen_item_id))) {
+        closeItem(r, { reason: 'onsen_no_longer_waiting' })
+        if (r.onsen_items.length > 1) receiver.revisit?.()
+      }
+    })
     const valid = ready()
     return rows.filter(r => {
       const own: ItemRef[] | undefined = r.onsen_items
       if (!own) return valid
       if (valid && r.state === 'queued' && own.every(ref => given.has(ref.onsen_item_id))) return true
       receiver.report(own.filter(ref => given.has(ref.onsen_item_id)), 'not_taken')
-      if (own.some(ref => gone.has(ref.onsen_item_id))) {
-        closeItem(r, { reason: 'onsen_no_longer_waiting' })
-        if (own.length > 1) receiver.revisit?.()
-      }
       return false
     })
   }

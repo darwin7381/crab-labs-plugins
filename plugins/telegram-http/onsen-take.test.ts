@@ -326,6 +326,31 @@ test('not_before, rides_next and parked refusals are checked by id; a vanished r
   expect((await r.receiver.receive([ride, other].map(itemRef))).given.size).toBe(2)
 })
 
+test('a hook returns its take before inspecting refusals; a lost non-hook response recovers its grant', async () => {
+  const r = rig(), good = r.f.add('good'), missing = r.f.add('missing', 'call', { state: 'cancelled' })
+  let release!: () => void, checking = false, lose = false
+  const wait = new Promise<void>(resolve => { release = resolve })
+  const mode = new TakeMode('adam', async (...args) => {
+    if (args[1].endsWith('/missing')) { checking = true; await wait }
+    const answer = await r.mode.req(...args)
+    if (lose && args[0] === 'POST') { lose = false; throw Error('response lost') }
+    return answer
+  }, () => {}, () => {}, 'mac-mini')
+  await mode.probe(); clean.push(() => mode.stop())
+  const receiver = new ItemReceiver(mode, r.claims, () => {})
+  const gone = new Set<string>()
+  expect([...(await receiver.receive([good, missing].map(itemRef), true, false, ids => ids.forEach(id => gone.add(id)))).given]).toEqual(['good'])
+  expect(checking).toBe(false)
+  await until(() => checking); release(); await until(() => gone.has('missing'))
+  const next = r.f.add('recovered')
+  lose = true
+  expect([...(await receiver.receive([itemRef(next)])).given]).toEqual(['recovered'])
+  receiver.report([itemRef(next)], 'completed'); await r.sync()
+  expect(r.outcomes(next.id)).toEqual(['completed'])
+  const keys = r.f.calls.filter(c => c.body.item_ids?.includes(next.id)).map(c => c.key)
+  expect(keys).toHaveLength(2); expect(keys[0]).toBe(keys[1])
+})
+
 test('hook timeout gets nothing; the exact take is replayed and its claim returned through ir', async () => {
   const r = rig(), row = r.f.add('slow')
   await r.mode.probe(); r.f.delayTake(3300)

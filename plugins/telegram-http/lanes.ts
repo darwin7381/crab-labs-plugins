@@ -3362,33 +3362,30 @@ async function takeSteering(tok: RunTok, ids: string[], res: ServerResponse) {
   const refs = pending.flatMap(s => s.ev.onsen_items!)
   if (!refs.length) return []
   // A lane can accumulate multiple peek pages between two tool calls. All takes share this hook's 3 s window.
+  const dropGone = (gone: Set<string>) => {
+    const current = S.steering?.[tok.lane] ?? []
+    const dropped = current.filter(s => s.run === tok.runId && s.ev.onsen_items?.some(r => gone.has(r.onsen_item_id)))
+    if (!dropped.length) return
+    for (const s of dropped) events.settleUnrun(s.ev.id, 'dropped', 'Onsen item no longer waiting')
+    setPendingSteer(tok.lane, current.filter(s => !dropped.includes(s)))
+    saveState()
+    if (dropped.some(s => s.ev.onsen_items!.length > 1)) onGateOpen?.()
+  }
   const batches = []
-  for (let start = 0; start < refs.length; start += 100) batches.push(receiver.receive(refs.slice(start, start + 100), true))
+  for (let start = 0; start < refs.length; start += 100) batches.push(receiver.receive(refs.slice(start, start + 100), true, false, dropGone))
   const results = await Promise.all(batches)
   const given = new Set(results.flatMap(r => [...r.given]))
-  const gone = new Set(results.flatMap(r => [...r.gone]))
   const taken = refs.filter(r => given.has(r.onsen_item_id))
   if (!live() || res.destroyed) {
     if (lane.status === 'closed') receiver.report(taken, 'reassigned', { note: `${lane.id} 在收下這件事之前已關閉。` })
     else receiver.report(taken, 'not_taken')
     return []
   }
-  const messages = [], dropped = new Set<string>()
+  const messages = []
   for (const s of pending) {
     const group = s.ev.onsen_items!
     if (group.every(r => given.has(r.onsen_item_id))) messages.push(steerMessage(s.ev, s.run, s.merged))
-    else {
-      receiver.report(group.filter(r => given.has(r.onsen_item_id)), 'not_taken')
-      if (group.some(r => gone.has(r.onsen_item_id))) {
-        dropped.add(s.ev.id)
-        events.settleUnrun(s.ev.id, 'dropped', 'Onsen item no longer waiting')
-      }
-    }
-  }
-  if (dropped.size) {
-    setPendingSteer(tok.lane, (S.steering?.[tok.lane] ?? []).filter(s => !dropped.has(s.ev.id)))
-    saveState()
-    if (pending.some(s => dropped.has(s.ev.id) && s.ev.onsen_items!.length > 1)) onGateOpen?.()
+    else receiver.report(group.filter(r => given.has(r.onsen_item_id)), 'not_taken')
   }
   return messages
 }

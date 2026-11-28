@@ -34,7 +34,7 @@ export class ItemReceiver {
     for (const ref of refs ?? []) this.claims.bind(ref.onsen_item_id, session, turn, registrySession)
   }
 
-  async receive(refs: ItemRef[], hook = false, binding = false): Promise<ReceiveResult> {
+  async receive(refs: ItemRef[], hook = false, binding = false, onGone?: (ids: Set<string>) => void): Promise<ReceiveResult> {
     const result = empty()
     if (!this.mode.active || this.claims.blocked()) return result
     const byId = new Map(refs.map(r => [r.onsen_item_id, r]))
@@ -62,12 +62,12 @@ export class ItemReceiver {
       // The first write may have committed before the response was lost. Recover its exact result.
       let retry = 0
       while ((!r || r.status >= 500 || expired && retry === 0) && this.mode.active) {
-        expired = true
         if (retry) await new Promise(resolve => setTimeout(resolve, Math.min(30_000, 1000 * retry)).unref())
         if (!this.mode.active) return empty()
         retry++
         if (!this.claims.blocked()) r = await take().catch(() => null)
       }
+      clearTimeout(timer)
       if (r?.status === 409) {
         const why = r.json?.error?.code
         if (why === 'not_current_connector' || why === 'not_take_member') this.mode.pause(why, why === 'not_current_connector' ? 45_000 : 60_000)
@@ -81,18 +81,26 @@ export class ItemReceiver {
         this.claims.taken(row, ref)
         result.given.add(row.id)
       }
-      if (!expired) await Promise.all(need.filter(id => !result.given.has(id)).map(async id => {
-        const single = await this.mode.req('GET', '/v1/items/' + encodeURIComponent(id), undefined, 3000).catch(() => null)
-        if (single?.status === 404 || (single?.status === 200 && single.json.data.state !== 'waiting')) result.gone.add(id)
-        const row: InboxItem | undefined = single?.json?.data
-        if (row?.state === 'waiting' && (row.reason === 'parked' && !row.released || row.reason === 'cut_person')) {
-          this.refused.set(id, { version: row.version, rides: row.reason === 'cut_person' })
-        }
-        if (row?.not_before) this.dueAt(row.not_before)
-      }))
+      const refused = need.filter(id => !result.given.has(id))
+      const inspect = async () => {
+        await Promise.all(refused.map(async id => {
+          const single = await this.mode.req('GET', '/v1/items/' + encodeURIComponent(id), undefined, 3000).catch(() => null)
+          if (single?.status === 404 || (single?.status === 200 && single.json.data.state !== 'waiting')) result.gone.add(id)
+          const row: InboxItem | undefined = single?.json?.data
+          if (row?.state === 'waiting' && (row.reason === 'parked' && !row.released || row.reason === 'cut_person')) {
+            this.refused.set(id, { version: row.version, rides: row.reason === 'cut_person' })
+          }
+          if (row?.not_before) this.dueAt(row.not_before)
+        }))
+        if (result.gone.size) onGone?.(result.gone)
+      }
       if (expired || !this.mode.active) {
         for (const id of need) if (result.given.has(id)) this.claims.report(id, 'not_taken')
         return empty()
+      }
+      if (refused.length) {
+        if (hook) setTimeout(() => void inspect(), 0)
+        else await inspect()
       }
       return result
     }
