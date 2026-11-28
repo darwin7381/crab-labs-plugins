@@ -178,6 +178,23 @@ function scriptedLane(root: string) {
   return { LANES_CLAUDE_BIN: bin }
 }
 
+test('C4 routes only the member’s own resumes to M1 across all session targets', async () => {
+  const d = await daemon()
+  await waitFor(() => d.f.calls.some(c => c.query.has('wait')))
+  const add = (id: string, from: string, session_id: string | null) =>
+    d.f.add(id, 'resume', { from, session_id, payload: { text: id }, created_at: new Date(d.f.now()).toISOString() })
+  add('foreign-resume', 'eve', 'main')
+  add('worker-target', 'adam', 'adam.worker.7')
+  add('unknown-target', 'adam', null)
+  add('main-target', 'adam', 'main')
+  const native = () => new Set(d.journal().filter(r => r.rec === 'msg' && r.kind === 'carry' && r.notif?.params.meta.user === 'lanes')
+    .map(r => r.onsen_items?.[0]?.onsen_item_id))
+  await waitFor(() => native().has('main-target'))
+  expect([...native()].sort()).toEqual(['main-target', 'unknown-target', 'worker-target'])
+  expect(d.f.calls.some(c => c.path === '/v1/items/main-target')).toBe(false)
+  expect(d.f.calls.some(c => c.path.endsWith('/take'))).toBe(false)
+})
+
 test('C4 main hooks create a waiting resume; an independent turn after fixture restart cancels it without a take', async () => {
   const session_id = randomUUID()
   const d = await daemon({}, 200, root => {

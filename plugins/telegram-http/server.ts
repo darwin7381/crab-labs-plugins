@@ -4974,8 +4974,9 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
  *  the verdict the same message pushed through BTCC unverified gets today (mesh-identity.ts resolveInbound, a forwarder without verified_from):
  *  verified=false, and forged when the name is an identity that signs (dropped and filed, as on /inject). */
 async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
-  // A page may omit the event history. Resolve the hand-over note before putting the row into M1.
-  if (row.session_id === 'main' && !row.events) {
+  const ownResume = row.kind === 'resume' && row.from === row.member
+  // A native resume only needs history for a hand-over note, regardless of its session target.
+  if (!row.events && (ownResume ? row.reason === 'reassigned' : row.session_id === 'main')) {
     const r = await onsen!.request('GET', '/v1/items/' + encodeURIComponent(row.id))
     if (r?.status === 404) return
     if (r?.status !== 200) throw new Error('could not read item history for ' + row.id)
@@ -4995,7 +4996,7 @@ async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
   }
   const prefix = [item.note, item.half_done ? '上一回合被打斷，接著做。' : ''].filter(Boolean).join('\n')
   if (prefix) payload.text = prefix + '\n' + (payload.text ?? '')
-  if (row.kind === 'resume' && (row.session_id == null || row.session_id === 'main')) {
+  if (ownResume) {
     Lanes.routeResume(item, String(payload.text ?? ''))
     return
   }

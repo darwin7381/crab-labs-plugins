@@ -6,7 +6,7 @@
 
 - `lanes-main.ts:775,815,835,1046` 是 WO-209 分辨裸回合與有 item 回合的地方。只有本成員的 C1 `TakeMode.active` 生效才把裸回合的非帳號錯誤、用量上限、非刻意的行程結束寫成一列。已有 item 的回合照它的 claim 回報。使用者要求的 restart 沿用原判斷。
 - S2 的 `POST /v1/members/<member>/items` 寫 `kind:"resume"`、`session_id:"main"`、`body:{format:"markdown",text:…}` 和 `refs:[]`。非上限錯誤的 `not_before` 是原本的 `cut.retry_at`。上限等待 keeper 解除，行程中斷等待可接收的主線，兩者省略這個欄位。同一段對話一次只等一列 resume。新的 prompt 在上限解除前又被拒時，沿用尚未交入的列。該列的建立請求保留同一把 Idempotency-Key，包含回應遺失、程式重新啟動的情況。
-- `lanes-main.ts:579` 的台北時間、錯誤原因、正數背景工作數和不用回覆的通知共用同一個產生處。C1 的 peek（`onsen-items.ts:88`）按到期時間取得參照，經 `server.ts:4965` 將它送到主線，M1 在可交入時才 take（`lanes-main.ts:462,539`），用既有的綁定、續約與完成回報。pull 成員繼續使用 WO-209 的本機通知及 receipt。切換時尚未交出的舊 cut 只能走一次。
+- `lanes-main.ts:579` 的台北時間、錯誤原因、正數背景工作數和不用回覆的通知共用同一個產生處。C1 的 peek（`onsen-items.ts:88`）按到期時間取得參照，經 `server.ts:4965` 依 kind 與寄件成員辨認自己的 resume，將它送到主線，M1 在可交入時才 take（`lanes-main.ts:462,539`），用既有的綁定、續約與完成回報。pull 成員繼續使用 WO-209 的本機通知及 receipt。切換時尚未交出的舊 cut 只能走一次。
 
 ## Claude Code 自己繼續
 

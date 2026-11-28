@@ -350,8 +350,8 @@ export function createMain(E: MainEnv) {
     return !!E.itemReceiver?.()?.claims.inSession(id) || items(r => (r.state === 'bound' || r.state === 'done')
       && r.onsen_items?.some((ref: ItemRef) => ref.onsen_item_id === id)).length > 0
   }
-  const isResume = (r: Row): boolean => r.onsen_items?.[0]?.kind === 'resume'
-  const owed = (r: Row): boolean => isResume(r) ? resumes.canOffer(r.onsen_items[0].onsen_item_id) : (E.owed ? E.owed(r) : r.kind !== 'digest')
+  const isResume = (r: Row): boolean => r.onsen_items?.[0]?.kind === 'resume' && r.onsen_items[0].from === E.agent
+  const owed = (r: Row): boolean => isResume(r) ? resumes.canOffer(r.onsen_items[0].onsen_item_id, contentOf(r)) : (E.owed ? E.owed(r) : r.kind !== 'digest')
   function routeResume(ref: ItemRef, text: string): void {
     resumes.remember(ref.onsen_item_id)
     if (resumes.cancelling(ref.onsen_item_id)) return
