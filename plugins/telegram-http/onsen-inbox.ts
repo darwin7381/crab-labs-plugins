@@ -214,12 +214,12 @@ export class OnsenPuller {
 
   /** hand on every pending item, in seq order; a throw stops here (the item stays pending, in order). WO-194 A.2: an item answered `later` stays
    *  pending in its place and is skipped until LATER_MS has passed; the ones behind it are handed on */
-  async drain(): Promise<void> {
+  async drain(retryHeld = false): Promise<void> {
     const inbox = this.o.inbox
     for (let i = 0; i < inbox.pending.length;) {
       const it = inbox.pending[i]!
       const due = this.held.get(it.seq)
-      if (due != null && due > this.now()) { i++; continue }
+      if (!retryHeld && due != null && due > this.now()) { i++; continue }
       const replay = !this.stats.polls
       const r = await this.o.deliver(it, due != null)
       if (replay) this.stats.replayed++
@@ -257,25 +257,37 @@ export class OnsenPuller {
     else throw new Error(`ack ${upto}: ${r ? `HTTP ${r.status}` : 'no credential'}`)
   }
 
-  private pullPaused(status: number): boolean {
+  private async drainAndAck(retryHeld = false): Promise<void> {
+    await this.drain(retryHeld)
+    await this.ack()
+  }
+
+  private async pullPaused(status: number): Promise<boolean> {
     if (!this.o.takeEnabled) return false
-    if (status === 409 && !this.takeMember) this.o.log('info', 'onsen inbox: member is on take; checking again in 60 s')
-    if (status === 200 && this.takeMember) this.o.log('info', 'onsen inbox: member is on pull again')
-    if (status === 200 || status === 409) this.takeMember = status === 409
-    return status === 409
+    if (status === 409) {
+      // Give held pull items one immediate hand-off when the member switches to take.
+      await this.drainAndAck(!this.takeMember)
+      if (!this.takeMember) this.o.log('info', 'onsen inbox: member is on take; checking again in 60 s')
+      this.takeMember = true
+      return true
+    }
+    if (status === 200 && this.takeMember) {
+      this.o.log('info', 'onsen inbox: member is on pull again')
+      this.takeMember = false
+    }
+    return false
   }
 
   /** one round: hand on what is pending, ack, one long poll, take and hand on what it gave, ack. Throws on any failure (the loop backs off). */
   async once(): Promise<void> {
     if (!this.o.inbox.based) { await this.baseline(); return }
-    await this.drain()
-    await this.ack()
+    await this.drainAndAck()
     const due = this.heldDueS()
     const inbox = this.o.inbox, waitS = due == null ? this.o.waitS ?? 25 : Math.min(this.o.waitS ?? 25, due)
     const path = `/inbox?after=${inbox.lastSeq}&wait=${waitS}&limit=${this.o.limit ?? 100}&host=${encodeURIComponent(this.o.host)}`
     const r = await this.o.req('GET', path, undefined, (waitS + 15) * 1000)
     if (!r) throw new NoCredential()
-    if (this.pullPaused(r.status)) return
+    if (await this.pullPaused(r.status)) return
     if (r.status !== 200) throw new Error(`GET /inbox: HTTP ${r.status}${r.json?.detail ? ` ${String(r.json.detail).slice(0, 120)}` : ''}`)
     this.stats.polls++
     this.stats.last_poll_at = new Date(this.now()).toISOString()
@@ -289,26 +301,25 @@ export class OnsenPuller {
     const items: PullItem[] = Array.isArray(j.items) ? j.items : []
     const fresh = inbox.take(items)
     this.stats.taken += fresh.length
-    await this.drain()
-    await this.ack()
+    await this.drainAndAck()
   }
 
   /** The pull's first start (no local copy of the pull yet: a new agent, or a lost state file). WO-158: begin after Onsen's acked_seq for this agent
    *  (GET /inbox?after=0 answers it with last_seq): what no daemon of this agent acked is handed on, so a call sent before the first poll (told
    *  「queued」) arrives; one a daemon acked is not given again. A key /inject delivered meanwhile is still dropped by the dedupe. An Onsen that gives no
-   *  acked_seq: ask with an `after` past any count, Onsen answers reset with its count (continue_after), start after it (1.51.0). Nothing is acked here. */
+   *  acked_seq: ask with an `after` past any count, Onsen answers reset with its count (continue_after), start after it (1.51.0). */
   async baseline(): Promise<void> {
     const host = encodeURIComponent(this.o.host)
     const r = await this.o.req('GET', `/inbox?after=0&wait=0&limit=1&host=${host}`, undefined, 15_000)
     if (!r) throw new NoCredential()
-    if (this.pullPaused(r.status)) return
+    if (await this.pullPaused(r.status)) return
     if (r.status !== 200) throw new Error(`GET /inbox (first start): HTTP ${r.status}`)
     const last = Number.isInteger(r.json?.last_seq) ? r.json.last_seq as number : null
     let n: number | null = Number.isInteger(r.json?.acked_seq) ? Math.min(r.json.acked_seq, last ?? r.json.acked_seq) : null
     if (n == null) {
       const c = await this.o.req('GET', `/inbox?after=${BASELINE_AFTER}&wait=0&limit=1&host=${host}`, undefined, 15_000)
       if (!c) throw new NoCredential()
-      if (this.pullPaused(c.status)) return
+      if (await this.pullPaused(c.status)) return
       if (c.status !== 200) throw new Error(`GET /inbox (first start): HTTP ${c.status}`)
       n = c.json?.reset === true && Number.isInteger(c.json?.continue_after) ? c.json.continue_after : Number.isInteger(c.json?.last_seq) ? c.json.last_seq : null
       if (n == null) throw new Error('GET /inbox (first start): no count in the answer')

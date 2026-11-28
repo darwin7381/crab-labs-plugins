@@ -11,6 +11,8 @@ const iso = (ms: number) => new Date(ms).toISOString()
 export function fakeItems() {
   let now = Date.now(), seq = 0, claimSeq = 0, owner = '', seen = 0
   const rows = new Map<string, Row>(), writes = new Map<string, Response>(), terminal = new Map<string, string>()
+  const givenByPull = new Set<Row>()
+  let pullAcked = 0
   const calls: Array<{ path: string; query: URLSearchParams; body: any; key: string | null }> = []
   const issued = new Set<string>(), reports = new Set<string>()
   const history: ItemReport[] = [], waiters = new Set<() => void>()
@@ -57,7 +59,22 @@ export function fakeItems() {
     if (path === '/v1/messages' && req.method === 'POST') return detail({ id: String(++seq), delivery: 'sent' })
     if (path.endsWith('/observation') && b.connector === undefined) return detail({ name: 'adam', kind: 'agent' })
     if (path.endsWith('/commands')) return detail({ name: 'adam', kind: 'agent' })
-    if (path === '/inbox') return mode === 200 ? error(409, 'take_member') : Response.json({ items: [], last_seq: 0, acked_seq: 0 })
+    if (path === '/inbox' && req.method === 'GET') {
+      if (mode === 200) return error(409, 'take_member')
+      const after = Number(q.get('after'))
+      const given = [...rows.values()].filter(r => r.state === 'waiting' && r.number > after).slice(0, Number(q.get('limit') ?? 100))
+      for (const row of given) givenByPull.add(row)
+      return Response.json({ items: given.map(r => ({ seq: r.number, sender: r.from, kind: r.kind, payload: r.payload })),
+        last_seq: seq, acked_seq: pullAcked })
+    }
+    if (path === '/inbox/ack' && req.method === 'POST') {
+      for (const row of givenByPull) {
+        if (row.number > b.upto) continue
+        row.state = 'completed'; change(row, 'acked'); givenByPull.delete(row)
+      }
+      pullAcked = Math.max(pullAcked, b.upto)
+      return Response.json({ acked: 1 })
+    }
     const base = '/v1/members/adam/items'
     const connector = b.connector ?? q.get('connector')
     if (connector && path.startsWith(base) && mode !== 200) return error(mode, mode === 409 ? 'not_take_member' : mode === 400 ? 'invalid_request' : 'not_found')
