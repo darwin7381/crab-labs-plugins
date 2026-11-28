@@ -28,8 +28,9 @@ test('S2 member POST authenticates the writer, validates the shape and returns t
   expect((await post(b, '')).status).toBe(400)
   const { data } = await (await post(b)).json()
   expect(data).toMatchObject({ from: 'adam', member: 'adam', waiter: 'joey-test', kind: 'self', state: 'waiting',
-    session_id: 'main', payload: { text: b.body.text }, preview: b.body.text, about_item_id: null, retry_after: null,
+    session_id: 'main', payload: { text: b.body.text, format: 'markdown' }, preview: b.body.text, about_item_id: null, retry_after: null,
     takeable: { now: false, why: 'not_before' }, not_before: due, deadline: due, refs: b.refs })
+  expect(data.payload).not.toHaveProperty('body')
   expect(data.line).toContain('自己留的｜adam → 等的人 joey-test｜等著')
   expect(data.events[0]).toMatchObject({ kind: 'created', claim_id: null, state: 'waiting', at: data.updated_at })
   expect((await (await post(b)).json()).data.id).toBe(data.id)

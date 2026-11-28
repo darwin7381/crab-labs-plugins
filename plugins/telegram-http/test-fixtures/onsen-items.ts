@@ -123,7 +123,7 @@ export function fakeItems() {
       if (old && rows.has(old.id)) return Bun.deepEquals(old.body, b) ? old.result.clone() : error(409, 'version_conflict')
       const row = add(crypto.randomUUID(), b.kind, { from: 'adam', waiter: b.waiter ?? 'adam', session_id: b.session_id ?? null,
         refs: b.refs, not_before: b.not_before ?? null, deadline: b.deadline ?? null, expires_at: b.expires_at ?? null,
-        payload: { text: b.body?.text ?? '' }, created_at: iso(now), completed_at: null, cancelled_at: null })
+        payload: b.body ? { text: b.body.text, format: b.body.format } : { text: '' }, created_at: iso(now), completed_at: null, cancelled_at: null })
       const result = detail(view(row))
       creates.set(key, { id: row.id, body: b, result: result.clone() })
       return result
