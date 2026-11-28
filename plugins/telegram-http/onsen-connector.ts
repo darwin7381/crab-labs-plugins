@@ -111,7 +111,8 @@ export class OnsenIds {
     const cid = await this.conversation(chat)
     const key = `${cid}:${s}`, had = this.msg.get(key)
     if (had && this.fresh(had)) return had.id
-    const r = await this.o.request('GET', `/v1/conversations/${encodeURIComponent(cid)}/messages/by-client-id/${encodeURIComponent(s)}`, undefined, TRY_MS)
+    const path = `/v1/conversations/${encodeURIComponent(cid)}/messages/by-client-id/${encodeURIComponent(s)}`
+    const r = await this.o.request('GET', path, undefined, TRY_MS)
     if (r && r.status === 404) return null
     const id = r && r.status === 200 ? r.json?.data?.id : undefined
     if (id == null) throw new Error(`Onsen did not say which message ${s} is (${why(r)})`)

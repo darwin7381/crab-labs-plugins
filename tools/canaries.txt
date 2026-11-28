@@ -229,7 +229,7 @@ plugins/telegram-http/onsen-inbound.ts::export const hasInboxPartner = (env: Rec
 plugins/telegram-http/server.ts::return OnsenInbound.inboundEffective(v, ONSEN_AGENT, INBOX_PARTNER)
 plugins/telegram-http/onsen-connector.ts::export class BridgeSwitch {
 plugins/telegram-http/onsen-connector.ts::async waitReport(id: string, conv: string): Promise<Said> {
-plugins/telegram-http/onsen-connector.ts::`/v1/conversations/${cid}/messages/by-client-id/${encodeURIComponent(s)}`
+plugins/telegram-http/onsen-connector.ts::`/v1/conversations/${encodeURIComponent(cid)}/messages/by-client-id/${encodeURIComponent(s)}`
 plugins/telegram-http/server.ts::const CONNECTOR = !INBOX_ONLY && !ROAMER
 plugins/telegram-http/server.ts::if (!TOKEN && ROAMER) {
 plugins/telegram-http/server.ts::new (await import('./roamer-telegram.ts')).RoamerTelegram(

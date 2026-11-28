@@ -133,6 +133,18 @@ test('WO-197 segment 2: a chat member:<name> is written with `to` (the person\'s
   expect(await ids.conversation('member:amy')).toBe('88')                // kept: no by-chat asked for it
 })
 
+test('the by-client-id lookup encodes both path segments and caches the returned id', async () => {
+  const calls: string[] = []
+  const ids = new OnsenIds({ request: async (method, path) => {
+    calls.push(method + ' ' + path)
+    return { status: 200, json: { data: { id: '401' } } }
+  } })
+  ids.know('-10042', 'room/2')
+  expect(await ids.message('-10042', 'post?#7')).toBe('401')
+  expect(await ids.message('-10042', 'post?#7')).toBe('401')
+  expect(calls).toEqual(['GET /v1/conversations/room%2F2/messages/by-client-id/post%3F%237'])
+})
+
 test('a group reply keeps the shared conversation across Telegram and web', async () => {
   const f = fake({})
   f.ids.know('-10042', 'group-a')
