@@ -496,6 +496,14 @@ test('walled main leaves mail and person waiting, keeper-clear probe reports the
   expect(r.outcomes(person.id)).toEqual(['in_session', 'usage_limit_probe'])
   expect(r.restarts).toEqual([r.sid]); expect(r.notices).toEqual([])
   expect(r.f.history.at(-1)!.body.retry_after).toBe(reset); expect(mail.state).toBe('waiting')
+  await r.hook('SessionEnd')
+  await r.hook('SessionStart', { pid: 1052, source: 'startup' })
+  await r.m.pump(); await r.sync()
+  expect(r.m.currentGen()?.state).toBe('walled')
+  expect(mail.claim).toBeNull()
+  r.setWall({ walled: false, clearedMs: Date.now() + 5000 })
+  await r.m.pump()
+  await until(() => !!mail.claim)
 })
 
 test('one album offer acquires its three rows in one request and sends one notification', async () => {

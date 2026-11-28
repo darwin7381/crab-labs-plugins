@@ -1073,6 +1073,7 @@ export function createMain(E: MainEnv) {
         const cur = J().get('main', g.id)!
         const first = !cur.wall_since
         setMain(cur, 'walled', { kind: err, error: err, prompt_id: null, tool_open: null, stopped_prompt: null, wall_since: cur.wall_since ?? new Date().toISOString(), wall_refused_at: Date.now(), wall_clear_at: null,
+          ...(refusedProbe ? { uw_clear_used: Math.max(Number(cur.uw_clear_used ?? 0), wall?.clearedMs ?? 0) } : {}),
           cut_turn: bareCut(cur, back, err) })
         if (refusedProbe) await restartForReport(cur, 'usage_limit_probe')
         if (first) tellJoey(`主線${WALL_WORD[err] ?? '模型無法使用'}（原文：${String(b.reason ?? err).slice(0, 200)}）。給主線的 ${items(r => r.state === 'queued' && owed(r)).length} 則訊息先保留，一件都沒有丟；之後主線一能用就交給它，恢復時我會告訴你。主線要等額度重置、換帳號或換模型才會再動。車道照常處理警報與同事的事。`, 'main-wall-up')
@@ -1122,14 +1123,16 @@ export function createMain(E: MainEnv) {
     // ends it with the one wall-down notice (2a936a7: the episode ended with the gen, and Joey heard main-wall-up and never the recovery)
     const ended = J().rows('main', r => r.state === 'gone' && !!r.wall_since && r.id !== id)
     const since = ended.map(r => String(r.wall_since)).sort()[0]
+    const refusal = taking() && ended.filter(r => r.wall_refused_at).sort((a, b) => b.wall_refused_at - a.wall_refused_at)[0]
     const carry = since ? { wall_since: since, wall_menu: ended.map(r => r.wall_menu).filter(Boolean).pop() ?? null } : {}
     const previous = latestMain()
     for (const r of ended) J().write('main', r.id, 'gone', { wall_since: null, wall_menu: null })
     // lanes-golive: the SessionStart context reaches the conversation on startup, clear and compact; on resume it is all but lost (25 of 334, Chiron's
     // measure), so a resumed main gets the rules on its first prompt instead (UserPromptSubmit)
     const carried = ['startup', 'clear', 'compact'].includes(String(b.source ?? ''))
-    J().write('main', id, goesOn ? 'in_turn' : E.streamOpen(pid) ? 'idle' : 'starting', { pid, session_id: sid, transcript_path: b.transcript_path ?? (goesOn ? same!.transcript_path ?? null : null),
+    J().write('main', id, goesOn ? 'in_turn' : refusal ? 'walled' : E.streamOpen(pid) ? 'idle' : 'starting', { pid, session_id: sid, transcript_path: b.transcript_path ?? (goesOn ? same!.transcript_path ?? null : null),
       source: b.source ?? null, ...(goesOn ? {} : { prompt_id: null, tool_open: null, stopped_prompt: null }), end_reason: null, rules_shown: carried ? sid : null, ...carry,
+      ...(refusal ? { wall_refused_at: refusal.wall_refused_at, uw_clear_used: refusal.uw_clear_used, kind: refusal.kind } : {}),
       cut_turn: previous?.cut_turn ?? null, resume_sent: previous?.resume_sent ?? null, resumes: previous?.resumes ?? 0,
       undelivered_since: previous?.undelivered_since ?? null })
     cur = id

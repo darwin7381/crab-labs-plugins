@@ -770,6 +770,7 @@ type Lane = {
   id: string; kind: LaneKind; n: number; session_id: string; thread: string
   status: 'new' | 'running' | 'idle' | 'closed'
   created: string; last: string; transcript: string; runs: number
+  last_limit_refusal?: number
   tokens_in: number; tokens_out: number; topic?: number; title?: string; critical?: boolean
   fork_from?: string
   /** lanes-topics (item 4): a worker's topic name as stored (= shown); its finish: pending at the close, done (time) once the ✅ and the closing line went */
@@ -3167,7 +3168,7 @@ function alertRepeat(ev: InEvent, critical: boolean): Decision | null {
 }
 /** the alert a new lane's thread was opened for (so its repeats find it) */
 function noteAlert(ev: InEvent, thread: string): void {
-  if (!isAlertEvent(ev)) return
+  if (ev.onsen_items?.length || !isAlertEvent(ev)) return
   S.alert_fp ??= {}
   const now = nowIso()
   S.alert_fp[alertFingerprint(ev.from, ev.text)] = { thread, event: ev.id, sev: alertSeverity(ev), repeats: 0, first: now, last: now, seen: alertValues(ev.text) }
@@ -3855,7 +3856,10 @@ function runEnded(lane: Lane | undefined, it: QItem, e: { reason: string; proces
   }
   const itemExit = e.processExit ?? e.reason
   const apiError = ['wall:server_error', 'wall:api_error', 'wall:overload'].includes(itemExit)
-  if (wall && !(takingItems() && apiError)) wallUp({ kind: wall, text: e.wallText ?? '' }, e.runId ?? it.run ?? '?')
+  if (wall && !(takingItems() && apiError)) {
+    if (takingItems() && lane) lane.last_limit_refusal = Date.now()
+    wallUp({ kind: wall, text: e.wallText ?? '' }, e.runId ?? it.run ?? '?')
+  }
   else if (!wall && S.wall && e.reachedModel) void wallDown(e.runId ?? it.run ?? '?')       // the first run that gets through takes the wall down, however it ended
   if (again) return
   const outcome = it.stuckRestart ? 'cut' : itemExit === 'normal' ? 'completed' : apiError ? 'error'
@@ -4225,7 +4229,7 @@ function laneMayTake(it: QItem): boolean {
   }
   const refs = runEvents(it).flatMap(ev => ev.onsen_items ?? [])
   if (!refs.length || !refs.every(r => r.kind === 'message' && !r.reason?.startsWith('usage_limit'))) return false
-  const last = Math.max(since, keeper?.lastWallMs ?? 0)
+  const last = S.lanes[it.lane]?.last_limit_refusal ?? 0
   if (personCanProbe(last)) return true
   itemReceiver!.dueAt(new Date(last + 60_000).toISOString())
   return false
