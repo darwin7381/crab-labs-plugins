@@ -6239,12 +6239,12 @@ function commitmentArgs(a: unknown): ReturnType<typeof checkCommitmentArgs> {
   const who = memberWaiter(chk.c.who)
   return who ? { ok: true, c: { ...chk.c, who } } : { ok: false, error: 'who must identify the Onsen member waiting for the answer' }
 }
-function recordPromise(evId: string, p: { by: string; to?: string | null; text: string; thread?: string | null; ref?: unknown; at?: number }): void {
+function recordPromise(evId: string, p: { by: string; to?: string | null; text: string; thread?: string | null; ref?: unknown; at?: number; words?: string; deadlineWords?: string }): void {
   if (activeSelfWriter()) {
     const e = events.get(evId)
     const recipient = memberWaiter(p.to) ?? e?.onsen_items?.[0]?.waiter ?? e?.onsen_items?.[0]?.from ?? S.threads[p.thread ?? '']?.peer
     if (recipient) {
-      const to = String(recipient).toLowerCase(), due = promiseTime(p.text, p.at ?? Date.now())
+      const to = String(recipient).toLowerCase(), due = promiseTime(p.words ?? p.text, p.at ?? Date.now(), p.deadlineWords)
       const key = JSON.stringify([p.by, to, p.ref ?? evId, p.text])
       const id = 'cm-' + createHash('sha256').update(key).digest('hex').slice(0, 24)
       events.open(id, { class: to === 'joey' ? 'joey' : 'peer', owner: p.by, thread: p.thread, text: p.text,
@@ -6296,7 +6296,7 @@ export async function promiseCheck(o: { who: string; to: string; text: string; e
   // (a thread the send named, quoted, or kept a promise on; the peer's newest live thread is a guess, peerThread's `peer-thread`, and is not used: 002l D4)
   const conv = o.thread && o.thread_from !== 'peer-thread' && o.thread_from !== 'none' ? o.thread : null
   const pev = (byMain && conv ? threadEvent(S.threads[conv])?.id : undefined) ?? o.ev
-  if (pev || activeSelfWriter()) recordPromise(pev ?? '', { by: o.who, to, text: commitmentText(cm), thread: byMain ? conv : o.thread, ref: o.ref, at: saidAt })
+  if (pev || activeSelfWriter()) recordPromise(pev ?? '', { by: o.who, to, text: commitmentText(cm), thread: byMain ? conv : o.thread, ref: o.ref, at: saidAt, words: forms ? forms.join('\n') : o.text })
   else if (byMain) events.open(`cm-${shortId()}`, { class: to === 'joey' ? 'joey' : 'peer', owner: 'main', thread: o.thread, text: cm.what,
     obligations: [{ kind: to === 'joey' ? 'joey' : 'peer', level: 'commitment', owner: 'main', to, what: cm.what, by: 'promise-check' }] })
   ledger({ lane: byMain ? 'main' : o.who, thread: o.thread, event: o.ev ?? (byMain ? `main-send-${o.ref}` : undefined), kind: 'commitment', text: commitmentText(cm),
@@ -6837,7 +6837,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       const chk = commitmentArgs(a)
       if (!chk.ok) return `commitment refused: ${chk.error}`
       tok.commitments = (tok.commitments ?? 0) + 1
-      recordPromise(tok.evId, { by: lane.id, to: chk.c.who, text: commitmentText(chk.c), thread: lane.thread })   // M3 (PL1): the promise is on the event's record
+      recordPromise(tok.evId, { by: lane.id, to: chk.c.who, text: commitmentText(chk.c), words: chk.c.what, deadlineWords: chk.c.by, thread: lane.thread })   // M3 (PL1): the promise is on the event's record
       ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'commitment', text: commitmentText(chk.c), refs: { ...chk.c }, detail: lane.transcript })
       return `ledger: commitment recorded (${chk.c.who}: ${chk.c.what}; by ${chk.c.by})`
     }
@@ -7006,7 +7006,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
         const cm = commitmentFromReport(rep.promised, queue.get(tok.evId)?.ev.from, th?.peer)
         if (cm) {
           tok.commitments = 1
-          recordPromise(tok.evId, { by: lane.id, to: cm.who, text: commitmentText(cm), thread: lane.thread })
+          recordPromise(tok.evId, { by: lane.id, to: cm.who, text: commitmentText(cm), words: rep.promised, thread: lane.thread })
           ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'commitment', text: commitmentText(cm), refs: { ...cm, from: 'receipt.promised' }, detail: lane.transcript })
         }
       }
@@ -8154,7 +8154,7 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
       const chk = commitmentArgs(a)
       if (!chk.ok) return `commitment refused: ${chk.error}`
       const dueRaw = String(a.due ?? '').trim()
-      const dueMs = dueRaw ? parseLocal(dueRaw) : activeSelfWriter() ? promiseTime(chk.c.by + ' ' + chk.c.what, Date.now()) : null
+      const dueMs = dueRaw ? parseLocal(dueRaw) : activeSelfWriter() ? promiseTime(chk.c.what, Date.now(), chk.c.by) : null
       if (dueRaw && (dueMs == null || Number.isNaN(dueMs))) return `commitment refused: due must be an ISO time such as 2026-11-15T10:00:00+08:00 (without a zone it is the lab's local time); got "${dueRaw.slice(0, 40)}". Nothing was recorded.`
       if (dueMs != null && !a.by) chk.c.by = `${simTime(dueMs)} 前`
       const where = peerThread(chk.c.who)

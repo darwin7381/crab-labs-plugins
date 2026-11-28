@@ -1,5 +1,6 @@
 import { memberOfTg } from './onsen-client.ts'
 import { MEMBER_CHAT } from './onsen-connector.ts'
+import { promiseSentences } from './lanes-followup.ts'
 import { parseLocal } from './lanes-digest.ts'
 import type { Ob } from './lanes-events.ts'
 import { ownItem, type SelfWriter } from './onsen-self.ts'
@@ -20,10 +21,23 @@ export function chatWaiter(chat: unknown, origins: ItemRef[] = []): string | und
   return senders.size === 1 ? [...senders][0] : undefined
 }
 
-/** Only set the deadline when the words give a time. Jev's deadline *probability* is never a timestamp. */
-export function promiseTime(words: string, at: number): number | null {
+/** Extract a time from the clause that promises delivery. The optional by field is an explicit tool argument. */
+export function promiseTime(words: string, at: number, by?: string): number | null {
+  if (by && by !== '未說明') return timeInPhrase(by, at)
+  // A comma can separate a time adjunct from its promise, e.g. 「10 分鐘後，我會回報」.
+  const phrases = words.replace(/(\d+(?:\.\d+)?\s*(?:分鐘|小時|天)\s*(?:以內|之後|內|後))\s*[，,]\s*(?=我(?:們)?[會將]|回報|給你)/g, '$1 ')
+  for (const clause of phrases.split(/[，,。；;！？!?\n]+|\.\s+/)) {
+    // A bare time attached to the action also occurs in terse tool/receipt text (「10 分鐘後回圖」).
+    if (!promiseSentences(clause).length && !/(?:分鐘|小時|天)(?:內|後)\s*(?:再|回|給|交|寄|查)|(?:點|時|:\d\d)(?:半|\d+分)?\s*(?:前|回|給|交|寄)/.test(clause)) continue
+    const due = timeInPhrase(clause, at)
+    if (due != null) return due
+  }
+  return null
+}
+
+function timeInPhrase(words: string, at: number): number | null {
   const stamp = words.match(/\d{4}-\d\d-\d\d[T ]\d\d:\d\d(?::\d\d(?:\.\d+)?)?(?:Z|[+-]\d\d:\d\d)?/i)
-  if (stamp) { const ms = parseLocal(stamp[0]); return Number.isFinite(ms) ? ms : null }
+  if (stamp) { const ms = parseLocal(stamp[0]); return ms >= at ? ms : null }
   const relative = words.match(/(\d+(?:\.\d+)?)\s*(分鐘|小時|天)\s*(?:以內|之後|內|後)/)
     ?? words.match(/\b(?:in|within)\s+(\d+(?:\.\d+)?)\s+(minutes?|hours?|days?)\b/i)
   if (relative) {
@@ -42,7 +56,10 @@ export function promiseTime(words: string, at: number): number | null {
   if (hour === 12 && /凌晨|上午/.test(clock[2] ?? '')) hour = 0
   const minute = clock[6] ? 30 : Number(clock[4] ?? clock[5] ?? 0)
   if (hour > 23 || minute > 59) return null
-  return Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate() + day, hour - 8, minute)
+  const due = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate() + day, hour - 8, minute)
+  if (due >= at) return due
+  if (weekday) return due + 7 * 86400_000
+  return clock[1] ? null : due + 86400_000
 }
 
 /** Called at the M3 journal transition. The same saved creation request identifies early completion after restart. */

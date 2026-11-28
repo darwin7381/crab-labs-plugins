@@ -125,6 +125,20 @@ test('only definite times become deadlines', () => {
   expect(promiseTime('第 1 點', at)).toBeNull()
 })
 
+test('clock times belong to the promise clause and bare past clocks roll to tomorrow', async () => {
+  const at = Date.parse('2026-11-28T15:00:00+08:00')
+  expect(promiseTime('10:30 那次重啟是正常的，晚點跟你說', at)).toBeNull()
+  expect(promiseTime('10 分鐘後，我會回報', at)).toBe(at + 600_000)
+  expect(promiseTime('9 點前給你', at)).toBe(Date.parse('2026-11-29T09:00:00+08:00'))
+  expect(promiseTime('10:30 那次重啟是正常的，我會 16:30 回報', at)).toBe(at + 90 * 60_000)
+  expect(promiseTime('今天 10:30 前回報', at)).toBeNull()
+  expect(promiseTime('回報', at, '2026-11-27T10:00:00+08:00')).toBeNull()
+  const count = selfRows().length
+  expect(await L.promiseCheck({ who: 'main', to: 'ken', text: '10:30 那次重啟是正常的，我會稍後回報', thread: null, ref: 'historical-clock' })).toBe('written')
+  await client.syncNow(true)
+  expect(selfRows()).toHaveLength(count)
+})
+
 test('a direct chat or a single group sender identifies the waiter', () => {
   const a = itemRef(f.add('group-a', 'message', { from: 'eve' })), b = { ...a, from: 'cain' }
   expect(chatWaiter('member:cain', [a])).toBe('cain')
