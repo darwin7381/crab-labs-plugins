@@ -259,7 +259,7 @@ export type MainPicker = {
 let D: LanesDeps
 /** lanes-golive (C2): what a lane's send carries besides to / text (the three lines of send_to_agent) */
 import type { InboxItem, ItemRef } from './onsen-items.ts'
-import { chatWaiter, projectPromises, promiseTime } from './onsen-promises.ts'
+import { chatWaiter, memberWaiter, projectPromises, promiseTime } from './onsen-promises.ts'
 import { ownItem, type SelfWriter } from './onsen-self.ts'
 
 export type LaneSendFields = { line: Line; title?: string; ask?: string; because?: string; deadline?: string; touches?: string[]; ref?: string }
@@ -2551,7 +2551,7 @@ function toMain(ev: InEvent, d: Decision, opt: { owesOnlyMain?: boolean } = {}):
   // Onsen's mention item (WO-181) is a notice, as the lanes digest is: it owes nobody anything (no Joey line, no answer) and is not a call. It reaches the
   // main as the lanes' own message (chat lanes, no_reply), its mention block riding with it. As a peer's call it carried a Joey line, and the main answered
   // Joey 「沒有要我做的事」 (Chiron's WO-175 lab, 08:42Z, lab-relay msg 881): fleet-wide, every comment naming an agent would have made it write to Joey
-  const notice = ev.item_kind === 'mention' || ev.item_kind === 'self' || ev.item_kind === 'keepwarm'
+  const notice = ev.item_kind === 'mention' || !!ev.onsen_items?.length && (ev.item_kind === 'self' || ev.item_kind === 'keepwarm')
   const p = (notice ? { content: String(ev.text ?? ''), meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: ev.item_kind!, no_reply: 'true' } }
     : ev.notif?.params ?? {}) as { content?: string; meta?: Record<string, string> }
   const notif = d.warn ? { method: ev.notif.method || 'notifications/claude/channel', params: { ...p, content: `${d.warn}\n\n${String(p.content ?? ev.text)}`, meta: { ...(p.meta ?? {}), screened: 'instructions-to-agent' } } }
@@ -4247,7 +4247,9 @@ function fireFollowup(f: Followup, now: number, item?: ItemRef): void {
   if (!lane || lane.status === 'closed') lane = newLane('reflex', { thread: f.thread })
   const rec = events?.get(f.event)
   const ev: InEvent = { id: f.event, source: 'mesh', from: f.from, text: String(rec?.text ?? f.note), meta: {}, notif: { method: '', params: {} },
-    thread: f.thread, trigger: f.trigger, cls: f.cls, followup: f.id, synthetic: followupEventText(f, now), ...(item ? { onsen_items: [item] } : {}) }
+    thread: f.thread, trigger: f.trigger, cls: f.cls, followup: f.id,
+    synthetic: [item?.note, item?.half_done && '上一回合被打斷，接著做。', followupEventText(f, now)].filter(Boolean).join('\n'),
+    ...(item ? { onsen_items: [item] } : {}) }
   routeRow({ event: f.event, source: 'followup', from: f.from, ...ownTag('followup', lane.id), target: 'lane', lane: lane.id, thread: f.thread, followup: f.id, note: `follow-up ${f.id} of ${f.event} (due ${f.due_iso})` }, ev)
   logos('lane.followup.fire', { lane: lane.id, thread: f.thread, followup: f.id, origin_event: f.event, event: f.event, due: f.due_iso, late_s: Math.round((now - f.due) / 1000) })
   const d = dispatch(ev, lane, { rule: 'followup' })
@@ -4258,8 +4260,8 @@ function fireFollowup(f: Followup, now: number, item?: ItemRef): void {
 function submitCheck(f: Followup, writer: SelfWriter): void {
   const event = events.get(f.event)
   const origin: ItemRef | undefined = event?.onsen_items?.[0]
-  const waiter = event?.promised?.at(-1)?.to ?? origin?.waiter ?? origin?.from ?? S.threads[f.thread]?.peer ?? undefined
-  const refs = [{ kind: 'item', value: f.id }]
+  const waiter = memberWaiter(event?.promised?.at(-1)?.to) ?? origin?.waiter ?? origin?.from ?? S.threads[f.thread]?.peer ?? undefined
+  const refs = [{ kind: 'item', value: f.id }, ...(event?.onsen_items ?? []).map((r: ItemRef) => ({ kind: 'item', value: r.onsen_item_id }))]
   if (f.run_id) refs.push({ kind: 'run', value: f.run_id })
   writer({ key: f.id, item: ownItem('self', f.lane, followupEventText(f, f.due), f.due, waiter, null, refs) })
   f.onsen = 'submitted'
@@ -4283,7 +4285,9 @@ export function resumeSelfItems(): void {
     submitCheck(f, writer)
   }
   saveState()
-  for (const e of events.rows(e => e.state === 'open' && e.obligations?.some((o: Ob) => !o.self && o.to && (o.level === 'commitment' || o.level === 'answer' && o.due_at != null)))) {
+  for (const e of events.rows(e => e.obligations?.some((o: Ob) => o.self
+    ? o.state === 'met' && !o.self.complete
+    : e.state === 'open' && o.to && (o.level === 'commitment' || o.level === 'answer' && o.due_at != null)))) {
     events.note(e.id, {})
   }
 }
@@ -5880,9 +5884,11 @@ export function mainReplied(t: MainTier | null, messageId: number | string | nul
   if (messageId != null && text?.trim() && (chat == null || !D.joeyChatId || String(chat) === String(D.joeyChatId()))) S.main_reply = { text: clip(text.trim(), 300), at: nowIso() }
   const x = replyTargets(replyTo, chat)
   // 002w (F, gap 16): what the main tells Joey it will do goes through the one promise check, onto the event the line is about
-  const about = x?.events[0] ?? x?.turn.events[0]
-  const to = activeSelfWriter() ? chatWaiter(chat ?? D.joeyChatId?.(), about?.onsen_items?.[0]) : 'joey'
-  if (messageId != null && text?.trim() && to) void promiseCheck({ who: 'main', to, text, ev: (about ?? x?.turn.events[0])?.id, thread: null, ref: messageId })
+  const take = !!activeSelfWriter()
+  const about = take ? x?.about[0] : x?.events[0] ?? x?.turn.events[0]
+  const origins = x?.about.filter(e => chat == null || e.tg?.chat_id == null || String(e.tg.chat_id) === String(chat)).flatMap(e => e.onsen_items ?? [])
+  const to = take ? chatWaiter(chat ?? D.joeyChatId?.(), origins) : 'joey'
+  if (messageId != null && text?.trim() && to) void promiseCheck({ who: 'main', to, text, ev: about?.id, thread: null, ref: messageId })
   for (const e of x?.events ?? []) {
     if (messageId == null) continue
     for (const o of (e.obligations ?? []) as Ob[]) {
@@ -6227,10 +6233,16 @@ const byJoeyRun = (tok: RunTok): boolean => {
  *  it, to whom and on which conversation, on the event of that conversation. 002w wrote the main's promise to Eve on the turn's event (Joey's message, no
  *  thread) as a bare text: nothing could find it by the conversation it belongs to, and the digest called it the lane's. */
 export type Promise_ = { text: string; by: string; to: string | null; thread: string | null; at: string; ref?: string }
+function commitmentArgs(a: unknown): ReturnType<typeof checkCommitmentArgs> {
+  const chk = checkCommitmentArgs(a)
+  if (!chk.ok || !activeSelfWriter()) return chk
+  const who = memberWaiter(chk.c.who)
+  return who ? { ok: true, c: { ...chk.c, who } } : { ok: false, error: 'who must identify the Onsen member waiting for the answer' }
+}
 function recordPromise(evId: string, p: { by: string; to?: string | null; text: string; thread?: string | null; ref?: unknown; at?: number }): void {
   if (activeSelfWriter()) {
     const e = events.get(evId)
-    const recipient = p.to || e?.onsen_items?.[0]?.waiter || e?.onsen_items?.[0]?.from || S.threads[p.thread ?? '']?.peer
+    const recipient = memberWaiter(p.to) ?? e?.onsen_items?.[0]?.waiter ?? e?.onsen_items?.[0]?.from ?? S.threads[p.thread ?? '']?.peer
     if (recipient) {
       const to = String(recipient).toLowerCase(), due = promiseTime(p.text, p.at ?? Date.now())
       const key = JSON.stringify([p.by, to, p.ref ?? evId, p.text])
@@ -6276,7 +6288,7 @@ export async function promiseCheck(o: { who: string; to: string; text: string; e
   if (ask) logMainCommitment({ who: o.who, to: o.to, btcc_msg_id: o.ref ?? null, p: ask.p, deadline: dl, hit, wrote: hit && !own, thread: o.thread, thread_from: o.thread_from ?? null, ms: ask.ms,
     ...(forms ? { form: true, sentences: forms.length } : {}) })
   if (!hit) return 'no'
-  if (own) return 'dup'
+  if (own || o.tok && (o.tok.commitments ?? 0) > 0) return 'dup'
   const said = forms ? forms.join(' ') : o.text
   const cm = commitmentFromReport(said, o.relay ? to : undefined, to) ?? { who: to, what: said.replace(/\s+/g, ' ').trim().slice(0, 500), by: '未說明' }
   if (o.tok) o.tok.commitments = 1
@@ -6548,7 +6560,7 @@ async function sendLine(tok: RunTok, lane: Lane, h: HeldLine): Promise<string> {
   note({ message_id: id, delivered: id != null || said, ...(said ? { onsen_first: 'telegram-pending' } : {}) })
   if (id == null && !said) throw new Error(`send failed: Joey did not get it; the ${decision ? 'question' : 'line'} is still owed (${decision ? 'ask' : 'send it'} again)`)
   tok.reported = true; if (decision) tok.askedJoey = true                   // WO-148 (item 2): what a held refusal waits for (stepsHeld's report step, owner_claim's ask)
-  const recipient = activeSelfWriter() ? chatWaiter(D.joeyChatId?.(), events.get(evId)?.onsen_items?.[0]) : 'joey'
+  const recipient = activeSelfWriter() ? chatWaiter(D.joeyChatId?.(), events.get(evId)?.onsen_items) : 'joey'
   if (recipient) void promiseCheck({ who: lane.id, to: recipient, text, ev: evId, thread: lane.thread, ref: said ? 'onsen' : id, tok, detail: lane.transcript })
   if (r.tier === 'push') S.pushes[lane.thread] = [...(S.pushes[lane.thread] ?? []).filter(t => Date.now() - t < 3600_000), Date.now()]
   saveState()
@@ -6822,7 +6834,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       return `ledger: ${kind} recorded${pid ? ` (id ${pid})` : ''}`
     }
     case 'commitment': {
-      const chk = checkCommitmentArgs(a)
+      const chk = commitmentArgs(a)
       if (!chk.ok) return `commitment refused: ${chk.error}`
       tok.commitments = (tok.commitments ?? 0) + 1
       recordPromise(tok.evId, { by: lane.id, to: chk.c.who, text: commitmentText(chk.c), thread: lane.thread })   // M3 (PL1): the promise is on the event's record
@@ -7852,6 +7864,7 @@ function appendTool(a: any, who: { lane: string; thread?: string; event?: string
 
 // ================================================================== main-only tools (tg role)
 export function mainToolDefs(): any[] {
+  const commitmentWaiter = activeSelfWriter() ? 'the member named in who' : 'Joey'
   return [
     { name: 'open_worker', description: '[lanes · main only] Open a worker lane: a parallel headless session bound to a new thread of your conversation with Joey (he sees it as a topic). Joey talks to it in that thread; it reports there. Use for long tasks.',
       inputSchema: { type: 'object', properties: { title: { type: 'string' }, brief: { type: 'string', description: 'Everything the worker needs: goal, constraints, what done looks like.' } }, required: ['title', 'brief'] } },
@@ -7868,8 +7881,8 @@ export function mainToolDefs(): any[] {
       inputSchema: { type: 'object', properties: { limit: { type: 'number', description: 'how many (default 15, max 50)' }, file: { type: 'string', description: 'a memory file name, e.g. MEMORY.md' } } } },
     { name: 'memory_revert', description: '[lanes · main only] Undo one memory change: a real revert commit in your name (the files go back to what they were before that commit). Use it for "undo that memory write"; do not rewrite the file by hand. `sha` from memory_history (or the commit id you were told after a write).',
       inputSchema: { type: 'object', properties: { sha: { type: 'string' }, reason: { type: 'string', description: 'why (one line)' } }, required: ['sha', 'reason'] } },
-    { name: 'commitment', description: '[lanes · main only] Record a promise YOU made (to a peer agent or to Joey): who, what, by when. Bookkeeping, like the lanes\' commitment tool: it lands in the ledger as kind commitment, lane main, on the open thread of that peer, and returns its id. The daemon also checks what you send with send_to_agent and records a promise it finds there; you do not need to call this for those. With `due` (an ISO time) this is also a durable reminder: when it is past due and you have not marked it done (commitment_done), Joey is rung once.',
-      inputSchema: { type: 'object', properties: { who: { type: 'string', description: 'to whom (name)' }, what: { type: 'string', description: 'what was promised' }, by: { type: 'string', description: 'by when, in words (e.g. 明天 10:00 前); filled from `due` when left empty' }, due: { type: 'string', description: 'optional: the due time as an ISO time (2026-11-15T10:00:00+08:00; without a zone it is read as the lab\'s local time). Past this time, and not done, Joey is rung once.' } }, required: ['who', 'what'] } },
+    { name: 'commitment', description: '[lanes · main only] Record a promise YOU made (to a peer agent or to Joey): who, what, by when. Bookkeeping, like the lanes\' commitment tool: it lands in the ledger as kind commitment, lane main, on the open thread of that peer, and returns its id. The daemon also checks what you send with send_to_agent and records a promise it finds there; you do not need to call this for those. With `due` (an ISO time) this is also a durable reminder: when it is past due and you have not marked it done (commitment_done), ' + commitmentWaiter + ' is rung once.',
+      inputSchema: { type: 'object', properties: { who: { type: 'string', description: 'to whom (name)' }, what: { type: 'string', description: 'what was promised' }, by: { type: 'string', description: 'by when, in words (e.g. 明天 10:00 前); filled from `due` when left empty' }, due: { type: 'string', description: 'optional: the due time as an ISO time (2026-11-15T10:00:00+08:00; without a zone it is read as the lab\'s local time). Past this time, and not done, ' + commitmentWaiter + ' is rung once.' } }, required: ['who', 'what'] } },
     { name: 'peer_hold', description: '[lanes · main only] Put a peer agent on hold: ALL its events go to the ledger only (no lane, no reply, nothing woken) until the time runs out or the hold is lifted. Use it when you have decided not to answer an agent. The hold shows in the digest. minutes: how long; until_lifted: true to hold until it is lifted (peer_hold again with minutes 0, or Joey /lanes release <peer>).',
       inputSchema: { type: 'object', properties: { peer: { type: 'string', description: 'the agent name, e.g. cain' }, minutes: { type: 'number', description: 'minutes to hold; 0 lifts the hold' }, until_lifted: { type: 'boolean', description: 'true: hold until it is lifted' }, reason: { type: 'string', description: 'why (one line)' } }, required: ['peer', 'reason'] } },
     { name: 'commitment_done', description: '[lanes · main only] Mark a promise of yours done (the id commitment returned). A done promise is not rung for.',
@@ -8131,10 +8144,10 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
     case 'memory_revert': return memoryRevert(a)                // 002l (N2)
     case 'peer_hold': return peerHoldTool(a)                    // 002k (H14)
     case 'commitment': {                                       // 002k (C1, G10)
-      const chk = checkCommitmentArgs(a)
+      const chk = commitmentArgs(a)
       if (!chk.ok) return `commitment refused: ${chk.error}`
       const dueRaw = String(a.due ?? '').trim()
-      const dueMs = dueRaw ? parseLocal(dueRaw) : activeSelfWriter() ? promiseTime(chk.c.by, Date.now()) : null
+      const dueMs = dueRaw ? parseLocal(dueRaw) : activeSelfWriter() ? promiseTime(chk.c.by + ' ' + chk.c.what, Date.now()) : null
       if (dueRaw && (dueMs == null || Number.isNaN(dueMs))) return `commitment refused: due must be an ISO time such as 2026-11-15T10:00:00+08:00 (without a zone it is the lab's local time); got "${dueRaw.slice(0, 40)}". Nothing was recorded.`
       if (dueMs != null && !a.by) chk.c.by = `${simTime(dueMs)} 前`
       const where = peerThread(chk.c.who)

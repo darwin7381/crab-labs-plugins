@@ -7,7 +7,7 @@ import { TakeMode } from './onsen-take.ts'
 import { ItemReceiver } from './onsen-receive.ts'
 import { Claims } from './onsen-claims.ts'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
-import { promiseTime } from './onsen-promises.ts'
+import { chatWaiter, promiseTime } from './onsen-promises.ts'
 import { itemRef } from './onsen-items.ts'
 import { outcomeFingerprint } from './lanes-followup.ts'
 
@@ -60,7 +60,8 @@ test('a sent Telegram promise creates one self for the test account and only Ons
 
 test('the main tool and a handed peer answer keep their actual waiter and finish early', async () => {
   const due = new Date(f.now() + 600_000).toISOString()
-  const reply = await L.callMainTool('commitment', { who: 'eve', what: '寄圖', due }, 'test-main')
+  expect(await L.callMainTool('commitment', { who: '未指明', what: '寄圖', due }, 'test-main')).toContain('who must identify')
+  const reply = await L.callMainTool('commitment', { who: 'member:eve', what: '寄圖', due }, 'test-main')
   const id = /\(id (cm-[^;]+)/.exec(reply)![1]!
   await client.syncNow(true)
   const row = selfRows().find(r => r.waiter === 'eve')!
@@ -82,8 +83,45 @@ test('only definite times become deadlines', () => {
   const at = Date.parse('2026-11-28T23:50:00+08:00')
   expect(promiseTime('12 分鐘後回報', at)).toBe(at + 720_000)
   expect(promiseTime('明天 10:15 前回報', at)).toBe(Date.parse('2026-11-29T10:15:00+08:00'))
+  expect(promiseTime('明天下午 3 點半回覆', at)).toBe(Date.parse('2026-11-29T15:30:00+08:00'))
+  expect(promiseTime('週一上午 9 時回覆', at)).toBe(Date.parse('2026-11-30T09:00:00+08:00'))
   expect(promiseTime('稍後回報', at)).toBeNull()
   expect(promiseTime('第 1 點', at)).toBeNull()
+})
+
+test('a direct chat or a single group sender identifies the waiter', () => {
+  const a = itemRef(f.add('group-a', 'message', { from: 'eve' })), b = { ...a, from: 'cain' }
+  expect(chatWaiter('member:cain', [a])).toBe('cain')
+  expect(chatWaiter('789', [a])).toBe('tg-789')
+  expect(chatWaiter('-123', [a, a])).toBe('eve')
+  expect(chatWaiter('-123', [a, b])).toBeUndefined()
+})
+
+test('a promise marked done while the connector is paused closes its original Item on reactivation', async () => {
+  const reply = await L.callMainTool('commitment', { who: 'eve', what: '10 分鐘後回圖' }, 'test-main')
+  const id = /\(id (cm-[^;]+)/.exec(reply)![1]!
+  await client.syncNow(true)
+  const row = selfRows().find(r => r.payload.text.includes(id))!
+  expect(row.deadline).toBeTruthy()
+  mode.pause('paused for test', 60_000)
+  await L.callMainTool('commitment_done', { commitment_id: id }, 'test-main')
+  await mode.probe()
+  L.resumeSelfItems()
+  await client.syncNow(true)
+  expect(row.state).toBe('completed')
+})
+
+test('a pull member keeps a new commitment entirely in M3', async () => {
+  f.mode(409); await mode.probe()
+  try {
+    const count = selfRows().length
+    const reply = await L.callMainTool('commitment', { who: 'eve', what: 'another report', due: new Date(f.now() + 60_000).toISOString() }, 'test-main')
+    expect(reply).toContain('Joey is rung once')
+    const id = /\(id (cm-[^;]+)/.exec(reply)![1]!
+    await client.syncNow(true)
+    expect(selfRows()).toHaveLength(count)
+    await L.callMainTool('commitment_done', { commitment_id: id }, 'test-main')
+  } finally { f.mode(200); await mode.probe() }
 })
 
 test('followup keeps the origin lane and sender limits, and only a due Item enters the lane queue', async () => {
