@@ -49,7 +49,7 @@ async function daemon(env: Record<string, string> = {}, initialMode = 200, setup
   const port = await freePort()
   const settings = setup?.(root)
   const childEnv: Record<string, string | undefined> = {
-    PATH: process.env.PATH, TMPDIR: root, HOME: join(root, 'home'), TELEGRAM_HTTP_PORT: String(port), TELEGRAM_STATE_DIR: state,
+    PATH: process.env.PATH, GIT_ALLOW_PROTOCOL: 'file', TMPDIR: root, HOME: join(root, 'home'), TELEGRAM_HTTP_PORT: String(port), TELEGRAM_STATE_DIR: state,
     AGENT_WORKSPACE_DIR: root, GENESIS_LANES: '1', LANES_AGENT: 'adam', ONSEN_HOST: 'Mac-Mini', ONSEN_TAKE: '*',
     ONSEN_OBSERVATION: 'adam', ONSEN_BASE: f.base, ONSEN_REGISTRY_CLI: '0', JEV_SCREEN: '', CRAB_LABS_PLUGINS_ENV: join(root, 'no-config'),
     USAGE_WALL_READ: '0', HUB_SYNC: '0', TYPESAFE_KEY_FILE: join(root, 'no-key'), LANES_CLAUDE_BIN: join(import.meta.dir, 'test-fixtures/no-claude.sh'),
@@ -175,6 +175,8 @@ function scriptedLane(root: string) {
   return { LANES_CLAUDE_BIN: bin }
 }
 
+import capturedPage from './test-fixtures/onsen-0.40.0/list-completed.json'
+const capturedPerson = capturedPage.items.find(it => it.kind === 'message')!
 const worker = 'adam.worker.1'
 async function laneHook(root: string, n: number, event: string) {
   const file = join(root, 'hook-' + n)
@@ -192,12 +194,14 @@ async function runningWorker() {
     }))
     return scriptedLane(root)
   })
-  const person = (id: string, tg: string) => d.f.add(id, 'message', { message_id: id, payload: {
+  const person = (id: string, tg: string, source = {}) => d.f.add(id, 'message', { ...source, message_id: id, payload: {
     message_id: id, from: 'joey', conversation_id: 'conv', kind: 'text', thread: 555, text: id,
     client: { name: 'telegram', chat: '1', msg_id: tg, user_id: '1', user: 'Joey', thread: '555' },
   } })
-  person('start-worker', '550')
-  await waitFor(() => d.f.history.some(h => h.item_id === 'start-worker' && h.body.session_id === worker))
+  const first = person(capturedPerson.id, '550', { ...capturedPerson, state: 'waiting' })
+  await waitFor(() => d.f.history.some(h => h.item_id === first.id && h.body.session_id === worker))
+  expect(first.session_id).toBe('main')
+  expect(d.f.calls.filter(c => c.path === '/v1/items/' + first.id)).toHaveLength(0)
   const row = person('message-during-run', '551')
   const input = join(d.lanes, 'run', 'steer', worker + '.in.jsonl')
   await waitFor(() => existsSync(input) && readFileSync(input, 'utf8').includes(row.id))
@@ -324,7 +328,7 @@ test('two peek pages of steering reach one boundary in takes of at most 100 IDs'
   const text = JSON.parse(await hook(1, 'PostToolUse')).hookSpecificOutput.additionalContext
   expect(text).toContain('「burst-99」')
   expect(text).toContain('「' + row.id + '」')
-  const takes = d.f.calls.filter(c => c.path.endsWith('/take') && !c.body.item_ids.includes('start-worker'))
+  const takes = d.f.calls.filter(c => c.path.endsWith('/take') && !c.body.item_ids.includes(capturedPerson.id))
   expect(takes.map(c => c.body.item_ids.length).sort((a, b) => b - a)).toEqual([100, 1])
   expect(new Set(takes.flatMap(c => c.body.item_ids))).toEqual(new Set(messages.map(r => r.id)))
   writeFileSync(join(d.root, 'release-lane'), '')
@@ -397,6 +401,7 @@ test('a busy lane slot leaves the next alert waiting; its run receives the claim
   await waitFor(() => records().some(r => r.rec === 'msg' && r.onsen_items?.some((i: any) => i.onsen_item_id === two.id)))
   const main = records().find(r => r.rec === 'msg' && r.onsen_items?.some((i: any) => i.onsen_item_id === two.id))
   expect(main.notif.params.content).toContain(hand!.body.note)
+  expect(d.f.calls.filter(c => c.path === '/v1/items/' + two.id)).toHaveLength(0)
   expect(records().some(r => r.rec === 'msg' && (r.kind === 'handoff' || r.kind === 'carry'))).toBe(false)
 }, 18000)
 

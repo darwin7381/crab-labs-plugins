@@ -2603,7 +2603,8 @@ export function toMainDirect(ev: InEvent): void {
 export function toMainForm(ev: InEvent): Decision | null {
   if (D?.role !== 'tg' || !main) return null
   // WO-159: a message Joey wrote in Onsen (via=onsen) goes the same way as a page answer: his message, to the main
-  if (ev.onsen_items?.length) return routeMainItem(ev)
+  if (ev.onsen_items?.[0]?.main) return routeMainItem(ev)
+  if (ev.onsen_items?.length) ev.id = itemEventId(ev.onsen_items[0]!)
   const onsen = ev.meta?.via === 'onsen'
   const did = onsen ? 'onsen' : 'web-form'
   // WO-157: on the new path decideWake's joey rule (a page answer is joey_form; a message he wrote in Onsen is joey_tg)

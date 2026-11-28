@@ -4963,14 +4963,6 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
  *  the verdict the same message pushed through BTCC unverified gets today (mesh-identity.ts resolveInbound, a forwarder without verified_from):
  *  verified=false, and forged when the name is an identity that signs (dropped and filed, as on /inject). */
 async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
-  // A page may omit the event history. Resolve the hand-over note before putting the row into M1.
-  if (row.session_id === 'main' && !row.events) {
-    const r = await onsen!.request('GET', '/v1/items/' + encodeURIComponent(row.id))
-    if (r?.status === 404) return
-    if (r?.status !== 200) throw new Error('could not read item history for ' + row.id)
-    if (r.json.data.state !== 'waiting') return
-    row = r.json.data
-  }
   const item = itemRef(row)
   if (itemClaims?.completed(row.id)) {
     const result = await itemReceiver!.receive([item])

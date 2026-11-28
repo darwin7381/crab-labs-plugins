@@ -38,7 +38,7 @@ export function fakeItems() {
     const number = ++seq
     const payload = kind === 'message' ? { message_id: 'm' + number, conversation_id: 'conv', kind: 'text', from: 'joey',
       via: 'telegram', text: id, client: { name: 'telegram', chat: '1', msg_id: String(number), user_id: '1', user: 'Joey' }, sent_at: iso(now) } : { text: id }
-    const row: Row = { id, number, member: 'adam', from: 'joey', session_id: null, kind, refs: [], state: 'waiting', reason: null,
+    const row: Row = { id, number, member: 'adam', from: 'joey', session_id: kind === 'message' || extra.message_id ? 'main' : null, note: null, kind, refs: [], state: 'waiting', reason: null,
       half_done: false, not_before: null, deadline: null, expires_at: null, failures: 0, released: false, version: 0, events: [], claim: null,
       message_id: kind === 'message' ? 'm' + number : null, action_id: null, call_id: null, mail_id: null,
       answered: null, response_message_ids: [], in_session_at: null, updated_at: iso(now), payload, ...extra }
@@ -94,7 +94,7 @@ export function fakeItems() {
         waiters.add(wake); req.signal.addEventListener('abort', wake, { once: true })
       })
       const all = select(), start = Number(q.get('cursor')), end = start + Number(q.get('limit') ?? 50)
-      return Response.json({ api_version: '1', as_of: iso(now), viewer: 'adam', read_by: null, items: all.slice(start, end),
+      return Response.json({ api_version: '1', as_of: iso(now), viewer: 'adam', read_by: null, items: all.slice(start, end).map(({ events, ...row }) => row),
         next_cursor: end < all.length ? String(end) : null,
         ...(connector ? { changed_after: iso(now - 1000).replace('Z', '+00:00') } : {}) })
     }
@@ -108,7 +108,7 @@ export function fakeItems() {
       const given = asked.filter(r => r.reason !== 'cut_person' || asked.some(o => o !== r && o.from === r.from && o.kind === 'message' && o.reason !== 'cut_person'))
       const claim_id = given.length ? 'claim-' + ++claimSeq : null
       for (const row of given) {
-        Object.assign(row, { state: 'claimed', reason: null, in_session_at: null, claim: { id: claim_id, connector, session_id: null, taken_at: iso(now), expires_at: iso(now + 45_000) } })
+        Object.assign(row, { state: 'claimed', reason: null, note: null, in_session_at: null, claim: { id: claim_id, connector, session_id: null, taken_at: iso(now), expires_at: iso(now + 45_000) } })
         issued.add(row.id + '/' + claim_id)
         change(row, 'taken')
       }
@@ -130,7 +130,7 @@ export function fakeItems() {
       reports.add(k + '/' + b.outcome)
       history.push({ item_id: row.id, body: b })
       if (row.claim && row.claim.id !== b.claim_id && b.outcome !== 'completed') { change(row, 'late_report', b.note); return detail(row) }
-      if (b.outcome === 'in_session' && row.claim) { row.claim.session_id = b.session_id; row.session_id = b.session_id; row.in_session_at = b.at }
+      if (b.outcome === 'in_session' && row.claim) { row.claim.session_id = b.session_id; row.session_id ??= b.session_id; row.in_session_at = b.at }
       if (typeof b.half_done === 'boolean') row.half_done = b.half_done
       if (b.outcome === 'error') row.not_before = iso(now + (row.failures + 1) * 300_000)
       if (failures.has(b.outcome) && !(b.outcome === 'cut' && row.reason === 'stuck')) row.failures++
@@ -142,7 +142,7 @@ export function fakeItems() {
           row.reason = row.reason === 'owed' && !row.answered ? 'not_answered' : null
           for (const p of rows.values()) if (p.reason === 'parked' && !p.released) { p.reason = null; p.released = true; change(p, 'released') }
         } else if (['stopped', 'not_applied'].includes(b.outcome)) { row.state = 'cancelled'; row.reason = b.outcome }
-        else { row.state = 'waiting'; row.reason = b.outcome; if (b.outcome === 'reassigned') row.session_id = 'main' }
+        else { row.state = 'waiting'; row.reason = b.outcome; if (b.outcome === 'reassigned') Object.assign(row, { session_id: 'main', note: b.note }) }
       }
       if (failures.has(b.outcome) && row.failures >= 3) {
         row.state = row.released ? 'cancelled' : 'waiting'; row.reason = row.released ? 'gave_up' : 'parked'; row.claim = null

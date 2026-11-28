@@ -2,7 +2,7 @@ import type { TakeMode } from './onsen-take.ts'
 
 export type InboxItem = {
   id: string; number: number; member: string; session_id: string | null; kind: string; from: string
-  state: string; reason: string | null; version: number; updated_at: string; not_before?: string | null
+  state: string; reason: string | null; note?: string | null; version: number; updated_at: string; not_before?: string | null
   deadline?: string | null; half_done?: boolean; relay?: string | null; refs: Array<{ kind: string; value: string }>
   message_id?: string | null; action_id?: string | null; call_id?: string | null; mail_id?: string | null
   events?: Array<{ kind: string; note: string }>; payload: Record<string, any>
@@ -15,9 +15,8 @@ export type ItemRef = {
   note?: string; reason?: string; half_done?: true; conversation?: string
 }
 export function itemRef(it: InboxItem): ItemRef {
-  const note = it.events?.findLast(e => e.kind === 'reassigned')?.note
   return { onsen_item_id: it.id, onsen_version: it.version, kind: it.kind, from: it.from,
-    ...(it.session_id === 'main' ? { main: true, note } : {}), ...(it.deadline ? { deadline: it.deadline } : {}),
+    ...(it.reason === 'reassigned' ? { main: true, note: it.note ?? undefined } : {}), ...(it.deadline ? { deadline: it.deadline } : {}),
     ...(it.reason ? { reason: it.reason } : {}), ...(it.half_done ? { half_done: true } : {}),
     ...(it.payload.conversation_id != null ? { conversation: String(it.payload.conversation_id) } : {}) }
 }
