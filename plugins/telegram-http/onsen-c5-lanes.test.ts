@@ -21,15 +21,15 @@ Object.assign(process.env, env)
 copyFileSync(process.env.LANES_TEST_ROUTER!, join(dir, 'router.json'))
 const L: typeof import('./lanes.ts') = await import(new URL('./lanes.ts?onsen-c5', import.meta.url).href)
 const pushes: string[] = []
+const client = new OnsenClient({ dir, agent: 'adam', record: true, base: f.base, credential: () => 'test-member', log: () => {} })
+const mode = new TakeMode('adam', client.request.bind(client), () => L.deliveryModeChanged(), () => {})
+const claims = new Claims(join(dir, 'claims.json'), client, () => {}, () => {}, f.now)
+const receiver = new ItemReceiver(mode, claims, () => {})
+L.useItemReceiver(receiver, client)
 L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, httpPort: 0, log: () => {},
   authOk: () => false, registryNames: () => ['eve'], joeyChatId: () => '6736970916',
   sendBot: async (_chat: string, text: string) => { pushes.push(text); return 1 } } as any)
 L.__setMainConnected('test-main')
-const client = new OnsenClient({ dir, agent: 'adam', record: true, base: f.base, credential: () => 'test-member', log: () => {} })
-const mode = new TakeMode('adam', client.request.bind(client), () => {}, () => {})
-const claims = new Claims(join(dir, 'claims.json'), client, () => {}, () => {}, f.now)
-const receiver = new ItemReceiver(mode, claims, () => {})
-L.useItemReceiver(receiver, client)
 await mode.probe()
 afterAll(() => {
   mode.stop(); claims.stop(); client.stop(); f.stop(); jev.stop(true)

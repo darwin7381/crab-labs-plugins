@@ -66,7 +66,7 @@ const PERM = ['Yes', "Yes, and don't ask again for ls commands in /tmp/x", 'No']
 
 beforeAll(async () => {
   root = mkdtempSync(join(tmpdir(), 'onsen-screen-menu-daemon-'))
-  sock = mkdtempSync(join(tmpdir(), 'onsen-screen-menu-tmux-'))
+  sock = mkdtempSync(join(tmpdir(), 'menu-tm-'))
   writeFileSync(join(root, 'fake-tui.ts'), FAKE_TUI)
   for (const k of ['c', 'p'] as const) {
     panes[k] = { name: `scrmenu-${k}-${process.pid}`, menu: join(root, `menu-${k}.json`), out: join(root, `chosen-${k}.jsonl`) }
