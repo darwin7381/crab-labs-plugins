@@ -2010,3 +2010,67 @@ test('scheduler results refused by Core stay pending across a restart and log th
   expect(r.logs.filter(l => l.startsWith('[error]') && l.includes('92') && l.includes('400'))).toHaveLength(1)
   expect(r.f.scheduleCalls.get('91')!.result).toBeNull()
 })
+
+test('a schedule waits through 4xx and restart for its own result while another claim completes', async () => {
+  const r = rig()
+  await r.mode.probe()
+  const schedule = r.f.add('scheduler-test', 'schedule'), other = r.f.add('another', 'message')
+  await r.receiver.receive([itemRef(schedule), itemRef(other)])
+  for (const row of [schedule, other]) r.claims.bind(row.id, 'main', 'turn')
+  await r.sync()
+  const claim = schedule.claim!.id
+  expect(r.claims.claimForTurn(schedule.id, 'previous-run')).toBeUndefined()
+  expect(r.claims.claimForTurn(schedule.id, 'turn')).toBe(claim)
+  r.client.recordCall({ claim: { item_id: schedule.id, claim_id: claim }, call_id: 'missing', run_id: '123', event: 'run', idem: 'result-123', body: { result: { outcome: 'ok' } } })
+  for (const row of [schedule, other]) r.claims.report(row.id, 'completed')
+  await r.sync()
+  expect(other.state).toBe('completed')
+  expect(r.outcomes(schedule.id)).toEqual(['in_session'])
+  expect(r.client.hasItemReports()).toBe(false)
+  expect(r.logs.filter(l => l.includes('[error]') && l.includes('123') && l.includes('404'))).toHaveLength(1)
+  r.f.scheduleCalls.set('missing', { id: 'missing', run: '123', result: null })
+  // Core saves the result, but the connector never receives its 2xx.
+  const disconnected = new OnsenClient({ ...r.client.cfg, fetch: (async (url, init) => {
+    const response = await fetch(url, init)
+    if (String(url).endsWith('/missing/state') && response.ok) {
+      await response.body?.cancel()
+      throw new Error('lost result response')
+    }
+    return response
+  }) as typeof fetch })
+  await disconnected.syncNow(true)
+  expect(r.f.scheduleCalls.get('missing')!.result).toEqual({ outcome: 'ok' })
+  expect(r.outcomes(schedule.id)).toEqual(['in_session'])
+  expect(disconnected.pendingBytes()).toBeGreaterThan(0)
+  const client = new OnsenClient(r.client.cfg)
+  client.watchItemReports(line => r.claims.replay(line), (...args) => r.claims.acknowledged(...args))
+  await client.syncNow(true)
+  const attempts = r.f.calls.filter(c => c.path === '/v1/calls/missing/state').slice(-2)
+  expect(attempts.map(c => [c.key, c.body])).toEqual(Array(2).fill(['result-123', { result: { outcome: 'ok' } }]))
+  expect(r.outcomes(schedule.id)).toEqual(['in_session', 'completed'])
+  expect(client.pendingBytes()).toBe(0)
+})
+
+test('another Item can report while a schedule result HTTP request is still in flight', async () => {
+  const r = rig(), started = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
+  await r.mode.probe()
+  const schedule = r.f.add('pending-network', 'schedule'), other = r.f.add('independent')
+  await r.receiver.receive([itemRef(schedule), itemRef(other)])
+  r.f.scheduleCalls.set('91', { id: '91', run: '92', result: null })
+  r.client.cfg.fetch = (async (url, init) => {
+    if (String(url).endsWith('/91/state')) { started.resolve(); await release.promise }
+    return fetch(url, init)
+  }) as typeof fetch
+  r.client.recordCall({ claim: { item_id: schedule.id, claim_id: schedule.claim!.id }, event: 'schedule', idem: '92',
+    run_id: '92', call_id: '91', body: { result: { outcome: 'ok' } } })
+  r.claims.report(schedule.id, 'completed')
+  const first = r.sync()
+  await started.promise
+  r.claims.report(other.id, 'completed')
+  const next = r.sync()
+  try {
+    await until(() => other.state === 'completed')
+    expect(schedule.state).toBe('claimed')
+  } finally { release.resolve(); await Promise.all([first, next]) }
+  expect(schedule.state).toBe('completed')
+})

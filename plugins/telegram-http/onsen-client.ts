@@ -116,7 +116,8 @@ export type CallStateName = 'accepted' | 'running' | 'completed' | 'failed'
 export type CallStateLine = { call_id: string; kind: CallRef['kind']; event: string; idem: string
   body: { state: CallStateName; session_id: string | null; result?: { outcome?: string; body?: { format: 'markdown'; text: string } }; at: string } }
 /** A take receipt supplements the Call. Only the Item reports the turn's progress. */
-export type ScheduledResultLine = { event: string; idem: string; call_id: string | null; run_id: string
+const scheduleKey = (id: string, claim: string) => JSON.stringify([id, claim])
+export type ScheduledResultLine = { claim?: { item_id: string; claim_id: string }; event: string; idem: string; call_id: string | null; run_id: string
   body: { state?: never; result: { outcome: string; body?: { format: 'markdown'; text: string } } } }
 export function scheduledResult(outcome: string, summary: string, steps?: Step[] | null): ScheduledResultLine['body']['result'] {
   const checklist = steps?.map(s => `- [${s.done ? 'x' : ' '}] ${s.step}${s.note ? ' — ' + s.note : ''}`).join('\n')
@@ -462,6 +463,53 @@ export class OnsenClient {
   private authWarnAt = 0
   private observers: Array<(line: SpoolLine) => void> = []
   /** WO-175: what became of the Call lines sent lately (idem → fate), and who waits for one not sent yet */
+  // Only the receipt and terminal report for one scheduler claim share this dependency.
+  private scheduled: Record<string, { receipt?: ScheduledResultLine; completion?: ItemReport; accepted?: boolean; refused?: number }> = Object.create(null)
+  private legacyResults = new Set<string>()
+  private scheduledFlights = new Map<string, Promise<void>>()
+  private scheduledRetry = new Map<string, number>()
+  private saveScheduled(): void {
+    mkdirSync(this.cfg.dir, { recursive: true, mode: 0o700 })
+    const file = join(this.cfg.dir, 'scheduled-results.json'), tmp = file + '.' + process.pid + '.tmp'
+    writeFileSync(tmp, JSON.stringify(this.scheduled), { mode: 0o600 })
+    renameSync(tmp, file)
+  }
+  private holdScheduled(claim: string, patch: { receipt?: ScheduledResultLine; completion?: ItemReport }): boolean {
+    if (!this.cfg.record) return false
+    const entry = this.scheduled[claim] ??= {}
+    Object.assign(entry, patch)
+    this.saveScheduled()
+    this.kick()
+    return true
+  }
+  private async syncScheduled(claim: string, force: boolean): Promise<void> {
+    const entry = this.scheduled[claim]!
+    if (!entry.accepted) {
+      if (!entry.receipt || (!force && Date.now() < (this.scheduledRetry.get(claim) ?? 0))) return
+      const cred = this.cfg.credential()
+      if (!cred) return
+      const r = await this.putScheduled(entry.receipt, cred).catch(e => ({ status: 0, json: { error: errText(e) } }))
+      if (r.status < 200 || r.status >= 300) {
+        this.scheduledRetry.set(claim, Date.now() + 5000)
+        if (r.status >= 400 && r.status < 500 && entry.refused === undefined) {
+          this.cfg.log('error', `onsen: scheduler run ${entry.receipt.run_id} result HTTP ${r.status}: ${callSaid(r.json)}; kept for retry`)
+          entry.refused = r.status
+          this.saveScheduled()
+        }
+        return
+      }
+      entry.accepted = true
+      this.stats.calls_put++
+      this.saveScheduled()
+    }
+    if (!entry.completion) return
+    const { waitForResult, ...line } = entry.completion
+    if (!this.appendItemReport(line)) return
+    delete this.scheduled[claim]
+    this.scheduledRetry.delete(claim)
+    this.saveScheduled()
+    await this.syncFifo(force)
+  }
   private itemReports = 0
   private reportedThrough: number
   private refusedReportEnd: number
@@ -470,7 +518,20 @@ export class OnsenClient {
   watchItemReports(replay: (line: ItemReport) => void, ack: (line: ItemReport, ok: boolean, row?: InboxItem) => void): void {
     this.itemAck = ack
     this.itemReports = 0
-    for (const { line } of this.pendingReports()) { this.itemReports++; replay(line.r) }
+    const pending = [...this.pendingReports()]
+    // Upgrade a C2 FIFO which already contains both halves of a receipt.
+    const old = new Map(pending.filter(({ line }) => line.r.body.outcome === 'completed').map(({ line }) => [line.r.item_id, line.r]))
+    if (old.size) for (const line of this.pendingLines()) {
+      if (line.k !== 'c' || !('run_id' in line.r)) continue
+      const id = /^item-(.+)-v\d+(?:-\w+)?$/.exec(line.r.event)?.[1]
+      const completion = id && old.get(id)
+      if (completion) {
+        this.legacyResults.add(line.r.idem)
+        this.holdScheduled(scheduleKey(completion.item_id, completion.body.claim_id), { receipt: line.r, completion })
+      }
+    }
+    for (const { line } of pending) { this.itemReports++; replay(line.r) }
+    for (const entry of Object.values(this.scheduled)) if (entry.completion) replay(entry.completion)
   }
 
   private *pendingReports() {
@@ -534,6 +595,12 @@ export class OnsenClient {
     if (!this.append({ k: 'item', r: write })) throw new Error('could not record the Onsen Item')
   }
   recordItemReport(line: ItemReport): boolean {
+    const key = scheduleKey(line.item_id, line.body.claim_id)
+    if (line.waitForResult || (line.body.outcome === 'completed' && this.scheduled[key]))
+      return this.holdScheduled(key, { completion: line })
+    return this.appendItemReport(line)
+  }
+  private appendItemReport(line: ItemReport): boolean {
     if (!this.append({ k: 'ir', r: line })) return false
     if (!this.itemReports) this.nextTryAt = 0 // let the first report past a non-report's backoff
     this.itemReports++
@@ -561,6 +628,8 @@ export class OnsenClient {
     this.reportedThrough = this.readCursor('reportedThrough')
     this.refusedReportEnd = this.readCursor('refusedReportEnd')
     this.rejected = join(cfg.dir, 'rejected.jsonl')
+    try { Object.assign(this.scheduled, JSON.parse(readFileSync(join(cfg.dir, 'scheduled-results.json'), 'utf8'))) }
+    catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e }
     this.linesFile = join(cfg.dir, 'lines.json')
     this.itemWrites = new ItemWrites(join(cfg.dir, 'item-ids'), cfg.agent, (...args) => this.request(...args))
   }
@@ -681,7 +750,11 @@ export class OnsenClient {
   }
   /** WO-175: one moment of a Call (onsen-status.ts CallFacts), PUT /v1/calls/<id>/state when the spool reaches it. false = not spooled */
   recordBlocked(r: BlockedReceipt): boolean { return this.append({ k: 'blocked', r }) }
-  recordCall(c: CallStateLine | ScheduledResultLine): boolean { const ok = this.append({ k: 'c', r: c }); if (ok) this.stats.calls_spooled++; return ok }
+  recordCall(c: CallStateLine | ScheduledResultLine): boolean {
+    const ok = 'run_id' in c && c.claim ? this.holdScheduled(scheduleKey(c.claim.item_id, c.claim.claim_id), { receipt: c }) : this.append({ k: 'c', r: c })
+    if (ok) this.stats.calls_spooled++
+    return ok
+  }
   /** WO-175 (Chiron 05:55Z): wait for what Onsen says to Call line `idem` (spooled already): the spool is tried at once and three more times within
    *  `ms`, whatever its backoff, as btcc-receipt does. A line sent before keeps its fate; one still unsent after `ms` stays in the spool (pending) */
   callFate(idem: string, ms = CALL_RECEIPT_WAIT_MS): Promise<CallLineFate> {
@@ -834,6 +907,20 @@ export class OnsenClient {
   }
   /** one sync pass now unless one is running (then another follows it) or a backoff is pending; `force` ignores the backoff (tests) */
   async syncNow(force = false): Promise<void> {
+    const jobs = [this.syncFifo(force)]
+    for (const claim of Object.keys(this.scheduled)) {
+      let flight = this.scheduledFlights.get(claim)
+      if (!flight) {
+        flight = this.syncScheduled(claim, force)
+          .catch(e => this.cfg.log('error', 'onsen: could not sync scheduled result: ' + errText(e)))
+          .finally(() => this.scheduledFlights.delete(claim))
+        this.scheduledFlights.set(claim, flight)
+      }
+      jobs.push(flight)
+    }
+    await Promise.all(jobs)
+  }
+  private async syncFifo(force: boolean): Promise<void> {
     if (this.running) { this.again = true; return }
     if (!force && Date.now() < this.nextTryAt) return
     this.running = true
@@ -845,7 +932,8 @@ export class OnsenClient {
   }
   /** what is still to be sent (bytes after the cursor) */
   pendingBytes(): number {
-    try { return Math.max(0, statSync(this.spool).size - this.readCursor()) } catch { return 0 }
+    const held = Object.keys(this.scheduled).length ? Buffer.byteLength(JSON.stringify(this.scheduled)) : 0
+    try { return held + Math.max(0, statSync(this.spool).size - this.readCursor()) } catch { return held }
   }
   private readCursor(key = 'offset'): number {
     try { const n = Number(JSON.parse(readFileSync(this.cursorFile, 'utf8'))[key]); return Number.isFinite(n) && n >= 0 ? n : 0 } catch { return 0 }
@@ -1079,6 +1167,11 @@ export class OnsenClient {
         // The FIFO cursor can now pass a report acknowledged ahead of a stuck record.
         if (t.end <= this.reportedThrough) { this.writeCursor(t.end); i++; continue }
         const line = t.line.r
+        if (line.body.outcome === 'completed' && this.scheduled[scheduleKey(line.item_id, line.body.claim_id)]?.completion) {
+          this.writeCursor(this.readCursor(), t.end)
+          this.itemReports = Math.max(0, this.itemReports - 1)
+          i++; continue
+        }
         // A C6 spool may outlive both its local claim and take mode. Migrate its wire body even without a watcher.
         const sid = line.body.session_id
         const body = sid && claudeSessionId(sid) ? { ...line.body, session_id: this.cfg.roamer ? roamerSessionId(this.cfg.agent, sid) : 'main' } : line.body
@@ -1100,6 +1193,10 @@ export class OnsenClient {
             return this.failStatus(r, path)
           }
         }
+        if (ok && r.json?.data?.state !== 'claimed' && body.outcome !== 'completed') {
+          const key = scheduleKey(line.item_id, body.claim_id)
+          if (this.scheduled[key]) { delete this.scheduled[key]; this.scheduledRetry.delete(key); this.saveScheduled() }
+        }
         if (ok) this.itemWrites.observe(r.json?.data)
         this.itemAck?.(line, ok, ok ? r.json?.data : undefined)
         this.writeCursor(this.readCursor(), t.end)
@@ -1109,6 +1206,7 @@ export class OnsenClient {
       if (t.line.k === 'c') {
         const c = t.line.r
         if ('run_id' in c) {
+          if (this.legacyResults.delete(c.idem)) { this.writeCursor(t.end); i++; continue }
           const r = await this.putScheduled(c, cred)
           if (r.status < 200 || r.status >= 300) {
             if (r.status >= 400 && r.status < 500 && this.refusedReportEnd !== t.end) {

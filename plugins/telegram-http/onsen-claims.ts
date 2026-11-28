@@ -10,7 +10,7 @@ const week = 7 * 86400_000
 type Claim = {
   claim_id: string; taken_at: string; session_id?: string; in_session_at?: string; last_outcome?: Outcome
   turn?: string; registry_session?: string; conversation?: string; message_id?: string; replies?: string[]
-  intakeAt?: string; target?: ReceivingTarget
+  scheduled?: boolean; intakeAt?: string; target?: ReceivingTarget
   stop?: { turn: string; at: number }
 }
 // Away from a target the registry still supplies its status. Only its own transcript can supply a turn.
@@ -98,6 +98,10 @@ export class Claims implements ClaimStore {
     this.pollOffset = offset
   }
   held(): string[] { return Object.keys(this.rows) }
+  claimForTurn(id: string, turn: string): string | undefined {
+    const row = this.rows[id]
+    return row?.turn === turn ? row.claim_id : undefined
+  }
   owns(id: string): boolean {
     const row = this.rows[id]
     return !!row && (!row.last_outcome || intermediate.has(row.last_outcome))
@@ -168,7 +172,7 @@ export class Claims implements ClaimStore {
     const claim = row.claim!
     if (this.rows[row.id]?.claim_id === claim.id) return
     const message = row.message_id ?? row.payload?.message_id
-    this.rows[row.id] = { claim_id: claim.id, taken_at: claim.taken_at, conversation: ref.conversation, target: ref.target,
+    this.rows[row.id] = { claim_id: claim.id, taken_at: claim.taken_at, conversation: ref.conversation, target: ref.target, ...(row.kind === 'schedule' ? { scheduled: true } : {}),
       ...(message != null ? { message_id: String(message) } : {}) }
     this.save(); this.clock(row.id); this.changed()
   }
@@ -208,7 +212,7 @@ export class Claims implements ClaimStore {
     const body = { claim_id: row.claim_id, outcome, at: new Date(this.now()).toISOString(),
       ...(row.session_id ? { session_id: row.session_id } : {}),
       ...(outcome === 'completed' && (row.replies || row.registry_session) ? { response_message_ids: row.replies ?? [] } : {}), ...fields }
-    const line: ItemReport = { item_id: id, body }
+    const line: ItemReport = { item_id: id, body, ...(row.scheduled && outcome === 'completed' ? { waitForResult: true as const } : {}) }
     if (outcome === 'in_session' && row.turn) line.binding = { turn: row.turn, registry_session: row.registry_session }
     if (!this.spool.recordItemReport(line)) throw new Error('could not spool item report for ' + id)
     this.replay(line)

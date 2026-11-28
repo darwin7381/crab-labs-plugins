@@ -7932,11 +7932,13 @@ export async function completeRun(tok: RunTok, runId: string, outcome: string, n
     return { ok: false, leftForMain: true, text: leftForMainText(runId) }
   }
   if (takingItems()) {
-    const event = runEvents(queue.get(tok.evId)).find(ev => ev.item_kind === 'scheduled' && String(ev.meta?.run_id) === runId)
+    const event = runEvents(queue.get(tok.evId)).find(ev => ev.item_kind === 'scheduled' && runOf(ev.refs, ev.meta?.run_id) === runId)
     const text = stripMarkup((via === 'receipt' && tok.receipt?.text) || String(note ?? ''))
     const normalized = btccOutcome(outcome)
     const result = scheduledResult(normalized === 'nothing-to-do' ? 'nothing_to_do' : normalized, text, steps)
-    const ok = D.recordScheduleResult?.({ event: event?.id ?? tok.evId, call_id: event?.call_id ?? null, run_id: runId,
+    const item = event?.onsen_items?.find(ref => ref.kind === 'schedule')
+    const claim = item && itemReceiver?.claims.claimForTurn(item.onsen_item_id, tok.runId)
+    const ok = D.recordScheduleResult?.({ ...(item && claim ? { claim: { item_id: item.onsen_item_id, claim_id: claim } } : {}), event: event?.id ?? tok.evId, call_id: event?.call_id ?? null, run_id: runId,
       idem: `call:run:${runId}:result`, body: { result } }) ?? false
     return { ok, text: ok ? `Call result queued for scheduler run ${runId}.` : `Could not queue the Call result for scheduler run ${runId}.` }
   }

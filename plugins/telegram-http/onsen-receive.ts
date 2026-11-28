@@ -7,7 +7,7 @@ export type Outcome = 'in_session' | 'not_taken' | 'completed' | 'owed' | 'backg
   | 'usage_limit' | 'usage_limit_probe' | 'error' | 'cut' | 'cut_person' | 'stopped' | 'stuck' | 'reassigned' | 'superseded'
 export type ReportFields = { response_message_ids?: string[]; retry_after?: string | null
   half_done?: boolean; command_message_id?: string; note?: string }
-export type ItemReport = { item_id: string; binding?: { turn: string; registry_session?: string }
+export type ItemReport = { item_id: string; waitForResult?: true; binding?: { turn: string; registry_session?: string }
   body: { claim_id: string; at: string; outcome: Outcome; session_id?: string } & ReportFields }
 export type ReceiveResult = { given: Set<string>; gone: Set<string>; claimed: Set<string> }
 const empty = (): ReceiveResult => ({ given: new Set(), gone: new Set(), claimed: new Set() })
@@ -16,6 +16,7 @@ export const itemIds = (refs: ItemRef[]) => refs.map(r => r.onsen_item_id)
 export type ClaimStore = {
   restoreMessageIds(journal: Journal): void
   blocked(): boolean
+  claimForTurn(id: string, turn: string): string | undefined
   owns(id: string): boolean
   inSession(id: string): boolean
   completed(id: string): boolean
