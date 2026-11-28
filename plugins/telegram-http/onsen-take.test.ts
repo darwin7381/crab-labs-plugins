@@ -4,8 +4,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
 import { OnsenClient } from './onsen-client.ts'
-import { OnsenInbox, OnsenPuller, switchOn } from './onsen-inbox.ts'
-import { deliveryMode, machineName, takeRefusal, TakeMode } from './onsen-take.ts'
+import { machineName, TakeMode } from './onsen-take.ts'
 import { ItemPeek, itemRef, type InboxItem } from './onsen-items.ts'
 import { Claims } from './onsen-claims.ts'
 import { ItemReceiver } from './onsen-receive.ts'
@@ -62,102 +61,21 @@ async function mainRig() {
     owing(value: boolean) { owes = value } }
 }
 
-test('switch, prerequisites, stable machine/member and all probe refusals', async () => {
+test('a pull member retries only the Item probe and starts when Onsen accepts the connector', async () => {
   const r = rig()
-  expect(switchOn(undefined, 'adam')).toBe(false)
-  expect(r.f.calls).toHaveLength(0)
-  const valid = { inbox: false, roamer: false, lanes: true, record: true, observation: true }
-  for (const key of Object.keys(valid) as Array<keyof typeof valid>) expect(takeRefusal({ ...valid, [key]: !valid[key] })).toBeTruthy()
-  expect(takeRefusal(valid)).toBeUndefined()
   expect(machineName('  --Mac_Mini  ')).toBe('mac-mini')
-  const { path, connector, req } = r.mode
-  for (const status of [400, 404, 409]) { r.f.mode(status); expect(await deliveryMode(req, path, connector)).toBe('pull') }
-  expect(await deliveryMode(async () => { throw Error('offline') }, path, connector)).toBe('pull')
-  r.f.mode(200); await r.mode.probe()
-  expect(r.mode.active).toBe(true)
-  expect(r.f.calls.every(c => c.query.get('connector') === 'mac-mini/adam' && c.query.get('limit') === '1')).toBe(true)
-})
-
-test('agent-inbox reports a pause once, including first start, and can resume pull', async () => {
-  const r = rig(), inbox = new OnsenInbox({ file: join(r.dir, 'inbox.json') })
-  const pull = new OnsenPuller({ inbox, base: r.f.base, req: r.client.request.bind(r.client), takeEnabled: true, host: 'mac-mini',
-    deliver: async () => 'delivered', log: (_lv, m) => r.logs.push(m) })
-  await pull.once(); await pull.once()
-  expect(r.logs.filter(s => s.includes('member is on take'))).toHaveLength(1)
-  expect(inbox.based).toBe(false)
-  r.f.mode(409); await pull.once()
-  expect(inbox.based).toBe(true)
-  expect(r.logs.filter(s => s.includes('on pull again'))).toHaveLength(1)
-})
-
-test('a 409 hands on locally held pull items and acks the delivered prefix before pausing', async () => {
-  const r = rig(), inbox = new OnsenInbox({ file: join(r.dir, 'inbox.json') })
-  const legacy = ['first', 'middle', 'last'].map(id => r.f.add(id, 'call'))
-  const ready = new Set<string>(), trace: string[] = []
-  const pull = new OnsenPuller({ inbox, base: r.f.base, takeEnabled: true, host: 'mac-mini', now: r.f.now,
-    req: async (...args) => {
-      const reply = await r.client.request(...args)
-      if (reply?.status === 409) trace.push('409')
-      return reply
-    },
-    deliver: async it => {
-      const text = String(it.payload.text)
-      if (!ready.has(text)) return 'later'
-      trace.push(text)
-      return 'delivered'
-    },
-    log: (_lv, line) => { if (line.includes('member is on take')) trace.push('pause at ' + inbox.ackedSeq) } })
-  const acks = () => r.f.calls.filter(c => c.path === '/inbox/ack').map(c => c.body)
-  r.f.mode(409) // old pull works until the member switches to take
-  await pull.once(); await pull.once()
-  expect(inbox.pending.map(it => it.seq)).toEqual(legacy.map(it => it.number))
-  expect(acks()).toEqual([])
-
-  r.f.mode(200)
-  const fresh = r.f.add('new', 'call')
-  ready.add('first'); ready.add('last')
-  await pull.once()
-  expect(trace).toEqual(['409', 'first', 'last', 'pause at 1'])
-  expect(inbox.pending.map(it => it.seq)).toEqual([2])
-  expect(acks()).toEqual([{ upto: 1 }])
-
-  ready.add('middle')
-  r.f.advance(60_000)
-  await pull.once(); await pull.once()
-  expect(trace).toEqual(['409', 'first', 'last', 'pause at 1', 'middle', '409', '409'])
-  expect(inbox.pending).toEqual([])
-  expect(acks()).toEqual([{ upto: 1 }, { upto: 3 }])
-  await r.mode.probe()
-  const page = (await r.mode.req('GET', r.mode.path + '?state=waiting&connector=' + encodeURIComponent(r.mode.connector)))!.json
-  expect(page.items.map((it: InboxItem) => it.id)).toEqual([fresh.id])
-  expect([...(await r.receiver.receive([...legacy, fresh].map(itemRef))).given]).toEqual([fresh.id])
-})
-
-test('an interrupted ack on a first-start 409 is retried after restart without repeating the hand-off', async () => {
-  const r = rig(), file = join(r.dir, 'inbox.json'), handed: number[] = []
-  r.f.mode(409)
-  const row = r.f.add('pending', 'call')
-  const old = await r.client.request('GET', '/inbox?after=0&wait=0&limit=1')
-  const inbox = new OnsenInbox({ file })
-  inbox.take(old!.json.items)
-  expect(inbox.based).toBe(false)
-  const puller = (local: OnsenInbox) => new OnsenPuller({ inbox: local, base: r.f.base, takeEnabled: true, host: 'mac-mini',
-    req: r.client.request.bind(r.client), log: (_lv, line) => r.logs.push(line),
-    deliver: async it => { handed.push(it.seq); r.f.down(true); return 'delivered' } })
-
-  r.f.mode(200)
-  await expect(puller(inbox).once()).rejects.toThrow('ack 1: HTTP 503')
-  expect(r.logs.some(line => line.includes('member is on take'))).toBe(false)
-  const restored = new OnsenInbox({ file })
-  expect(restored.pending).toEqual([])
-  expect(restored.ackedSeq).toBe(0)
-  r.f.down(false)
-  const resumed = puller(restored)
-  await resumed.once(); await resumed.once()
-  expect(handed).toEqual([row.number])
-  expect(restored.ackedSeq).toBe(row.number)
-  expect(row.state).toBe('completed')
-  expect(r.f.calls.filter(c => c.path === '/inbox/ack').map(c => c.body)).toEqual([{ upto: 1 }, { upto: 1 }])
+  let retry!: () => void, interval = 0
+  const mode = new TakeMode('adam', r.mode.req, () => {}, line => r.logs.push(line), 'mac-mini', (fn, ms) => {
+    retry = fn; interval = ms
+    return setTimeout(() => {}, ms).unref()
+  })
+  clean.push(() => mode.stop())
+  r.f.mode(409); await mode.probe()
+  expect(mode.active).toBe(false)
+  expect(interval).toBe(60_000)
+  expect(r.logs.some(l => l.includes('not_take_member'))).toBe(true)
+  r.f.mode(200); retry(); await until(() => mode.active)
+  expect(r.f.calls.map(c => [c.path, c.query.get('connector')])).toEqual(Array(2).fill([mode.path, 'mac-mini/adam']))
 })
 
 test('peek waits without claiming and reads a gated row again on release', async () => {
@@ -346,7 +264,7 @@ test('a foreign connector pauses all receives for 45 s and keeps the observation
   })
   clean.push(() => mode.stop())
   await mode.probe(); r.f.advance(45_001)
-  await deliveryMode(mode.req, mode.path, 'other/adam')
+  await mode.req('GET', mode.path + '?connector=other%2Fadam&limit=1')
   const receiver = new ItemReceiver(mode, r.claims, () => {}), row = r.f.add('ownership')
   await receiver.receive([itemRef(row)])
   expect(interval).toBe(45_000); expect(mode.active).toBe(false); expect(mode.observationRequired).toBe(true)

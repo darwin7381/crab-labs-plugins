@@ -55,7 +55,6 @@ plugins/telegram-http/inbox-text.ts::send_to_agent：找別隻 agent 只有這�
 plugins/telegram-http/fleet-mail.ts::export async function sendToAgent
 plugins/telegram-http/channel-bot-control.ts::hooks.afterClear(ok)
 plugins/telegram-http/server.ts::reply, { ...connectorClearHooks(chat, ref,
-plugins/telegram-http/server.ts::await deliverEditedMessage(m, [String(p.message_id)])
 plugins/telegram-http/onsen-client.ts::async drawLine(
 plugins/telegram-http/server.ts::onsenFacts.delivered(chat_id, msgId)
 plugins/telegram-http/server.ts::Lanes.observeLanes({ journal:
@@ -182,10 +181,7 @@ plugins/telegram-http/lanes.ts::its receipt goes to BTCC /complete (WO-175: the 
 plugins/telegram-http/onsen-status.ts::async receipt(event: string, call: CallRef
 plugins/telegram-http/onsen-client.ts::callFate(idem: string, ms = CALL_RECEIPT_WAIT_MS)
 plugins/telegram-http/server.ts::onsen.recordCall(line) }, client: onsen })
-plugins/telegram-http/lanes-wake-rules.json::"id": "mention",
 plugins/telegram-http/lanes.ts::if (batchRule(v.rule, cfg)) return { id, match: {}, to: 'main', batch: true }
-plugins/telegram-http/server.ts::if (it.kind === 'mention' && !(typeof p.text === 'string' && p.text.trim())) p.text = mentionItemText(it)
-plugins/telegram-http/wake-decide.ts::'lane_exit', 'own', 'mention', 'other'] as const
 plugins/telegram-http/lanes-threads.ts::return clip80(topic ? `${who} 私訊／${String(it.topic_name ?? '').trim() || `#${topic}`}` : `${who} 私訊`)
 plugins/telegram-http/lanes.ts::export function refreshDmTitles(): number {
 plugins/telegram-http/server.ts::const dmPerson = (chat: string): string | null => dmNames.personOf(chat)
@@ -197,36 +193,13 @@ plugins/telegram-http/onsen-files.ts::export function filesOn(value: string | un
 plugins/telegram-http/onsen-client.ts::recordWithFiles(item: OnsenItem, upload: () => Promise<string[]>): void {
 plugins/telegram-http/onsen-client.ts::const items = await this.withFiles(run.map(x => x.line))
 plugins/telegram-http/onsen-client.ts::const s = await this.withoutFiles(run[k]!.line, items[k]!, said, cred)
-plugins/telegram-http/onsen-first.ts::export function firstOn(value: string | undefined, agent: string): boolean {
-plugins/telegram-http/onsen-first.ts::export const idemPre = (agent: string, chat: string): string => `tg:${agent}:${chat}:out:pre:${randomUUID()}`
-plugins/telegram-http/onsen-first.ts::export const NOT_TAKEN = 'Onsen 沒收下，這一則沒有送出'
-plugins/telegram-http/onsen-first.ts::const r = await this.o.request('GET', '/v1/meta', undefined, 5_000)
-plugins/telegram-http/onsen-client.ts::recordDeliveryReport(messageId: number, body: DeliveryReportLine['body']): boolean {
-plugins/telegram-http/onsen-client.ts::const r = await this.post(`/messages/${encodeURIComponent(String(mid))}/delivery`, body, cred)
 plugins/telegram-http/lanes.ts::if ((e as any)?.heldInOnsen === true) { if (held) held.said = String((e as Error).message)
-plugins/telegram-http/onsen-inbound.ts::export const heldText = (agent: string): string => `Onsen 現在連不上，這一則還沒交給 ${agent}；連上會自動補交，不用重傳。`
-plugins/telegram-http/onsen-inbound.ts::export function inboundOn(value: string | undefined, agent: string): boolean {
-plugins/telegram-http/onsen-inbound.ts::const r = await this.o.request('POST', isEvent(job) ? '/events' : '/messages', isEvent(job) ? job.event : job.item, this.o.tryMs ?? TRY_MS)
-plugins/telegram-http/server.ts::ONSEN_INBOUND: fleetConfigApplied.includes('ONSEN_INBOUND') ? undefined : process.env.ONSEN_INBOUND
 plugins/telegram-http/roamer-telegram.ts::await h.finishInbound(this.inboundFacts(ctx, text, image, attachment, attachmentFromReply, voiceTranscript, inTopic), { imagePath, imageError })
-plugins/telegram-http/server.ts::if (it.kind === 'person_message' || it.kind === 'person_edit') return personPulled(it, again)
-plugins/telegram-http/server.ts::const r = await fetch(`http://127.0.0.1:${port}/onsen/person`
-plugins/telegram-http/server.ts::if (!INBOX_ONLY && u.pathname === '/onsen/person' && req.method === 'POST') {
-plugins/telegram-http/server.ts::await deliverFormAnswer(fi, it.item?.main || !await onsenInboundNow() ? 'main' : 'rules', [String(p.message_id)]
-plugins/telegram-http/onsen-inbound.ts::export const BACK_MS = 20_000
-plugins/telegram-http/onsen-inbound.ts::after(of: string, event: Record<string, unknown>): boolean {
-plugins/telegram-http/server.ts::const INBOUND_BACK_MS = Number(process.env.ONSEN_INBOUND_BACK_MS) || OnsenInbound.BACK_MS
-plugins/telegram-http/server.ts::async function inboundBack(key: string, onsenId: number | null, tries: number): Promise<void> {
-plugins/telegram-http/server.ts::for (const k of left) inboundBackLater(k, null)
-plugins/telegram-http/server.ts::if (personBusy.has(own) || (!edit && personBusy.has(key))) return { code: 409, json: { busy: true } }
 plugins/telegram-http/onsen-inbox.ts::export type HandResult = 'delivered' | 'duplicate' | 'undelivered' | 'later'
 plugins/telegram-http/onsen-inbox.ts::if (!retryHeld && due != null && due > this.now()) { i++; continue }
-plugins/telegram-http/server.ts::  return 'later'
 plugins/telegram-http/server.ts::function pageReplyMeta(r: NonNullable<OnsenVisible.FormItem['reply_to']>): Record<string, string> {
 plugins/telegram-http/server.ts::if (it.say && it.reply_to && typeof it.reply_to === 'object') Object.assign(meta, pageReplyMeta(it.reply_to))
 plugins/telegram-http/server.ts::...(p.reply_to && typeof p.reply_to === 'object' ? { reply_to: p.reply_to } : {}) }
-plugins/telegram-http/onsen-inbound.ts::export const hasInboxPartner = (env: Record<string, string | undefined>): boolean => Number(env.LANES_INBOX_PORT ?? 0) > 0
-plugins/telegram-http/server.ts::return OnsenInbound.inboundEffective(v, ONSEN_AGENT, INBOX_PARTNER)
 plugins/telegram-http/onsen-connector.ts::export class BridgeSwitch {
 plugins/telegram-http/onsen-connector.ts::async waitReport(id: string, conv: string): Promise<Said> {
 plugins/telegram-http/onsen-connector.ts::`/v1/conversations/${cid}/messages/by-client-id/${encodeURIComponent(s)}`
@@ -237,10 +210,8 @@ plugins/telegram-http/server.ts::void reportCommands().catch(() => {})
 plugins/telegram-http/server.ts::async function connectorReply(o: { chat: string; sender: string; text: string; redact: Array<[string, string]>; rich: boolean; files: string[]
 plugins/telegram-http/server.ts::if (!Connector.reactionOk(emoji)) throw new Error(`setMessageReaction: 400 Bad Request: REACTION_INVALID
 plugins/telegram-http/server.ts::await connectorSay!.edit(String(args.chat_id), String(args.message_id ?? ''), String(args.text ?? ''))
-plugins/telegram-http/server.ts::if (r.held || !r.ids.length) throw new OnsenFirst.HeldInOnsen(
 plugins/telegram-http/server.ts::agent: CONNECTOR_AGENT,
 plugins/telegram-http/server.ts::async function connectorFile(fileId: string): Promise<string> {
-plugins/telegram-http/server.ts::if (!c && CONNECTOR && p.conversation_id != null && p.message_id != null) c = { chat: `onsen:${p.conversation_id}`
 plugins/telegram-http/onsen-inbound.ts::export function clientMetaOf(client: unknown): Record<string, string> | null {
 plugins/telegram-http/onsen-inbound.ts::export const TG_OWN_FILE_NAME = /^file_\d+(\.[A-Za-z0-9]+)?$/
 plugins/telegram-http/server.ts::...(a.mime && !sticker ? { mime: String(a.mime) } : {}), ...(name && !sticker ? { name } : {}) } } : {}),
@@ -279,10 +250,6 @@ plugins/telegram-http/onsen-client.ts::get on(): boolean { const v = this.o.on; 
 plugins/telegram-http/onsen-connector-actions-daemon.test.ts::no ONSEN_BRIDGE (the machine config names someone else), ONSEN_ACTIONS=0: a connector all the same
 plugins/telegram-http/server.ts::const OFFICER_ON_SCREEN = 'on the screen by the duty officer'
 plugins/telegram-http/onsen-client.ts::resolved ${option_id} by ${who} (pressed ${where})
-plugins/telegram-http/server.ts::const albumHeld = new Map<string, string>()
-plugins/telegram-http/server.ts::if (!await finishInbound(f, 'onsen', undefined, [key, own])) inboundStore.finish([key, own])
-plugins/telegram-http/server.ts::if (entry.keys.length) inboundStore?.finish(entry.keys)
-plugins/telegram-http/server.ts::function restartAlbumItems(chat: string, mgid: string): void {
 plugins/telegram-http/onsen-inbound.ts::export const albumItem = (f: Pick<Facts, 'mgid' | 'image' | 'attachment' | 'fromReply'>): boolean =>
 plugins/telegram-http/onsen-album-restart-daemon.test.ts::killed while their photos are fetched; restarted: one tag with the three, once
 plugins/telegram-http/startup-picker.ts::hot?: () => Iterable<string>
@@ -314,7 +281,6 @@ plugins/telegram-http/roamer-telegram.ts::private checkApprovals(): void {
 plugins/telegram-http/onsen-connector.ts::export const MEMBER_CHAT = /^member:([a-z0-9][a-z0-9_.-]{0,63})$/
 plugins/telegram-http/onsen-connector.ts::export function withoutOnsenLabel(text: string, sender: string, agent: string, kindName: (k: string) => string): string {
 plugins/telegram-http/onsen-connector-seg2-daemon.test.ts::the line by conversation_id at the /clear
-plugins/telegram-http/server.ts::async function albumHeldItems(entry: AlbumEntry, key: string): Promise<void> {
 plugins/telegram-http/server.ts::if (count != null) entry.expect = Math.max(entry.expect ?? 0, count)
 plugins/telegram-http/onsen-connector.ts::fresh(): boolean { this.at = -Infinity; return this.on() }
 plugins/telegram-http/onsen-connector.ts::const open = label.slice(0, -1) + '｜'
@@ -402,3 +368,9 @@ plugins/telegram-http/server.ts::/api/fleet/main-registry
 plugins/telegram-http/lanes-main.ts::resume_sent: cut.at
 plugins/telegram-http/lanes-main.ts::const probe = g?.state === 'walled' && (clear ?? 0) > Number(g.uw_clear_used ?? 0)
 plugins/telegram-http/lanes-main.ts::undelivered_since: previous?.undelivered_since ?? null
+# WO-213 C7: one Item receiver, including forms, and the connector's retry on refusal.
+plugins/telegram-http/server.ts::await receivePerson(payload, item)
+plugins/telegram-http/server.ts::await deliverFormAnswer(fi, item.main ? 'main' : 'rules'
+plugins/telegram-http/onsen-take.ts::code === 'not_current_connector' ? 45_000 : 60_000
+plugins/telegram-http/onsen-connector.ts::export class HeldInOnsen extends Error
+plugins/telegram-http/onsen-take-daemon.test.ts::the old hand-over routes and local stores are gone

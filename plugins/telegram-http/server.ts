@@ -67,9 +67,9 @@ import { ScreenStatus, Since, composeRecord, isVerdictMenu, judgeFor, screenJudg
 import { Claims } from './onsen-claims.ts'
 import { ItemReceiver } from './onsen-receive.ts'
 import { ItemPeek, itemRef, type ItemRef, type InboxItem } from './onsen-items.ts'
-import { machineName, takeRefusal, TakeMode } from './onsen-take.ts'
+import { machineName, TakeMode } from './onsen-take.ts'
 import { ObservationPut } from './onsen-observation.ts'
-import { MentionCards, mentionItemText } from './onsen-mentions.ts'
+import { MentionCards } from './onsen-mentions.ts'
 import { JevJudge, QUESTIONS_PATH_DEFAULT } from './screen-judge-jev.ts'
 import { jevAsk, jevKey, jevLog } from './lanes-triage.ts'
 import { LocalKeepwarm, SENDER as SENDER_KEEPWARM } from './keepwarm-local.ts'
@@ -82,15 +82,14 @@ import { topicLink } from './lanes-topics.ts'
 import { startStartupPickerWatchdog, handleStartupPickerCallback, capturePane, detectStartupPicker, driveStartupPicker, rearmStartupPicker, useLanesMenuRules, permissionShaped, type DetectedPicker, type PickerTarget } from './startup-picker.ts'
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
 import { expandHiddenEntities } from './entities.ts'
-import { FORWARDERS, bearerIdentity, claimedIdentity, loadTable, readCredentialFile, readOwnCredential, resolveInbound, verdictMeta, type Verdict } from './mesh-identity.ts'
-import { OnsenInbox, OnsenPuller, OnsenSender, dedupeKeyOf, isMailboxInject, itemKey, recipientNote, switchOn, type HandResult, type PullItem } from './onsen-inbox.ts'
+import { bearerIdentity, claimedIdentity, loadTable, readCredentialFile, readOwnCredential, resolveInbound, verdictMeta, type Verdict } from './mesh-identity.ts'
+import { OnsenSender, isMailboxInject, recipientNote, switchOn } from './onsen-inbox.ts'
 import * as Onsen from './onsen-client.ts'
 import * as OnsenEdit from './onsen-edit.ts'
 import * as OnsenStatus from './onsen-status.ts'
 import * as OnsenVisible from './onsen-visible.ts'
 import * as OnsenAttach from './onsen-attachments.ts'
 import * as OnsenFiles from './onsen-files.ts'
-import * as OnsenFirst from './onsen-first.ts'
 import * as OnsenInbound from './onsen-inbound.ts'
 import * as Connector from './onsen-connector.ts'
 // WO-197 final (1.59.0): the code that talks to Telegram is roamer-telegram.ts, loaded (dynamic import) only by a roamer: never imported here
@@ -354,17 +353,15 @@ const onsen: Onsen.OnsenClient | null = INBOX_ONLY ? null : new Onsen.OnsenClien
   credential: () => readCredentialFile(ONSEN_CRED_FILE), credentialWhere: ONSEN_CRED_FILE, log,
   joeyChat: () => { try { return String(loadAccess().allowFrom[0] ?? '') } catch { return '' } },
 })
-const ONSEN_TAKE_ON = switchOn(process.env.ONSEN_TAKE, ONSEN_AGENT)
 let takeMode: TakeMode | undefined
 let itemPeek: ItemPeek | undefined
 let itemReceiver: ItemReceiver | undefined
 let itemClaims: Claims | undefined
 let registryStatusChanged: (() => void) | undefined
-if (ONSEN_TAKE_ON) {
-  const reason = takeRefusal({ inbox: INBOX_ONLY, roamer: ROAMER, lanes: Lanes.LANES_ON, record: !!onsen?.cfg.record,
-    observation: switchOn(process.env.ONSEN_OBSERVATION, ONSEN_AGENT) })
-  if (reason) log('info', `onsen take: staying on pull: ${reason}`)
-  else if (onsen) {
+if (CONNECTOR && onsen) {
+  if (!Lanes.LANES_ON || !onsen.cfg.record) {
+    log('warn', 'onsen take: receiving requires lanes and recording')
+  } else {
     takeMode = new TakeMode(ONSEN_AGENT, (m, p, b, t, h, signal) => onsen.request(m, p, b, t, h, signal),
       active => { if (active) { itemClaims!.start(); itemPeek!.reset() } else itemPeek!.stop(); registryStatusChanged?.() }, line => log('info', line))
     itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, Lanes.offerMissed, () => registryStatusChanged?.())
@@ -408,11 +405,6 @@ async function formLinks(chat: string, text: string, who: string): Promise<{ tex
   }
 }
 const onsenUpload: OnsenFiles.Upload = (bytes, o) => onsen ? onsen.uploadFile(bytes, o) : Promise.resolve({ error: 'Onsen is off here' })
-/** WO-192 (onsen-first.ts): Onsen's version, read the first time it is needed (onsenInboundNow: a page message's route), then every 10 min (recording
- *  on, the Telegram daemon) */
-const onsenVersion: OnsenFirst.OnsenVersion | null = onsen && onsen.cfg.record && !INBOX_ONLY
-  ? new OnsenFirst.OnsenVersion({ request: (m, p, b, t) => onsen!.request(m, p, b, t), log }) : null
-/** tests only: a comma list of waits in ms (ONSEN_BRIDGE_RETRY_MS, ONSEN_INBOUND_RETRY_MS) */
 const msList = (v: string | undefined): number[] | undefined => { const l = String(v ?? '').split(',').map(x => Number(x.trim())).filter(x => Number.isFinite(x) && x >= 0); return l.length ? l : undefined }
 /** WO-197 (onsen-connector.ts): the connector's way into Onsen: the agent's Telegram numbers turned into Onsen's ids (asked, cached), what it says
  *  written with conversation_id and the bridge's report waited for (ONSEN_BRIDGE_WAIT_MS, 3 s); ONSEN_BRIDGE_RETRY_MS (tests) the write's retries */
@@ -674,94 +666,11 @@ async function connectorThreadLink(chat: string, thread: number): Promise<string
   }
   return `${Onsen.onsenBase(process.env).replace(/\/api\/onsen$/, '')}/onsen/next/#/conversation/${cid}`
 }
-/** WO-194 (onsen-inbound.ts; ONSEN_INBOUND: a comma list of agent names or `*`; unset, empty or 0 = off; the plist, else the machine config read again at
- *  most every 30 s). 1.59.0: no Telegram message is written into Onsen here any more (a connector's come from the bridge, a roamer records nothing): the
- *  switch now decides only how a page message (via web) that comes back from Onsen is routed (personArrived: the router's rules, else the main).
- *  Recording on, the Telegram daemon, and Onsen ≥ 0.33.0 (the version read the first time it is asked, then every 10 min) */
-/** WO-197: ONSEN_INBOUND names this agent AND it has an agent-inbox partner (LANES_INBOX_PORT; a roamer has none: off whatever the list says) */
-const INBOX_PARTNER = OnsenInbound.hasInboxPartner(process.env)
-let inboundNoPartnerSaid = false
-function inboundSwitch(): boolean {
-  const v = liveSetting('ONSEN_INBOUND')
-  if (!INBOX_PARTNER && OnsenInbound.inboundOn(v, ONSEN_AGENT) && !inboundNoPartnerSaid) {
-    inboundNoPartnerSaid = true
-    log('info', 'onsen inbound: ONSEN_INBOUND names this agent but it has no agent-inbox daemon (LANES_INBOX_PORT unset): off here (the path before)')
-  }
-  return OnsenInbound.inboundEffective(v, ONSEN_AGENT, INBOX_PARTNER)
-}
-async function onsenInboundNow(): Promise<boolean> {
-  try {
-    if (!onsen?.cfg.record || INBOX_ONLY || !onsenVersion || !inboundSwitch()) return false
-    onsenVersion.start()
-    await onsenVersion.ensure(3_000)
-    return onsenVersion.version != null && OnsenFirst.versionAtLeast(onsenVersion.version, OnsenInbound.MIN_ONSEN)
-  } catch { return false }
-}
-/** WO-194: the facts each message's tag is built from, kept until its person_message comes back (and what was delivered, so nothing is twice) */
-const inboundStore: OnsenInbound.InboundStore | null = onsen && !INBOX_ONLY ? new OnsenInbound.InboundStore({ file: join(STATE_DIR, 'onsen', 'inbound-store.json'), log }) : null
-/** WO-197 (Chiron mesh 12852): an album item's kept-facts key → its album, while the album waits: the inbox handing the item again, or A.1, finds it
- *  here (delivered with its album, never a second time); its facts stay on disk until then, so a daemon stopped before the album goes delivers it after
- *  its restart (A.1's restart path) */
-const albumHeld = new Map<string, string>()
-/** WO-194 A.1 (Chiron 11:35Z): a message written into Onsen and not back from the inbox BACK_MS (20 s) after (its agent-inbox daemon down or not
- *  pulling): delivered here once from the facts it kept (finishInbound, the tag of the path before); the store remembers it, so the person_message
- *  that comes back later is a duplicate. One log line each. ONSEN_INBOUND_BACK_MS: tests only */
-const INBOUND_BACK_MS = Number(process.env.ONSEN_INBOUND_BACK_MS) || OnsenInbound.BACK_MS
-const INBOUND_BACK_TRIES = 10
-/** the keys A.1 delivered here (for the log line of the late person_message) */
-const deliveredHere = new Set<string>()
-function inboundBackLater(key: string, onsenId: number | null, tries = 0): void {
-  const t = setTimeout(() => { void inboundBack(key, onsenId, tries) }, INBOUND_BACK_MS); (t as any).unref?.()
-}
-async function inboundBack(key: string, onsenId: number | null, tries: number): Promise<void> {
-  if (!inboundStore || inboundStore.isDone(key)) return
-  if (personBusy.has(key)) { inboundBackLater(key, onsenId, tries); return }     // coming back from the inbox right now: looked at again later
-  if (albumHeld.has(key)) return                                                 // WO-197: back already, waiting in its album (finished when it goes)
-  const f = inboundStore.get(key)
-  if (!f) return
-  personBusy.add(key)
-  try {
-    log('warn', `onsen inbound: ${key} not back from the inbox ${Math.round(INBOUND_BACK_MS / 1000)} s after it was written into Onsen${onsenId != null ? ` (message ${onsenId})` : ''}: delivered here from the facts it kept`)
-    const keys = [key, ...(onsenId != null ? [`pm:${onsenId}`] : [])]
-    if (!await finishInbound(f, 'local', undefined, keys)) inboundStore.finish(keys)   // WO-197: an album item's keys are finished when its album goes
-    inboundStore.stats.here++
-    deliveredHere.add(key)
-    if (deliveredHere.size > 200) deliveredHere.delete(deliveredHere.values().next().value!)
-  } catch (e) {
-    log('error', `onsen inbound: delivering ${key} here (not back from the inbox) failed: ${e instanceof Error ? e.message : e}${tries + 1 < INBOUND_BACK_TRIES ? '; trying again' : ''}`)
-    if (tries + 1 < INBOUND_BACK_TRIES) inboundBackLater(key, onsenId, tries + 1)
-  } finally { personBusy.delete(key) }
-}
-/** WO-197 (Chiron mesh 12852): the album items kept from before the last stop and not delivered yet (A.1's restart path delivers them 20 s after the
- *  start). An item of the same album handed over before that pulls them into its album now (restartAlbumItems), so the album is one tag */
-const restartLeft = new Set<string>()
-function restartAlbumItems(chat: string, mgid: string): void {
-  for (const k of [...restartLeft]) {
-    const f = inboundStore?.get(k)
-    if (!f || inboundStore!.isDone(k) || albumHeld.has(k)) { restartLeft.delete(k); continue }
-    if (f.chat_id !== chat || f.mgid !== mgid || !OnsenInbound.albumItem(f) || personBusy.has(k)) continue
-    restartLeft.delete(k)
-    log('info', `onsen inbound: ${k}, kept from before the last stop, joins its album now (another item of it came)`)
-    void finishInbound(f, 'local', undefined, [k]).then(inAlbum => { if (!inAlbum) inboundStore!.finish([k]) })
-      .catch(e => log('error', `onsen inbound: delivering ${k} here: ${e instanceof Error ? e.message : e}`))
-  }
-}
-// A.1 after a restart: what was kept before it and has not been delivered is looked at 20 s after the start
-if (inboundStore) {
-  const left = inboundStore.waiting()
-  for (const k of left) if (OnsenInbound.albumItem(inboundStore.get(k) ?? { fromReply: false })) restartLeft.add(k)
-  // WO-197 (Chiron mesh 12852): an album item back from Onsen keeps its facts until its album is delivered, so a daemon that stopped between the two
-  // (a fleet version change restarts every daemon) delivers it here, once, with the rest of its album
-  const albums = left.filter(k => OnsenInbound.albumItem(inboundStore!.get(k) ?? { fromReply: false })).length
-  if (left.length) log('info', `onsen inbound: ${left.length} message(s) kept from before the last stop and not delivered yet${albums ? ` (${albums} album item(s) whose album did not go)` : ''}: delivered here in ${Math.round(INBOUND_BACK_MS / 1000)} s unless they come back first`)
-  for (const k of left) inboundBackLater(k, null)
-}
 // Onsen step 3 (WO-143): delivery facts (delivered / seen / turn_end of Joey's messages) and the main's status, recorded only (onsen-status.ts). Set up
 // after the lanes are (the block after lanesInit below); null = recording off for this agent, or the agent-inbox daemon.
 let onsenFacts: OnsenStatus.DeliveryFacts | null = null
 let onsenStep3Stop: (() => void) | null = null
 /** WO-145 (ONSEN_FORM_LINKS): the long poll of page answers (set up with step 3); null = off */
-let formInbox: OnsenVisible.FormInbox | null = null
 /** Onsen 1.45.1: an MCP stream opened (sid, its GET): which claude process holds it (the status's not_connected check); null = recording off */
 let onsenPeer: ((sid: string, req: IncomingMessage) => void) | null = null
 let onsenStatusNow: (() => unknown) | null = null
@@ -1678,27 +1587,13 @@ function maybeAutoAckScheduled(runId: string | undefined): void {
   } catch {}
 }
 
-// WO-151 3a / 3b (Relay part 3, onsen-inbox.ts): this agent-inbox daemon takes what is sent to it from Onsen (ONSEN_PULL) and writes its calls there
-// (ONSEN_SEND; WO-158, 1.52.0: only there, no push to the roster url; off = the push, the stop switch). Each switch: a comma list of agent names or
-// `*` (the plist, then the machine config), read at start; one base, ONSEN_BASE (default https://core.kbro.ai/api/onsen); the credential is this
-// daemon's mesh credential. Off: neither runs; only the dedupe keys /inject delivers are
-// recorded (onsen-inbox.json), so that turning ONSEN_PULL on later never hands on again what /inject already delivered.
-const ONSEN_PULL_ON = INBOX_ONLY && switchOn(process.env.ONSEN_PULL, INBOX_SELF)
 const ONSEN_SEND_ON = INBOX_ONLY && switchOn(process.env.ONSEN_SEND, INBOX_SELF)
-const onsenInbox: OnsenInbox | null = INBOX_ONLY ? new OnsenInbox({ file: join(STATE_DIR, 'onsen-inbox.json'), log }) : null
 const ONSEN_INBOX_BASE = Onsen.onsenBase(process.env)
-const onsenReq = ONSEN_PULL_ON || ONSEN_SEND_ON ? (() => {
+const onsenReq = ONSEN_SEND_ON ? (() => {
   const c = new Onsen.OnsenClient({ dir: join(STATE_DIR, 'onsen'), base: ONSEN_INBOX_BASE, agent: INBOX_SELF, record: false, credential: () => readOwnCredential(STATE_DIR), log })
   return (m: 'GET' | 'POST', path: string, b?: unknown, t?: number) => c.request(m, path, b, t)
 })() : null
-const onsenPuller: OnsenPuller | null = ONSEN_PULL_ON && onsenReq && onsenInbox ? new OnsenPuller({ takeEnabled: ONSEN_TAKE_ON, req: onsenReq, base: ONSEN_INBOX_BASE, inbox: onsenInbox,
-  deliver: (it, again) => deliverPulled(it, again), log, host: (process.env.ONSEN_HOST ?? '').trim() || hostname().replace(/\.local$/, ''),
-  ...(Number(process.env.ONSEN_PERSON_RETRY_MS) > 0 ? { laterMs: Number(process.env.ONSEN_PERSON_RETRY_MS) } : {}),   // WO-194 A.2: tests only
-  ...(process.env.ONSEN_PULL_WAIT_S ? { waitS: Number(process.env.ONSEN_PULL_WAIT_S) } : {}),
-  ...(process.env.ONSEN_PULL_BACKOFF_MS ? { minBackoffMs: Number(process.env.ONSEN_PULL_BACKOFF_MS), maxBackoffMs: Number(process.env.ONSEN_PULL_BACKOFF_MS) * 4 } : {}) }) : null
 const onsenSender: OnsenSender | null = ONSEN_SEND_ON && onsenReq ? new OnsenSender({ req: onsenReq, log }) : null
-if (INBOX_ONLY) log('info', `onsen inbox: pull ${onsenPuller ? 'on' : 'off'}, send ${onsenSender ? 'on' : 'off'}${onsenReq ? ` (${ONSEN_INBOX_BASE})` : ''}; ${onsenInbox?.keyCount ?? 0} delivered key(s), last_seq ${onsenInbox?.lastSeq ?? 0}, ${onsenInbox?.pending.length ?? 0} pending`)
-
 /** The roster (agent-registry-sync's copy of agent-registry.json). WO-158: with ONSEN_SEND on only the names are needed (send_to_agent's name check,
  *  the lanes' peer list); `url` is read only for a mailbox-type identity (BTCC's mailbox inject) and, with ONSEN_SEND off, for the push. */
 function loadInboxRegistry(): Record<string, { url?: string; desc?: string }> {
@@ -1957,16 +1852,13 @@ function laneEventOf(n: { method: string; params: unknown }, verified?: boolean,
   }
 }
 // lanes-golive (C1, C3): THE entrance of a mesh notification with lanes on, from either daemon: the router decides (the agent-inbox daemon asks the tg
-// daemon's router; the tg daemon routes itself). Only when no router can be asked does the fleet path (any open session of this agent) take it.
-async function laneDeliverMesh(n: { method: string; params: unknown }, verified?: boolean, fallback = true, facts: WakeFacts = {}): Promise<Lanes.Decision | null> {
+// daemon's router; the tg daemon routes itself).
+async function laneDeliverMesh(n: { method: string; params: unknown }, verified?: boolean, facts: WakeFacts = {}): Promise<Lanes.Decision | null> {
   const ev = laneEventOf(n, verified, facts)
   Lanes.noteInboundThread(ev.btcc_msg_id, ev.thread, ev.hop)
   const d = INBOX_ONLY ? await Lanes.routeRemote(ev)                       // target main: the tg daemon queued it for the main (M1)
     : await Lanes.routeEvent(ev).catch(err => { log('error', `lanes: router failed (${err}) — main`); Lanes.toMainDirect(ev); return { rule: 'router-failed', target: 'main' } as Lanes.Decision })
-  // a router failure inside the tg daemon is the main's there (002w D: /lanes/route answers target main); null = the tg daemon itself could not be
-  // reached: there is no M1 to queue into, the fleet path (any open session of this agent) is what is left
-  if (!d) { if (fallback) broadcastNotification(n) }
-  else if (d.target === 'lane' && !CALL_STATE) {
+  if (d?.target === 'lane' && !CALL_STATE) {
     if (facts.onsen_items && ev.meta?.run_id) await Lanes.inboxPost('/lanes/scheduler-taken', { run_id: ev.meta.run_id })
     else maybeAutoAckScheduled(ev.meta?.run_id)
   }    // 開工回執: a lane took the scheduled run (WO-175: the Call's running, when on)
@@ -2988,18 +2880,14 @@ function replyForwardMeta(msg: unknown, attachmentFromReply: boolean, skipTopicC
 /** WO-194: the rest of a person's Telegram message once it is delivered: its <channel> tag, the album wait, the router. One function whichever way the
  *  message came (how: 'local', the path before; 'onsen', back from Onsen with the facts its arrival kept, or rebuilt from the person_message), so the
  *  tag is the same. `got`: the photo already taken (the path before takes it before the transcript); else it is taken here. */
-async function finishInbound(f: OnsenInbound.Facts, how: 'local' | 'onsen', got?: { imagePath?: string; imageError?: string }, keys: string[] = []): Promise<boolean> {
+async function finishInbound(f: OnsenInbound.Facts, got?: { imagePath?: string; imageError?: string }): Promise<boolean> {
   const chat_id = f.chat_id, msgId = f.msgId, text = f.text, image = f.image, attachment = f.attachment, inTopic = f.inTopic
   const voiceTranscript = f.voiceTranscript, attachmentFromReply = f.fromReply
   // #6: an item of an album (photos or documents sharing a media_group_id; never a replied-to message's file) is buffered below, not delivered alone.
-  // WO-197 (Chiron mesh 12852): true is returned then, and its kept facts' keys (`keys`) are finished when the album is delivered (flushAlbum), not now
   const inAlbum = OnsenInbound.albumItem(f)
-  // WO-197: a connector's album item kept across a restart: its files are in Onsen (the cache of this process may not have them)
-  if (f.fileUrls && CONNECTOR) for (const [ref, u] of Object.entries(f.fileUrls)) if (!connectorFiles.has(ref)) connectorFiles.set(ref, u)
   let imagePath = got?.imagePath
   let imageError = got?.imageError
-  // WO-197 (lab 17:12Z): an album item's photo is taken while the item already waits in the album buffer: the hand-over (POST /onsen/person) is
-  // answered at once and the inbox hands the next item on, the photos come in side by side, and the album's flush waits for them
+  // Fetch photos concurrently while the rest of the album arrives.
   let photo: Promise<string | undefined> | undefined
   if (!got && image) {
     const take = keptPhoto(image.file_id)
@@ -3087,9 +2975,8 @@ async function finishInbound(f: OnsenInbound.Facts, how: 'local' | 'onsen', got?
         ? { imagePath, ...(photo ? { photo } : {}), fileId: image.file_id, size: image.size }
         : { fileId: attachment!.file_id, size: attachment!.size, docKind: attachment!.kind,
             docMime: attachment!.mime, docName: attachment!.name }),
-      item: f.item, onsenId: f.onsenId, meta, ...(f.clientMeta ? { clientMeta: f.clientMeta } : {}), keys, ...(inTopic != null ? { routeTopic: String(inTopic) } : {}),
+      item: f.item, onsenId: f.onsenId, meta, ...(f.clientMeta ? { clientMeta: f.clientMeta } : {}), ...(inTopic != null ? { routeTopic: String(inTopic) } : {}),
     }, OnsenInbound.albumCountOf(f))
-    restartAlbumItems(chat_id, String(mgid))
     return true
   }
 
@@ -3202,8 +3089,6 @@ type AlbumEntry = {
   cap: ReturnType<typeof setTimeout> | null
   /** WO-197 (lab 19:24Z): its flush has begun (the items this daemon holds are being added): nothing else flushes it */
   flushing?: boolean
-  /** WO-197 (Chiron mesh 12852): its items' kept facts (inboundStore keys: chat:message_id, pm:<Onsen id>), finished once the album is delivered */
-  keys: string[]
   /** WO-197 segment 2: the topic the router knows the album by (dispatchInbound routeTopic) */
   routeTopic?: string
 }
@@ -3213,18 +3098,26 @@ function bufferAlbumItem(
   chatId: string,
   mgid: string,
   item: { item?: ItemRef; onsenId?: string; caption?: string; imagePath?: string; photo?: Promise<string | undefined>; fileId: string; size?: number;
-          docKind?: string; docMime?: string; docName?: string; meta: Record<string, string>; clientMeta?: Record<string, string>; keys?: string[]; routeTopic?: string },
+          docKind?: string; docMime?: string; docName?: string; meta: Record<string, string>; clientMeta?: Record<string, string>; routeTopic?: string },
   count: number | null = null,
 ): void {
   const key = `${chatId}:${mgid}`
   let entry = albumBuffers.get(key)
   if (!entry) {
     entry = { chatId, ids: [], captions: [], items: [], baseMeta: item.meta, ...(item.clientMeta ? { clientMeta: item.clientMeta } : {}), timer: null,
-      expect: null, first: Date.now(), cap: null, keys: [], ...(item.routeTopic ? { routeTopic: item.routeTopic } : {}) }
+      expect: null, first: Date.now(), cap: null, ...(item.routeTopic ? { routeTopic: item.routeTopic } : {}) }
     albumBuffers.set(key, entry)
   }
-  if (item.keys?.some(k => albumHeld.get(k) === key)) { log('info', `album ${key}: ${item.keys.join(', ')} is in it already: not added again`); return }
-  for (const k of item.keys ?? []) { if (!entry.keys.includes(k)) entry.keys.push(k); albumHeld.set(k, key) }
+  if (item.item) {
+    const buffered = entry.items.find(row => row.item?.onsen_item_id === item.item!.onsen_item_id)
+    if (buffered) {
+      if (item.item.onsen_version > buffered.item!.onsen_version) {
+        buffered.item = item.item
+        buffered.caption = item.caption
+      }
+      return
+    }
+  }
   if (item.meta.message_id) entry.ids.push(item.meta.message_id)
   if (entry.timer) clearTimeout(entry.timer)
   entry.timer = null
@@ -3249,36 +3142,12 @@ function albumWait(key: string, entry: AlbumEntry): void {
   }
   entry.timer = setTimeout(() => flush('window'), ALBUM_WINDOW_MS)
 }
-/** WO-197 (lab 19:24Z): the items of this album whose facts this daemon keeps and that are not in it (not back from the inbox yet, or left by a
- *  restart): added now, in its buffer (finishInbound with their keys: finished when the album goes); one being handed over right now is left to it */
-async function albumHeldItems(entry: AlbumEntry, key: string): Promise<void> {
-  if (!inboundStore) return
-  const mgid = key.slice(entry.chatId.length + 1)
-  const mine = (k: string): OnsenInbound.Facts | undefined => {
-    const f = inboundStore!.get(k)
-    return f && OnsenInbound.albumItem(f) && f.chat_id === entry.chatId && f.mgid === mgid && !albumHeld.has(k) && !inboundStore!.isDone(k) ? f : undefined
-  }
-  for (const k of [...restartLeft]) if (mine(k)) restartLeft.delete(k)
-  let n = 0
-  for (const k of inboundStore.waiting()) {
-    const f = mine(k)
-    if (!f || personBusy.has(k)) continue
-    if (f.albumCount) entry.expect = Math.max(entry.expect ?? 0, f.albumCount)
-    try { if (await finishInbound(f, 'local', undefined, [k])) n++ } catch (e) { log('warn', `album ${key}: ${k} (held here) not added: ${e instanceof Error ? e.message : e}`) }
-  }
-  if (n) log('info', `album ${key}: ${n} more item(s) whose facts this daemon holds (not back from the inbox yet) go with it`)
-}
-
 async function flushAlbum(key: string, why: 'window' | 'all' | 'cap'): Promise<void> {
   const entry = albumBuffers.get(key)
   if (!entry || entry.flushing) return
   entry.flushing = true
   if (entry.timer) clearTimeout(entry.timer)
   if (entry.cap) clearTimeout(entry.cap)
-  // WO-197 (lab 19:23–19:24Z, 1.58.28 item 2: killed after the first item came back; after the restart a1 + a3 went at the cap, a2 alone 20 s later
-  // through A.1): every item of this album whose facts this daemon holds goes with it, back from the inbox or not (its kept arrival facts, the ones a
-  // restart left); its late person_message, the inbox's retry, A.1 find it delivered. Never two tags for one album, nobody waits for a retry
-  await albumHeldItems(entry, key)
   albumBuffers.delete(key)
   // WO-197: the count known: one line (the cap: what came, of how many); the photos still being taken are waited for (each gives its path, or none: a
   // failed download, image_error as before)
@@ -3338,8 +3207,7 @@ async function flushAlbum(key: string, why: 'window' | 'all' | 'cap'): Promise<v
     }, entry.routeTopic, entry.items.flatMap(it => it.onsenId ? [it.onsenId] : []), entry.items.flatMap(it => it.item ? [it.item] : []))
   } catch (err) { log('error', `album flush dispatch failed: ${err}`) }
   // WO-197 (Chiron mesh 12852): delivered: its items' kept facts go now (a restart before this line delivers the album from them, once)
-  for (const k of entry.keys) albumHeld.delete(k)
-  if (entry.keys.length) inboundStore?.finish(entry.keys)
+
 }
 
 // Voice transcription (#12, opt-in, CHANNEL_BOT_VOICE_TRANSCRIBE=1) is the roamer's (roamer-telegram.ts): it takes the audio from Telegram. A connector's
@@ -3513,7 +3381,7 @@ if (tg) {
     // WO-197: the menu's Onsen Action (asked there too) is resolved by the presser once the keys went in
     pickerTap: (data, senderId, reply) => handleStartupPickerCallback(data, paneWatchTargets, reply, (tmux, key, idx) => pickerPressedHere(tmux, key, idx, Onsen.memberOfTg(senderId) ?? '')),
     runControlCallback,
-    finishInbound: (f, got) => finishInbound(f, 'local', got),
+    finishInbound: (f, got) => finishInbound(f, got),
     replyForwardMeta, safeName, metaExcerpt,
   }
   tg.start(host)
@@ -3829,7 +3697,7 @@ if (Lanes.LANES_ON) {
       },
       // WO-205 (Chiron mesh-13475): M2's registry disagreement (the tg daemon relays it here) as a BTCC page alert to the connector's maintainer;
       // BTCC names the agent from this daemon's mesh credential
-      ...(ONSEN_TAKE_ON ? { inboundLog: logPeerArrival, schedulerTaken: maybeAutoAckScheduled } : {}),
+      inboundLog: logPeerArrival, schedulerTaken: maybeAutoAckScheduled,
       registryAlert: async a => {
         if (!BTCC_API_BASE) return 'BTCC_API_BASE not set'
         const machine = machineName()
@@ -3859,10 +3727,10 @@ if (Lanes.LANES_ON) {
         const sender = o.laneId || 'router', turn_id = o.laneId ? Lanes.runOfLane(o.laneId) : null
         if (!tg) {
           // WO-197: the line written into Onsen (its label as its first line, as recorded today); the bridge draws it. Not reported within 3 s: said
-          // (OnsenFirst.HeldInOnsen: pushJoey / sendLine count it as told, the lane owes nothing)
+          // (HeldInOnsen: pushJoey / sendLine count it as told, the lane owes nothing)
           const r = await connectorReply({ chat, sender, text: Connector.withoutOnsenLabel(fl.text, sender, ONSEN_AGENT, Lanes.kindName), redact: fl.redact, rich: useRich, files: [], replyTo: o.replyTo ?? null,
             topic: tf.message_thread_id, silent: !!o.silent, turn_id })
-          if (r.held || !r.ids.length) throw new OnsenFirst.HeldInOnsen(r.held ? Connector.HELD : `sent (id: onsen:${r.onsenId})`, Number(r.onsenId), [])
+          if (r.held || !r.ids.length) throw new Connector.HeldInOnsen(r.held ? Connector.HELD : `sent (id: onsen:${r.onsenId})`, Number(r.onsenId), [])
           const ids = r.ids.map(Number)
           sentIn(chat, ids, tf)
           return ids[0]!
@@ -3925,15 +3793,13 @@ if (Lanes.LANES_ON) {
 //              state and Joey's held messages. last_activity_at: the newest write to the main's transcript or its subagents'.
 /** WO-165 A: JEV_SCREEN as the plist sets it (fixed for the daemon's life), else the machine config's line, read again at most every 30 s (taking an
  *  agent off needs no restart). WO-169: SCREEN_JUDGE (which judge reads the screen: jev, the default | program) the same way. WO-180: ONSEN_OBSERVATION
- *  (the observation goes to Onsen: a comma list of agent names or `*`) the same way. WO-194: ONSEN_INBOUND too. 1.59.0: ONSEN_FILES and ONSEN_FIRST
- *  are not read any more (the Telegram files and the Onsen-first send were the daemon's own Telegram path; a connector's words and files always go
- *  through Onsen) */
-type LiveKey = 'JEV_SCREEN' | 'SCREEN_JUDGE' | 'ONSEN_OBSERVATION' | 'LANES_MENTION_CARDS' | 'ONSEN_INBOUND'
+ *  (the observation goes to Onsen: a comma list of agent names or `*`) the same way */
+type LiveKey = 'JEV_SCREEN' | 'SCREEN_JUDGE' | 'ONSEN_OBSERVATION' | 'LANES_MENTION_CARDS'
 const LIVE_PLIST: Record<LiveKey, string | undefined> = { JEV_SCREEN: fleetConfigApplied.includes('JEV_SCREEN') ? undefined : process.env.JEV_SCREEN,
   SCREEN_JUDGE: fleetConfigApplied.includes('SCREEN_JUDGE') ? undefined : process.env.SCREEN_JUDGE,
   ONSEN_OBSERVATION: fleetConfigApplied.includes('ONSEN_OBSERVATION') ? undefined : process.env.ONSEN_OBSERVATION,
-  LANES_MENTION_CARDS: fleetConfigApplied.includes('LANES_MENTION_CARDS') ? undefined : process.env.LANES_MENTION_CARDS,   // WO-181
-  ONSEN_INBOUND: fleetConfigApplied.includes('ONSEN_INBOUND') ? undefined : process.env.ONSEN_INBOUND }   // WO-194
+  LANES_MENTION_CARDS: fleetConfigApplied.includes('LANES_MENTION_CARDS') ? undefined : process.env.LANES_MENTION_CARDS,
+}
 let liveFile: { at: number; v: Record<string, string> } = { at: -Infinity, v: {} }
 function liveSetting(k: LiveKey): string | undefined {
   if (LIVE_PLIST[k] !== undefined) return LIVE_PLIST[k]
@@ -4002,7 +3868,7 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     if (takeMode?.active) Object.assign(r.observation, { connector: takeMode.connector, held_item_ids: itemClaims!.held() })
     lastView = pub; lastObservation = r.observation
     status.update(pub)
-    if (!takeMode?.checking) obsPut.update(r.observation)                                          // WO-180: the same point, the same object (sent only if it changed or the beat is due)
+    if (!takeMode || takeMode.active) obsPut.update(r.observation)                                          // WO-180: the same point, the same object (sent only if it changed or the beat is due)
     screenStatus?.programChanged(v)
     // the Esc wrap-up reads the record when it changes, not only at its 2 s tick (WO-169 criterion 4: the next item within 2 s of an interruption seen).
     // WO-177 一: and M1 offers what it held the moment the record says the main can take it: the edge is the member state (decideWake's: a wall or a
@@ -4074,7 +3940,7 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
       cleared_limit_text: clearedLimitText() }
   }
   onsenStatusCompute = currentStatus                                    // WO-157 / WO-169: the lanes' one state source (decideWake, 此刻, the same-matter gate, the Esc wrap-up)
-  // WO-165 A (Joey TG chiron:2485; Chiron's WO-165 comment 18:26Z): JEV_SCREEN on for this agent (a comma list of names or `*`, as ONSEN_PULL; the plist's
+  // WO-165 A (Joey TG chiron:2485; Chiron's WO-165 comment 18:26Z): JEV_SCREEN on for this agent (a comma list of names or `*`, from the plist's
   // value, else the machine config's, re-read every 30 s), its TypeSafe key and Chiron's questions file (JCS screen-status/questions.json): Jev reads the
   // bottom of the main's pane and its reading is reported. One look a second (JEV_SCREEN_POLL_MS) and at each change of statusOf's view; Jev only when the
   // screen's hash changed; one call in flight, JEV_SCREEN_TIMEOUT_MS (3 s) each, at most JEV_SCREEN_MAX_PER_MIN (20) a minute
@@ -4112,13 +3978,13 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     setInterval(() => { try { watch.tick() } catch (e) { log('warn', `onsen: transcript: ${e}`) } }, Number.isFinite(pollMs) && pollMs >= 50 ? pollMs : 250).unref()
   }
   setTimeout(kick, 1_000).unref?.()
-  onsenStep3Stop = () => { facts.flushLater(); status.stop(); obsPut.stop(); registry.stop(); formInbox?.stop(); screenStatus?.stop() }
+  onsenStep3Stop = () => { facts.flushLater(); status.stop(); obsPut.stop(); registry.stop(); screenStatus?.stop() }
   // WO-169 part 2: the observation beside the record it was composed with (the one handed out last; WO-180: the one obsPut sends to Onsen)
   onsenStatusNow = () => ({ ...(status.current() ?? {}), observation: lastObservation, put: obsPut.health(),   // WO-180: is it being sent (sent, rejected, …)
     mode: tap ? 'lanes' : watch?.watching() ? 'transcript' : 'stream-only', registry: registry.mode(),
     turn_end_settling: facts.pendingLater(), ...(screenStatus ? { screen_status: screenStatus.health() } : {}), ...(calls ? { calls: calls.health() } : {}),
     // WO-145: the visible half (only what is on)
-    ...(formInbox ? { forms: formInbox.stats } : {}), ...(onsenWakeLog ? { wake_log: { on: true, recorded: onsen.stats.wake_recorded } } : {}) })
+     ...(onsenWakeLog ? { wake_log: { on: true, recorded: onsen.stats.wake_recorded } } : {}) })
   log('info', `onsen: step 3 on (delivery facts and the main's status: Claude Code's session registry; detail from ${tap ? 'the lanes journal' : 'the transcript'})`)
   // WO-147 (Onsen step 4a, ONSEN_WAKE_LOG): every route record (routing.jsonl line) as one wake row in Onsen (onsen-wake.ts), through the spool. Read only:
   // the row is built from the record the router already wrote and appended to the spool after the router's own step (a microtask: toMain has given the
@@ -4155,13 +4021,6 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     onsenWakeLog = true
     log('info', `onsen: wake log on for ${ONSEN_AGENT} (host ${host}): every routing.jsonl row and every hand-over wake line of the state journal also as a row in Onsen (POST ${onsen.cfg.base}/wake/batch, through the spool)`)
   }
-  // WO-145 (ONSEN_FORM_LINKS): the answers to the page forms this agent sent come in by a long poll and go to the main as Joey's message would
-  if (ONSEN_VISIBLE.forms) {
-    formInbox = new OnsenVisible.FormInbox({ dir: join(STATE_DIR, 'onsen'), log, request: (m, p, b, t) => onsen.request(m, p, b, t),
-      deliver: it => deliverFormAnswer(it), echo: async () => {}, spoolAck: ids => onsen.recordFormAck(ids) })   // WO-197: the bridge draws the echo from the feed
-    formInbox.start()
-    log('info', `onsen: forms inbox on (GET ${onsen.cfg.base}/forms/inbox?wait=25; answers go to the main, echoed silently)`)
-  }
 }
 /** WO-145: a page answer to the main, as Joey's Telegram message in that chat would go (lanes on: the one builder, never a lane; lanes off: the same
  *  delivery as his message). Its id is form-<Onsen message id> (no Telegram id can collide); meta via=web-form, form_title, form_id. false = its chat is
@@ -4169,7 +4028,7 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
 async function deliverFormAnswer(it: OnsenVisible.FormItem, route: 'main' | 'rules' = 'main', personIds?: string[], refs?: ItemRef[]): Promise<boolean> {
   const access = loadAccess(), chat = String(it.chat)
   if (!(access.allowFrom.map(String).includes(chat) || chat in (access.groups ?? {}) || (Connector.ONSEN_CHAT.test(chat) && CONNECTOR))) {
-    log('warn', `onsen: page answer ${it.id} is for chat ${chat}, which is not allowlisted: not delivered (acked)`)
+    log('warn', `onsen: page answer ${it.id} is for chat ${chat}, which is not allowlisted: not routed`)
     return false
   }
   const ref = `form-${it.id}`, uid = chat.startsWith('-') ? String(access.allowFrom[0] ?? '') : chat
@@ -4209,110 +4068,44 @@ function pageReplyMeta(r: NonNullable<OnsenVisible.FormItem['reply_to']>): Recor
   if (r.text != null && String(r.text).trim()) out.reply_to_text = metaExcerpt(String(r.text), 500)
   return out
 }
-/** WO-194: a person_message / person_edit of this agent's Onsen inbox (onsen_person.py), handed over by its agent-inbox daemon (POST /onsen/person).
- *  Answered 200 once delivered (the inbox acks it then: never before), or when it is not to be delivered (its chat not on the allowlist; delivered
- *  already: duplicate); 409 while the same message is being delivered (the inbox hands it again later). A Telegram message: its tag from the facts its
- *  arrival kept (finishInbound, the tag of the path before), or rebuilt from the payload when none were kept. A page message (via web): as the forms
- *  inbox's `say` item is delivered (deliverFormAnswer: via="onsen", its files from Onsen), by the router's rules when ONSEN_INBOUND is on here (else
- *  to the main, as before), then echoed 〔你在 Onsen 傳的〕. Delivered whatever the switch: what Onsen gives to deliver is never dropped */
-const personBusy = new Set<string>()
-async function personArrived(it: { item?: ItemRef; kind?: string; seq?: number; dedupe?: string | null; payload?: any }): Promise<{ code: number; json: Record<string, unknown> }> {
-  const p = it.payload && typeof it.payload === 'object' ? it.payload : {}
+async function receivePerson(p: Record<string, any>, item: ItemRef): Promise<void> {
   let c = p.client && typeof p.client === 'object' ? p.client : null
   // WO-197: a person with no app account (client null) says it in Onsen only: in connector mode its chat is the Onsen conversation (onsen:<id>), its
   // number form-<id> (as a page message's), delivered as a page message
-  if (!c && CONNECTOR && p.conversation_id != null && p.message_id != null) c = { chat: `onsen:${p.conversation_id}`, msg_id: `form-${p.message_id}`, user: p.from ?? null, user_id: null }
-  if (c?.chat && CONNECTOR) connectorFilesOf(p)
-  if (!inboundStore || !c?.chat || c.msg_id == null) {
-    log('warn', `onsen inbound: ${it.kind} ${p.message_id ?? '?'} has no Telegram chat or number (client ${JSON.stringify(c).slice(0, 120)}): not delivered (acked)`)
-    return { code: 200, json: { dropped: 'no Telegram chat' } }
+  if (!c && p.conversation_id != null && p.message_id != null) c = { chat: `onsen:${p.conversation_id}`, msg_id: `form-${p.message_id}`, user: p.from ?? null, user_id: null }
+  if (c?.chat) connectorFilesOf(p)
+  if (!c?.chat || c.msg_id == null) {
+    log('warn', `onsen item: ${p.message_id ?? '?'} has no Telegram chat or number (client ${JSON.stringify(c).slice(0, 120)}): not routed`)
+    return
   }
   const chat = String(c.chat), ref = String(c.msg_id), access = loadAccess()
   if (!(access.allowFrom.map(String).includes(chat) || chat in (access.groups ?? {}) || (Connector.ONSEN_CHAT.test(chat) && CONNECTOR))) {
-    log('warn', `onsen inbound: ${it.kind} ${p.message_id} is for chat ${chat}, which is not allowlisted: not delivered (acked)`)
-    return { code: 200, json: { dropped: 'chat not allowlisted' } }
+    log('warn', `onsen item: ${p.message_id} is for chat ${chat}, which is not allowlisted: not routed`)
+    return
   }
-  const edit = it.kind === 'person_edit'
-  const key = `${chat}:${ref}`, own = String(it.dedupe || (edit ? `pe:${p.message_id}:${p.edited_at}` : `pm:${p.message_id}`))
-  const shown = p.via === 'web' ? ref : `tg:${ref}`
-  if (!it.item && (inboundStore.isDone(own) || (!edit && inboundStore.isDone(key)))) {
-    inboundStore.stats.duplicates++
-    log('info', `onsen inbound: ${it.kind} ${p.message_id ?? '?'} (${shown}) came back from the inbox ${!edit && deliveredHere.has(key) ? 'after it was delivered here (not back in time, A.1)' : 'already delivered'}: not delivered again`)
-    return { code: 200, json: { duplicate: true } }
+  // WO-197 segment 2 (CONTRACT §7d 「指令」; sonn's ruling 7): a connector runs a person's slash command itself (the bridge's kind command, or a page
+  // message whose text is one), with today's handler; one it does not know goes on as a message
+  const thread = await connectorThreadOf(p, c, chat)
+  if ((p.kind === 'command' || /^\/[A-Za-z]/.test(String(p.text ?? '').trim()))
+    && await connectorCommand(String(p.text ?? ''), chat, ref, String(c.user_id ?? ''), c.user != null ? String(c.user) : '', thread, p.sent_at, p.via === 'web' ? 'onsen' : undefined, item, String(p.message_id))) {
+    return
   }
-  if (!edit && albumHeld.has(key)) {                         // WO-197: in its album already (it goes with the album)
-    const buffered = it.item && albumBuffers.get(albumHeld.get(key)!)?.items.find(row => row.item?.onsen_item_id === it.item!.onsen_item_id)
-    if (buffered?.item && it.item!.onsen_version > buffered.item.onsen_version) {
-      buffered.item = it.item
-      buffered.caption = String(p.text ?? '')
-    }
-    inboundStore.stats.duplicates++
-    log('info', `onsen inbound: ${it.kind} ${p.message_id ?? '?'} (${shown}) came back from the inbox again while its album waits: not buffered again`)
-    return { code: 200, json: { duplicate: true, album: true } }
+  if (p.via === 'web' || Connector.ONSEN_CHAT.test(chat)) {
+    const fi: OnsenVisible.FormItem = { id: Number(ref.replace(/^form-/, '')) || Number(p.message_id), form_id: 0, chat, title: '', body: String(p.text ?? ''),
+      ...(p.sent_at ? { at: String(p.sent_at) } : {}), say: true, ...(Array.isArray(p.attachments) && p.attachments.length ? { attachments: p.attachments } : {}),
+      ...(p.reply_to && typeof p.reply_to === 'object' ? { reply_to: p.reply_to } : {}) }
+    await deliverFormAnswer(fi, item.main ? 'main' : 'rules', [String(p.message_id)], [item])
+    return
   }
-  // busy: the same item, or (A.1) the same message being delivered here because it was not back in time
-  if (personBusy.has(own) || (!edit && personBusy.has(key))) return { code: 409, json: { busy: true } }
-  const busy = edit ? [own] : [own, key]
-  for (const b of busy) personBusy.add(b)
-  try {
-    if (edit) {
-      log('info', `onsen inbound: person_edit of ${shown} received from the inbox`)
-      const at = Math.floor(Date.parse(String(p.edited_at ?? '')) / 1000)
-      // the edited message as the bridge wrote it (1.59.0: no Telegram edit reaches this daemon itself any more)
-      const m = { message_id: Number(ref), chat: { id: Number(chat), type: chat.startsWith('-') ? 'supergroup' : 'private' },
-        from: { id: Number(c.user_id) || 0, is_bot: false, ...(c.user ? { username: String(c.user) } : {}) }, text: String(p.text ?? ''), ...(Number.isFinite(at) ? { edit_date: at } : {}),
-        ...(c.thread != null ? { is_topic_message: true, message_thread_id: Number(c.thread) } : {}) }
-      if (/^\d+$/.test(ref)) await deliverEditedMessage(m, [String(p.message_id)])
-      inboundStore.finish([own])
-      log('info', `onsen inbound: person_edit of ${shown} handed on`)
-      return { code: 200, json: { delivered: true } }
-    }
-    log('info', `onsen inbound: person_message ${p.message_id} (${shown}) received from the inbox`)
-    // WO-197 segment 2 (CONTRACT §7d 「指令」; sonn's ruling 7): a connector runs a person's slash command itself (the bridge's kind command, or a page
-    // message whose text is one), with today's handler; one it does not know goes on as a message
-    const thread = CONNECTOR ? await connectorThreadOf(p, c, chat) : undefined
-    if (CONNECTOR && (p.kind === 'command' || /^\/[A-Za-z]/.test(String(p.text ?? '').trim()))
-      && await connectorCommand(String(p.text ?? ''), chat, ref, String(c.user_id ?? ''), c.user != null ? String(c.user) : '', thread, p.sent_at, p.via === 'web' ? 'onsen' : undefined, it.item, String(p.message_id))) {
-      inboundStore.finish([key, own])
-      log('info', `onsen inbound: ${shown} is a command; the connector handled it itself`)
-      return { code: 200, json: { delivered: true, handled_here: true } }
-    }
-    if (p.via === 'web' || Connector.ONSEN_CHAT.test(chat)) {
-      const fi: OnsenVisible.FormItem = { id: Number(ref.replace(/^form-/, '')) || Number(p.message_id), form_id: 0, chat, title: '', body: String(p.text ?? ''),
-        ...(p.sent_at ? { at: String(p.sent_at) } : {}), say: true, ...(Array.isArray(p.attachments) && p.attachments.length ? { attachments: p.attachments } : {}),
-        ...(p.reply_to && typeof p.reply_to === 'object' ? { reply_to: p.reply_to } : {}) }
-      await deliverFormAnswer(fi, it.item?.main || !await onsenInboundNow() ? 'main' : 'rules', [String(p.message_id)], it.item ? [it.item] : undefined)
-      inboundStore.finish([key, own])
-      log('info', `onsen inbound: ${shown} handed to the ${Lanes.LANES_ON ? 'router' : 'session(s)'}`)
-      return { code: 200, json: { delivered: true } }
-    }
-    let f = inboundStore.take(key)
-    if (!f) {
-      f = factsFromPayload(p, chat, ref, thread)
-      inboundStore.stats.rebuilt++
-      log('warn', `onsen inbound: no facts kept for ${shown} (arrived before this daemon's state, or elsewhere): its tag is built from the person_message`)
-    }
-    const cm = OnsenInbound.clientMetaOf(c)                 // WO-197: the bridge's client.meta onto the tag
-    // WO-207 (Chiron #200873, Joey TG chiron:2973): a voice note's body is Onsen's text as is (its transcript, whole, after Onsen's one prefix line; a
-    // caption when it had one), not the (voice message) placeholder; the same words are not laid over the tag again as client.meta voice_transcript.
-    // Onsen's text empty (voice_error, no caption): the placeholder, as before
-    const voiceText = (p.voice === true || p.kind === 'voice') && typeof p.text === 'string' && p.text.trim() ? p.text : null
-    if (voiceText && cm?.voice_transcript && voiceText.includes(cm.voice_transcript)) delete cm.voice_transcript
-    f = { ...f, ...(it.item ? { item: it.item } : {}), onsenId: String(p.message_id), ...(voiceText ? { text: voiceText, voiceTranscript: undefined } : {}), ...(cm ? { clientMeta: cm } : {}) }
-    // WO-197 (Chiron mesh 12852): an album item is answered 200 (the inbox acks it) before its album goes (up to TELEGRAM_ALBUM_CAP_MS): what rebuilds
-    // its tag is kept on disk until then (the arrival's facts with client.meta; a connector's, rebuilt from the person_message, with where Onsen keeps
-    // its files), so a daemon stopped meanwhile delivers it after its restart, once
-    if (OnsenInbound.albumItem(f)) {
-      const urls: Record<string, { url: string; name?: string; mime?: string }> = {}
-      for (const a of Array.isArray(p.attachments) ? p.attachments : []) if (a?.client_ref && a?.url)
-        urls[String(a.client_ref)] = { url: String(a.url), ...(a.name ? { name: String(a.name) } : {}), ...(a.mime ? { mime: String(a.mime) } : {}) }
-      f = { ...f, ...(Object.keys(urls).length ? { fileUrls: urls } : {}) }
-      inboundStore.park(key, f)
-    }
-    if (!await finishInbound(f, 'onsen', undefined, [key, own])) inboundStore.finish([key, own])
-    log('info', `onsen inbound: ${shown} handed to the ${Lanes.LANES_ON ? 'router' : 'session(s)'}`)
-    return { code: 200, json: { delivered: true } }
-  } finally { for (const b of busy) personBusy.delete(b) }
+  const f = factsFromPayload(p, chat, ref, thread)
+  const cm = OnsenInbound.clientMetaOf(c)                 // WO-197: the bridge's client.meta onto the tag
+  // WO-207 (Chiron #200873, Joey TG chiron:2973): a voice note's body is Onsen's text as is (its transcript, whole, after Onsen's one prefix line; a
+  // caption when it had one), not the (voice message) placeholder; the same words are not laid over the tag again as client.meta voice_transcript.
+  // Onsen's text empty (voice_error, no caption): the placeholder, as before
+  const voiceText = (p.voice === true || p.kind === 'voice') && typeof p.text === 'string' && p.text.trim() ? p.text : null
+  if (voiceText && cm?.voice_transcript && voiceText.includes(cm.voice_transcript)) delete cm.voice_transcript
+  await finishInbound({ ...f, item, onsenId: String(p.message_id),
+    ...(voiceText ? { text: voiceText, voiceTranscript: undefined } : {}), ...(cm ? { clientMeta: cm } : {}) })
 }
 /** WO-194: a Telegram message's facts from its person_message alone (the arrival's were not kept): the restoration table of the ticket. What Onsen does
  *  not carry is missing (reply_to_user_id, forward_origin and forward_from_id, attachment_origin, a voice note's caption) and the sender's name is
@@ -4359,18 +4152,11 @@ function factsFromPayload(p: any, chat: string, ref: string, thread?: number): O
     rfm, ...(p.media_group_id ? { mgid: String(p.media_group_id) } : {}), ...(text && !voice && a ? { caption: text } : {}),
   }
 }
-// The delivery of one inbound message (WO-151 3a: shared by POST /inject and the Onsen pull, onsen-inbox.ts): the body /inject takes and who sent it
-// (the verdict). /inject: the verdict from the presented credential (resolveInbound); a pulled item: Onsen's authenticated sender (deliverPulled), never
-// forged or held. Returns the HTTP answer /inject gives (code, JSON); the pull reads it. Everything below the dedupe is the /inject handler of 1.49.1,
-// unchanged.
-// WO-151 dedupe (both paths on): the message's key (dedupeKeyOf: the sender's `dedupe`, else msg:<msg_id>) already delivered by either path is dropped
-// first, before any comms row or route, and answered as delivered ({injected: true, duplicate: true}). A trusted delivery records its key
-// (onsen-inbox.json; claimed while it runs, so two arrivals of one key cannot both pass); a refused one (a ring with no router) leaves it free.
 type InboundBody = { text?: string; from?: string; verified_from?: string; chat_id?: string; logged?: boolean;
   msg_id?: number; reply_to_id?: number; reply_to_from?: string; reply_to_text?: string;
   no_reply?: boolean; op?: string | number; wake?: unknown; ring?: unknown; dedupe?: unknown; refs?: unknown; call_id?: string }
 type InboundAnswer = { code: number; json: Record<string, unknown> }
-async function deliverInbound(body: InboundBody | null, verdict: Verdict, o: { holdUnsigned: boolean; trusted: boolean; src: 'inject' | 'onsen'; item?: ItemRef }): Promise<InboundAnswer> {
+async function deliverInbound(body: InboundBody | null, verdict: Verdict, holdUnsigned: boolean, item?: ItemRef): Promise<InboundAnswer> {
   const text = typeof body?.text === 'string' ? body.text.slice(0, 4000) : ''
   const opRef = body?.op != null && OP_REF_RE.test(String(body.op).trim()) ? String(body.op).trim() : ''
   if (!text) return { code: 400, json: { error: 'text required' } }
@@ -4385,27 +4171,12 @@ async function deliverInbound(body: InboundBody | null, verdict: Verdict, o: { h
     fileHeld(verdict.sender, verdict.relay, text, 'forged-unsigned')
     return { code: 200, json: { injected: false, dropped: 'forged-unsigned', held: true } }
   }
-  if (o.holdUnsigned) {
+  if (holdUnsigned) {
     log('warn', `HELD unsigned inject (MESH_REQUIRE_SIGNED): claimed=${verdict.sender} text=${text.slice(0, 80)}`)
     fileHeld(verdict.sender, verdict.relay, text, 'unsigned')
     return { code: 200, json: { injected: false, held: true } }
   }
-  // WO-151: delivered already by the other path (or being delivered right now): dropped here, counted
-  const key = onsenInbox ? dedupeKeyOf(body?.dedupe, body?.msg_id) : null
-  if (key && onsenInbox!.seen(key)) {
-    if (o.src === 'inject') onsenInbox!.stats.inject_dup_dropped++
-    log('info', `onsen inbox: ${o.src === 'inject' ? '/inject' : 'Onsen item'} from ${verdict.sender} (${key}) already delivered by the ${o.src === 'inject' ? 'Onsen' : '/inject'} path: dropped`)
-    return { code: 200, json: { injected: true, duplicate: true } }
-  }
-  const claimed = !!key && o.trusted && onsenInbox!.claim(key)
-  let taken = false
-  try {
-    const out = await deliverInboundTaken(body!, text, opRef, verdict, o.item)
-    taken = out.json.injected === true || out.json.ignored != null
-    return out
-  } finally {
-    if (claimed) { if (taken) onsenInbox!.record(key!); else onsenInbox!.release(key!) }
-  }
+  return deliverInboundTaken(body!, text, opRef, verdict, item)
 }
 async function logPeerArrival(row: Record<string, unknown>): Promise<number | undefined> {
   if (!BTCC_API_BASE) return
@@ -4486,10 +4257,9 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
       },
     }
     // lanes-golive (C3): one entrance into the main: the router (1.52.0, WO-158: no hub doorbell any more)
-    const d = await laneDeliverMesh(notification, verdict.verified, !ring, { ...wakeFactsOf(body as unknown as Record<string, unknown>), ...(item ? { onsen_items: [item] } : {}) })
-    if (ring && !d) {
-      log('warn', `ring from ${from} NOT delivered: no lanes router to ask (the mailbox tries again later)`)
-      return { code: 200, json: { injected: false, error: 'lanes router unreachable: ring not delivered' } }
+    const d = await laneDeliverMesh(notification, verdict.verified, { ...wakeFactsOf(body as unknown as Record<string, unknown>), ...(item ? { onsen_items: [item] } : {}) })
+    if (!d) {
+      return { code: 503, json: { injected: false, error: 'lanes router unreachable' } }
     }
     return { code: 200, json: { injected: true, routed: d?.target ?? 'main', lane: d?.lane ?? null, rule: d?.rule ?? 'router-unreachable' } }
   }
@@ -4520,13 +4290,6 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
   await dispatchInbound(chatId, notif)
   return { code: 200, json: { injected: true, active_sessions: activeServers.size } }
 }
-/** WO-151 3a: one item taken from Onsen, handed to the same delivery as /inject (deliverInbound). Its sender is Onsen's authenticated caller, or the name
- *  a relay identity (BTCC) speaks for: verified, never forged. The relay attribute agents read keeps the values it has today (direct: the sender itself;
- *  btcc: BTCC spoke for it), so no text an agent reads changes; that it came through Onsen is in the log and /healthz (a value `onsen` there waits for
- *  Chiron). The item's key (Onsen's `dedupe`, else msg:<msg_id>) goes in as the body's `dedupe`.
- *  WO-158: an item Onsen 0.9.4 marks `unverified: true` (only a relay can: a name it passes on without vouching for it, e.g. a BTCC console release) gets
- *  the verdict the same message pushed through BTCC unverified gets today (mesh-identity.ts resolveInbound, a forwarder without verified_from):
- *  verified=false, and forged when the name is an identity that signs (dropped and filed, as on /inject). */
 async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
   // A page may omit the event history. Resolve the hand-over note before putting the row into M1.
   if (row.session_id === 'main' && !row.events) {
@@ -4547,8 +4310,7 @@ async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
   if (prefix) payload.text = prefix + '\n' + (payload.text ?? '')
   if (row.kind === 'message' || row.message_id) {
     if (edit && row.reason !== 'reassigned') { Lanes.editWaitingItem(item, String(payload.text ?? ''), row.updated_at); return }
-    const arrived = await personArrived({ item, kind: 'person_message', seq: row.number, dedupe: 'item:' + row.id, payload })
-    if (arrived.code !== 200) throw new Error('person delivery: HTTP ' + arrived.code)
+    await receivePerson(payload, item)
     return
   }
   if (row.kind === 'control') {
@@ -4563,106 +4325,14 @@ async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
   }
   const kinds: Record<string, string> = { call: 'peer_call', mail: 'peer_mail', schedule: 'scheduled', keepwarm: 'wd_keepwarm' }
   if (row.call_id != null) payload.call_id = row.call_id
-  const result = await deliverPulled({ seq: row.number, kind: kinds[row.kind] ?? row.kind, sender: row.from, relay: row.relay,
-    dedupe: 'item:' + row.id, refs: Object.fromEntries(row.refs.map(r => [r.kind, r.value])), payload }, false, item)
-  if (result === 'later') throw new Error('peer delivery did not reach the router for ' + row.id)
+  const relay = !row.relay ? 'direct' : row.relay === 'oncall-receiver' ? 'oncall-receiver' : 'btcc'
+  const body = { ...payload, item_kind: payload.item_kind ?? kinds[row.kind] ?? row.kind,
+    refs: Object.fromEntries(row.refs.map(r => [r.kind, r.value])) }
+  const out = await deliverInbound(body, { sender: row.from, verified: true, forged: false, relay }, false, item)
+  if (!out.json.injected && !out.json.ignored) throw new Error('peer delivery failed for ' + row.id)
 }
-async function deliverPulled(it: PullItem, again = false, item?: ItemRef): Promise<HandResult> {
-  // WO-176: Onsen's control item (a press in Onsen, no text) is for this agent's Telegram daemon, never for a session: no comms row, no router, no wake row
-  if (it.kind === Onsen.ACTION_CONTROL_KIND) return controlPulled(it)
-  // WO-194: a person's message Onsen gives this agent to deliver (person_message / person_edit) is its Telegram daemon's to deliver, never a peer message
-  if (it.kind === 'person_message' || it.kind === 'person_edit') return personPulled(it, again)
-  // the sender's facts in Onsen's own fields (0.9.3) count as much as the payload's: an item whose no_reply is only a top-level fact is still a
-  // no-reply answer to the router (Chiron WO-158 11:56Z: a no_reply peer_call sent that way opened a lane)
-  const p = { ...((it.payload ?? {}) as InboundBody), ...((it as { no_reply?: unknown }).no_reply === true ? { no_reply: true } : {}),
-    // WO-157: the item's kind (Onsen's WO-147 names) is the sender's field the receiver's decideWake reads; the payload's own kind field, if any, wins
-    ...(typeof it.kind === 'string' && !(it.payload as Record<string, unknown> | undefined)?.item_kind ? { item_kind: it.kind } : {}),
-    // WO-164: the item's refs (Onsen's own field: the thread keys, the scheduler's run_id, the board's ticket) go on as the body's refs (the router reads them)
-    ...(it.refs && typeof it.refs === 'object' ? { refs: it.refs } : {}),
-    // WO-175: Onsen's call id (0.24.1: on every Call item; null before the Call exists, and for other kinds)
-    ...((it as { call_id?: unknown }).call_id != null ? { call_id: String((it as { call_id?: unknown }).call_id) } : {}) } as InboundBody
-  // WO-181 (Chiron 06:19Z): Onsen's item of a mention (kind mention, no text, only a post_id) is the batch's reason to reach the main; the lines
-  // are the mention block that rides the delivery (lanes-main.ts). It gets one line of its own, so it can be delivered at all
-  if (it.kind === 'mention' && !(typeof p.text === 'string' && p.text.trim())) p.text = mentionItemText(it)
-  const relay: Verdict['relay'] = !it.relay ? 'direct' : it.relay === 'oncall-receiver' ? 'oncall-receiver' : 'btcc'
-  const sender = String(it.sender ?? 'unknown').slice(0, 64)
-  const unverified = it.unverified === true
-  const verdict: Verdict = { sender, verified: !unverified, relay, forged: unverified && resolveInbound(undefined, sender, undefined, loadTable()).forged }
-  const key = itemKey(it)
-  const out = await deliverInbound({ ...p, dedupe: key ?? undefined }, verdict, { holdUnsigned: false, trusted: true, src: 'onsen', item })
-  if (out.json.duplicate === true) return 'duplicate'
-  const ok = out.json.injected === true || out.json.ignored != null
-  log(ok ? 'info' : 'warn', `onsen inbox: item ${it.seq} (${it.kind ?? '?'}) from ${verdict.sender}${it.relay ? ` via ${it.relay}` : ''}${unverified ? ' (unverified)' : ''}${key ? ` ${key}` : ' (no key)'}: ${ok ? 'handed on' : `not delivered ${JSON.stringify(out.json).slice(0, 160)}`}`)
-  return ok ? 'delivered' : 'undelivered'
-}
-/** WO-194: a person_message / person_edit item (onsen_person.py: a person's message, from Telegram or Onsen's page, given to this agent to deliver). Handed
- *  to this agent's Telegram daemon (POST /onsen/person on LANES_TG_PORT, the loopback token), which builds its <channel> tag and routes it, and answers
- *  once it is delivered; never handed to a session from here, whatever ONSEN_INBOUND says. Not taken: tried again 1 s and 3 s later, then `later`
- *  (A.2, Chiron 11:35Z): it stays pending in its place (never acked undelivered) and is tried again (once) every 30 s, while the items behind it go on */
-const PERSON_FORWARD_GAPS_MS = (process.env.ONSEN_PERSON_FORWARD_GAPS_MS ?? '1000,3000').split(',').map(x => Number(x.trim())).filter(n => Number.isFinite(n) && n >= 0)
-async function personPulled(it: PullItem, again = false): Promise<HandResult> {
-  const key = itemKey(it)
-  if (key && onsenInbox?.seen(key)) return 'duplicate'
-  const port = Number(process.env.LANES_TG_PORT ?? 0)
-  let why = port ? '' : 'LANES_TG_PORT is not set (no Telegram daemon to hand it to)'
-  for (let i = 0; port && i <= (again ? 0 : PERSON_FORWARD_GAPS_MS.length); i++) {
-    if (i) await new Promise(r => setTimeout(r, PERSON_FORWARD_GAPS_MS[i - 1]))
-    let tok = ''
-    try { tok = readFileSync(join(process.env.MCP_TOKEN_DIR ?? join(homedir(), '.claude', 'agent-inbox', 'mcp-tokens'), String(port)), 'utf8').trim() } catch {}
-    try {
-      const r = await fetch(`http://127.0.0.1:${port}/onsen/person`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok}` },
-        body: JSON.stringify(it), signal: AbortSignal.timeout(60_000) })
-      const j = await r.json().catch(() => ({})) as Record<string, unknown>
-      if (r.status === 200) {
-        if (key) onsenInbox?.record(key)
-        log('info', `onsen inbox: item ${it.seq} (${it.kind}) ${key ?? ''}: handed to the Telegram daemon (:${port}): ${j.duplicate ? 'already delivered' : j.dropped ? `not delivered there (${j.dropped})` : 'delivered'}`)
-        return j.duplicate ? 'duplicate' : 'delivered'
-      }
-      why = `HTTP ${r.status}${j.error ? ` ${String(j.error).slice(0, 120)}` : ''}`
-    } catch (e) { why = String(e instanceof Error ? e.message : e).slice(0, 120) }
-  }
-  log('warn', `onsen inbox: item ${it.seq} (${it.kind}) not taken by the Telegram daemon (${why}): kept, handed on again`)
-  return 'later'
-}
-/** WO-176: an action_control item (sender onsen: a person pressed an option of one of this agent's Actions in Onsen). Handed to this agent's Telegram
- *  daemon (POST /onsen/action on LANES_TG_PORT, the loopback token), which presses it. Not taken: the item stays pending and is tried again
- *  (ONSEN_ACTION_FORWARD_GAPS_MS, default 10 s and 20 s later: three tries in ~30 s; the inbox waits meanwhile); after the last try it is acked and its
- *  Action cancelled ("daemon could not apply"), so an agent's messages never stall behind it. Anything else of that kind: dropped, nothing pressed */
-const ACTION_FORWARD_GAPS_MS = (process.env.ONSEN_ACTION_FORWARD_GAPS_MS ?? '10000,20000').split(',').map(x => Number(x.trim())).filter(n => Number.isFinite(n) && n >= 0)
-let inboxActions: Onsen.OnsenActions | null = null
-async function controlPulled(it: PullItem): Promise<HandResult> {
-  const c = it.sender === Onsen.ACTION_CONTROL_SENDER && it.unverified !== true ? Onsen.actionControlOf(it.payload) : null
-  if (!c) {
-    log('warn', `onsen inbox: item ${it.seq} (${it.kind}) from ${String(it.sender ?? '?').slice(0, 64)}: not a control item as Onsen sends it; dropped, nothing pressed`)
-    return 'undelivered'
-  }
-  const key = itemKey(it)
-  if (key && onsenInbox?.seen(key)) return 'duplicate'
-  const port = Number(process.env.LANES_TG_PORT ?? 0)
-  let why = port ? '' : 'LANES_TG_PORT is not set (no Telegram daemon to hand it to)'
-  for (let i = 0; port && i <= ACTION_FORWARD_GAPS_MS.length; i++) {
-    if (i) await new Promise(r => setTimeout(r, ACTION_FORWARD_GAPS_MS[i - 1]))
-    let tok = ''
-    try { tok = readFileSync(join(process.env.MCP_TOKEN_DIR ?? join(homedir(), '.claude', 'agent-inbox', 'mcp-tokens'), String(port)), 'utf8').trim() } catch {}
-    try {
-      const r = await fetch(`http://127.0.0.1:${port}/onsen/action`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok}` },
-        body: JSON.stringify(c), signal: AbortSignal.timeout(5000) })
-      if (r.status === 202 || r.status === 200) {
-        if (key) onsenInbox?.record(key)
-        log('info', `onsen inbox: item ${it.seq} (action_control) action ${c.action_id} ${c.option_id} v${c.version}: handed to the Telegram daemon (:${port})`)
-        return 'delivered'
-      }
-      why = `HTTP ${r.status}`
-    } catch (e) { why = String(e instanceof Error ? e.message : e).slice(0, 120) }
-    log('warn', `onsen inbox: item ${it.seq} (action_control) action ${c.action_id}: the Telegram daemon did not take it (try ${i + 1} of ${ACTION_FORWARD_GAPS_MS.length + 1}: ${why})`)
-  }
-  log('warn', `onsen inbox: item ${it.seq} (action_control) action ${c.action_id} ${c.option_id}: not handed over (${why}); acked, nothing pressed, the Action is cancelled`)
-  if (onsenReq) {
-    inboxActions ??= new Onsen.OnsenActions({ req: onsenReq, log })
-    inboxActions.cancel(inboxActions.adopt(c.action_id, c.version), 'daemon could not apply')
-  }
-  return 'undelivered'
-}
+
+
 
 log('info', `mcp loopback token: ${mcpToken ? 'ready' : 'MISSING'}; ${MCP_REQUIRE_TOKEN ? 'required' : 'report-first (MCP_REQUIRE_TOKEN unset)'}`)
 const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResponse) => {
@@ -4694,16 +4364,13 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         // Onsen (WO-139): recording on, bytes waiting in the spool, last sync; step 3 (WO-143): deliveries_recorded, status_recorded, the status now
         ...(onsen ? { onsen: { ...onsen.health(), ...(onsenStatusNow ? { status: onsenStatusNow() } : {}),
           ...(onsenActions ? { actions: onsenActions.health() } : {}), ...(mentionCards ? { mentions: mentionCards.health() } : {}),   // WO-176 (Epeius): the Actions client's own counts (on, created … failed, followed); WO-181: the mention cards'
-          // WO-194: a person's message delivered from Onsen (the kept facts: albums, A.1); ONSEN_INBOUND now only routes a page message (personArrived)
-          ...(inboundStore ? { inbound: { on: inboundSwitch(), partner: INBOX_PARTNER, back: inboundStore.health() } } : {}) } } : {}),
+        } } : {}),
         max_queue_depth: Math.max(0, ...[...memQueue.values()].map(q => q.length)),
         last_update_id: tg?.lastUpdateId ?? 0,
         mcp_auth: mcpGate.stats,
         polling: tg?.polling ?? false,  // a roamer: its long poll's onStart has run; false = not polling (yet), and always for a connector
         // WO-151 3a / 3b: the Onsen pull (taken, handed on, duplicates dropped on either path) and this agent's sends into Onsen (WO-158: the only path)
         ...(INBOX_ONLY ? {
-          onsen_pull: { on: !!onsenPuller, ...(onsenPuller ? onsenPuller.health() : { last_seq: onsenInbox?.lastSeq ?? 0, acked_seq: onsenInbox?.ackedSeq ?? 0 }),
-            keys: onsenInbox?.keyCount ?? 0, inject_dup_dropped: onsenInbox?.stats.inject_dup_dropped ?? 0 },
           onsen_send: { on: !!onsenSender, ...(onsenSender ? onsenSender.stats : {}) },
         } : {}),
         // WO-120: this daemon's usage-wall state (null = no fresh state: delivering as before)
@@ -4760,10 +4427,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
       const verdict = resolveInbound(authz,
         typeof body?.from === 'string' ? body.from : undefined,
         typeof body?.verified_from === 'string' ? body.verified_from : undefined, meshTable)
-      // WO-151: who may mark a message delivered for the dedupe with the Onsen path: a signed sender, a hop BTCC or the oncall receiver vouches for,
-      // or a holder of the inject token. An unsigned caller without the token never records a key, so it cannot suppress a genuine message.
-      const trusted = verdict.verified || FORWARDERS.has(verdict.relay) || tokenOk
-      const out = await deliverInbound(body, verdict, { holdUnsigned, trusted, src: 'inject' })
+      const out = await deliverInbound(body, verdict, holdUnsigned)
       res.writeHead(out.code, { 'content-type': 'application/json' })
       res.end(JSON.stringify(out.json))
       return
@@ -4785,40 +4449,6 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
       for (const k of ['limit', 'since', 'until', 'q', 'id', 'chat']) { const v = u.searchParams.get(k); if (v) args[k] = k === 'limit' ? Number(v) : v }
       const text = await onsen.queryHistory(args, 'hook').catch(e => `chat_history failed: ${e instanceof Error ? e.message : e}`)
       res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' }).end(text)
-      return
-    }
-    // WO-176: Onsen's control item for one of this agent's Actions (a person pressed an option in Onsen), handed over by this agent's agent-inbox daemon
-    // (its Onsen pull). Same loopback token as /mcp. Taken at once (202) and pressed here in the background, so the inbox never waits for a key
-    if (!INBOX_ONLY && u.pathname === '/onsen/action' && req.method === 'POST') {
-      if (!mcpGate.check(req.headers['authorization'] as string | undefined, req.method ?? '?', req.headers['user-agent'] as string | undefined)) {
-        const r = refusal(req.headers['authorization'] as string | undefined)
-        res.writeHead(r.status, { 'content-type': 'application/json' }).end(r.body)
-        return
-      }
-      const c = Onsen.actionControlOf(await readJsonBody(req).catch(() => null))
-      if (!c || !onsenActions) {
-        res.writeHead(c ? 503 : 400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: c ? 'no Onsen client in this daemon' : 'body is {action_id, option_id, version}' }))
-        return
-      }
-      res.writeHead(202, { 'content-type': 'application/json' }).end(JSON.stringify({ accepted: true }))
-      void applyActionControl(c).catch(e => log('warn', `onsen action ${c.action_id}: applying the press from Onsen failed: ${e instanceof Error ? e.message : e}`))
-      return
-    }
-    // WO-194: a person_message / person_edit of this agent's Onsen inbox, handed over by its agent-inbox daemon; same loopback token as /mcp.
-    // Answered once delivered (personArrived), so the inbox acks it only then
-    if (!INBOX_ONLY && u.pathname === '/onsen/person' && req.method === 'POST') {
-      if (!mcpGate.check(req.headers['authorization'] as string | undefined, req.method ?? '?', req.headers['user-agent'] as string | undefined)) {
-        const r = refusal(req.headers['authorization'] as string | undefined)
-        res.writeHead(r.status, { 'content-type': 'application/json' }).end(r.body)
-        return
-      }
-      const b = await readJsonBody(req).catch(() => null) as any
-      if (!b || !OnsenInbound.ITEM_KINDS.includes(String(b.kind))) {
-        res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'body is an inbox item of kind person_message or person_edit' }))
-        return
-      }
-      const out = await personArrived(b).catch(e => ({ code: 500, json: { error: String(e instanceof Error ? e.message : e).slice(0, 200) } }))
-      res.writeHead(out.code, { 'content-type': 'application/json' }).end(JSON.stringify(out.json))
       return
     }
     // WO-126 (1.38.1): the main's mailbox_decide, handed over by this agent's Telegram daemon (its tool lives there); same loopback token as /mcp
@@ -5146,7 +4776,7 @@ function startListen(): void {
     // Joey rule 2026-07-12: never silently run stale code — self-report version
     // + freshness vs origin/main at every boot (fail-open, see version-check.ts).
     void checkVersion().then(() => log('info', versionLine())).catch(() => {})
-    if (onsenPuller) onsenPuller.start()          // WO-151 3a
+
     // WO-158: hub sync is gone; a doorbell an older process (≤ 1.51.0) parked waiting for a sync is handed to the delivery once, so none is stranded
     void drainLeftoverDoorbells(STATE_DIR, (chatId, n) => dispatchInbound(chatId, n), log)
     // Roamer cross-protocol auto-discovery: announce ourselves so partner-

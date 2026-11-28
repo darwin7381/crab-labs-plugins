@@ -50,12 +50,11 @@ async function daemon(env: Record<string, string> = {}, initialMode = 200, setup
   const settings = setup?.(root)
   const childEnv: Record<string, string | undefined> = {
     PATH: process.env.PATH, TMPDIR: root, HOME: join(root, 'home'), TELEGRAM_HTTP_PORT: String(port), TELEGRAM_STATE_DIR: state,
-    AGENT_WORKSPACE_DIR: root, GENESIS_LANES: '1', LANES_AGENT: 'adam', ONSEN_HOST: 'Mac-Mini', ONSEN_TAKE: '*',
+    AGENT_WORKSPACE_DIR: root, GENESIS_LANES: '1', LANES_AGENT: 'adam', ONSEN_HOST: 'Mac-Mini',
     ONSEN_OBSERVATION: 'adam', ONSEN_BASE: f.base, ONSEN_REGISTRY_CLI: '0', JEV_SCREEN: '', CRAB_LABS_PLUGINS_ENV: join(root, 'no-config'),
     USAGE_WALL_READ: '0', HUB_SYNC: '0', TYPESAFE_KEY_FILE: join(root, 'no-key'), LANES_CLAUDE_BIN: join(import.meta.dir, 'test-fixtures/no-claude.sh'),
     ...env, ...settings,
   }
-  if (!childEnv.ONSEN_TAKE) delete childEnv.ONSEN_TAKE
   const journal = () => {
     const file = join(state, 'lanes', 'state.jsonl')
     return existsSync(file) ? readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) : []
@@ -90,25 +89,20 @@ async function daemon(env: Record<string, string> = {}, initialMode = 200, setup
   return { f, root, lanes, state, proc, base, journal, log, restart }
 }
 
-for (const [name, cfg, reason] of [
-  ['unset', { ONSEN_TAKE: '' }, ''], ['observation off', { ONSEN_OBSERVATION: '' }, 'ONSEN_OBSERVATION'],
-  ['lanes off', { GENESIS_LANES: '0' }, 'LANES_ON'], ['recording off', { ONSEN_RECORD: '0' }, 'recording'],
-  ['inbox-only', { CHANNEL_INBOX_ONLY: '1' }, 'INBOX_ONLY'],
-] as const) test('real daemon startup: ' + name, async () => {
-  const d = await daemon(cfg)
-  await Bun.sleep(100)
-  expect(d.f.calls.filter(c => c.path.endsWith('/items'))).toHaveLength(0)
-  const log = d.log().split('\n').filter(s => s.includes('onsen take:'))
-  expect(log).toHaveLength(reason ? 1 : 0)
-  if (reason) expect(log[0]).toContain(reason)
-})
+for (const cfg of [{ GENESIS_LANES: '0' }, { ONSEN_RECORD: '0' }, { CHANNEL_INBOX_ONLY: '1' }]) {
+  test('daemon does not receive Items with ' + JSON.stringify(cfg), async () => {
+    const d = await daemon(cfg)
+    await Bun.sleep(100)
+    expect(d.f.calls.filter(c => c.path.endsWith('/items') || c.path === '/inbox')).toHaveLength(0)
+  })
+}
 
-test('daemon probes only once on an old server and keeps observation on the legacy shape', async () => {
-  const d = await daemon({}, 400)
-  await waitFor(() => d.f.calls.some(c => c.path.endsWith('/observation')))
-  expect(d.f.calls.filter(c => c.path.endsWith('/items'))).toHaveLength(1)
-  expect(d.f.calls.find(c => c.path.endsWith('/observation'))!.body.connector).toBeUndefined()
-  expect(d.log().split('\n').filter(l => l.includes('mode probe did not return 200'))).toHaveLength(1)
+test('take starts by default and owns the observation; the old hand-over routes and local stores are gone', async () => {
+  const d = await daemon({ ONSEN_OBSERVATION: '' })
+  await waitFor(() => d.f.calls.some(c => c.path.endsWith('/observation') && c.body.connector === 'mac-mini/adam'))
+  for (const route of ['/onsen/person', '/onsen/action']) expect((await fetch(d.base + route, { method: 'POST' })).status).toBe(404)
+  for (const path of ['inbox/pending', 'inbox/undeliverable', 'onsen-inbox.json', 'onsen/inbound-store.json'])
+    expect(existsSync(join(d.state, path))).toBe(false)
 })
 
 test('real daemon routes one unclaimed notification per album at count or 1.5 s and replaces a newer waiting edit', async () => {
@@ -529,14 +523,15 @@ for (const [reason, outcome, code] of [
   expect(d.journal().some(r => r.rec === 'run' && r.state === 'exited' && r.reason === reason)).toBe(true)
 })
 
-for (const code of [404, 409, 0]) test('daemon stays on pull after probe ' + (code || 'network error'), async () => {
+for (const code of [404, 409, 0]) test('daemon waits for the Item endpoint after probe ' + (code || 'network error'), async () => {
   const cfg: Record<string, string> = {}
   if (!code) cfg.ONSEN_BASE = 'http://127.0.0.1:' + await freePort()
   const d = await daemon(cfg, code || 200)
-  await waitFor(() => d.log().includes('mode probe did not return 200'))
-  expect(d.log().split('\n').filter(s => s.includes('mode probe did not return 200'))).toHaveLength(1)
+  await waitFor(() => d.log().includes('retry in 60s'))
+  expect(d.log().split('\n').filter(s => s.includes('retry in 60s'))).toHaveLength(1)
   expect(d.f.calls.filter(c => c.query.has('wait') || c.path.endsWith('/take'))).toHaveLength(0)
   expect(d.f.calls.filter(c => c.path.endsWith('/items'))).toHaveLength(code ? 1 : 0)
+  expect(d.f.calls.some(c => c.path.startsWith('/inbox'))).toBe(false)
 })
 
 test('the mail lane takes its two coalesced events together and completes both', async () => {

@@ -10,7 +10,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { OnsenClient, outboundRecord, redactText, type SendCtx } from './onsen-client.ts'
 import { DeliveryFacts, type StatusView } from './onsen-status.ts'
-import { FormInbox, PendingTracker, SeenReactor, SinceTracker, StatusPin, clearStatusOff, formBodyText, formEchoText, formHosts, formTitle, pendingLine,
+import { PendingTracker, SeenReactor, SinceTracker, StatusPin, clearStatusOff, formBodyText, formEchoText, formHosts, formTitle, pendingLine,
   rewriteFormLinks, statusLine, statusText, switchOn, tpe, withKey, type FormItem, type PinApi } from './onsen-visible.ts'
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
@@ -426,59 +426,8 @@ describe('page form links', () => {
   })
 })
 
-describe('the forms inbox', () => {
-  const item = (id: number, chat = '1828'): FormItem => ({ id, form_id: id + 1000, chat, title: `表單 ${id}`, body: `{"v":${id}}`, at: '2026-11-25T06:00:00Z' })
-  const mk = (dir = mkdtempSync(join(tmpdir(), 'onsen-vis-inbox-'))) => {
-    const st = { items: [] as FormItem[], acked: [] as number[], ackStatus: 200, status: 200, spooled: [] as number[][] }
-    const order: string[] = []
-    const inbox = new FormInbox({ dir, log, waitS: 0, sleep: async () => {},
-      request: async (m, p, b) => {
-        if (m === 'GET') { order.push(`GET ${p}`); return { status: st.status, json: { items: st.items.filter(x => !st.acked.includes(x.id)) } } }
-        order.push(`POST ${p} ${JSON.stringify(b)}`)
-        if (st.ackStatus !== 200) return { status: st.ackStatus, json: {} }
-        st.acked.push(...(b as any).ids); return { status: 200, json: { acked: (b as any).ids.length } }
-      },
-      deliver: async it => { order.push(`deliver ${it.id}`); return it.chat !== '999' },
-      echo: async it => { order.push(`echo ${it.id}`) },
-      spoolAck: ids => { st.spooled.push(ids); return true },
-    })
-    return { inbox, st, order, dir }
-  }
-  test('each answer: delivered, echoed, then acked (in id order); a chat not allowlisted: acked and dropped', async () => {
-    const { inbox, st, order } = mk()
-    st.items = [item(8), item(7), item(9, '999')]
-    expect(await inbox.pollOnce()).toMatchObject({ ok: true })
-    expect(order).toEqual(['GET /forms/inbox?wait=0', 'deliver 7', 'echo 7', 'deliver 8', 'echo 8', 'deliver 9', 'POST /forms/ack {"ids":[7,8,9]}'])
-    expect(inbox.stats).toMatchObject({ delivered: 2, dropped: 1, acked: 3 })
-  })
-  test('the ack lost: spooled; the answer comes back (after a restart too): not delivered again, acked again', async () => {
-    const a = mk()
-    a.st.items = [item(20)]
-    a.st.ackStatus = 503
-    await a.inbox.pollOnce()
-    expect(a.st.spooled).toEqual([[20]])
-    const b = mk(a.dir)                                                                // a restart: the same state dir
-    b.st.items = [item(20), item(21)]
-    await b.inbox.pollOnce()
-    expect(b.order).toEqual(['GET /forms/inbox?wait=0', 'deliver 21', 'echo 21', 'POST /forms/ack {"ids":[20,21]}'])
-  })
-  test('Onsen without the route (404): asked again in a minute; an error: the backoff; a delivery that throws: not acked', async () => {
-    const { inbox, st, order } = mk()
-    st.status = 404
-    expect(await inbox.pollOnce()).toMatchObject({ ok: false, wait: 60_000 })
-    st.status = 502
-    expect(await inbox.pollOnce()).toMatchObject({ ok: false, wait: 0 })
-    const c = mk()
-    c.st.items = [item(30)]
-    ;(c.inbox as any).o.deliver = async () => { throw new Error('lanes not ready') }
-    expect(await c.inbox.pollOnce()).toMatchObject({ ok: true, wait: 5_000 })
-    expect(c.order).toEqual(['GET /forms/inbox?wait=0'])
-    expect(order.length).toBe(2)
-  })
-})
-
-describe('the spool: a form ack line, observe, request', () => {
-  test('recordFormAck → POST /forms/ack in order; observe sees each appended line; request carries the credential', async () => {
+describe('the spool after cutover', () => {
+  test('retired ack and Telegram delivery records advance locally; subsequent records still sync', async () => {
     const CRED = 'mesh_VISIBLE**********************************'
     const posted: Array<{ path: string; body: any; auth: string }> = []
     const f = (async (input: any, init?: any) => {
@@ -491,15 +440,13 @@ describe('the spool: a form ack line, observe, request', () => {
     const c = new OnsenClient({ dir, base: 'http://onsen.test/api/onsen', agent: 'adam', record: true, credential: () => CRED, log, fetch: f })
     const seen: string[] = []
     c.observe(l => seen.push(l.k))
+    writeFileSync(join(dir, 'spool.jsonl'), '{"k":"a","r":{"ids":[5,6]}}\n{"k":"r","r":{"message_id":42}}\n')
     c.recordMessage({ idem_key: 'a', agent: 'adam', client: 'telegram', chat: '1', direction: 'out', sender: 'main', body: 'x', kind: 'text', sent_at: new Date().toISOString(), status: 'ok' })
-    expect(c.recordFormAck([5, 6])).toBe(true)
-    expect(c.recordFormAck([])).toBe(false)
-    expect(seen).toEqual(['m', 'a'])
+    expect(seen).toEqual(['m'])
     await c.syncNow(true)
-    expect(posted.map(p => p.path)).toEqual(['/messages/batch', '/forms/ack'])
-    expect(posted[1]!.body).toEqual({ ids: [5, 6] })
+    expect(posted.map(p => p.path)).toEqual(['/messages/batch'])
     expect(c.pendingBytes()).toBe(0)
-    const r = await c.request('GET', '/forms/inbox?wait=0')
+    const r = await c.request('GET', '/v1/members/adam/items')
     expect(r?.status).toBe(200)
     expect(posted.at(-1)!.auth).toBe(`Bearer ${CRED}`)
     const none = new OnsenClient({ dir, base: 'http://onsen.test/api/onsen', agent: 'adam', record: true, credential: () => null, log, fetch: f })

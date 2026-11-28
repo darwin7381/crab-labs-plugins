@@ -265,3 +265,8 @@ export function withoutOnsenLabel(text: string, sender: string, agent: string, k
   if (!rest) return after ?? text                                           // the label alone: the line dropped (a text that is only the label stays)
   return after === null ? rest : `${rest}\n${after}`
 }
+
+export class HeldInOnsen extends Error {
+  readonly heldInOnsen = true
+  constructor(message: string, readonly onsenId: number, readonly sentIds: number[]) { super(message) }
+}

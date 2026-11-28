@@ -23,7 +23,7 @@ import { readFileSync } from 'fs'
 import { join } from 'path'
 
 export const WAKE_KINDS = ['joey_tg', 'joey_edit', 'joey_form', 'peer_call', 'peer_mail', 'mail_ring', 'mail_event', 'scheduled', 'alert', 'board',
-  'wd_keepwarm', 'wd_mail', 'wd_stall', 'wd_restart', 'wd_resume', 'external', 'handoff', 'card', 'batch', 'lane_exit', 'own', 'mention', 'other'] as const
+  'wd_keepwarm', 'wd_mail', 'wd_stall', 'wd_restart', 'wd_resume', 'external', 'handoff', 'card', 'batch', 'lane_exit', 'own', 'other'] as const
 export type WakeKind = typeof WAKE_KINDS[number]
 export type Urgency = 'interrupt' | 'ordered' | 'silent' | 'state'
 export const MEMBER_STATES = ['idle', 'busy', 'waiting', 'stuck', 'menu', 'compacting', 'walled', 'starting', 'offline', 'gone'] as const

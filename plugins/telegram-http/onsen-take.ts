@@ -5,26 +5,11 @@ export function machineName(host = process.env.ONSEN_HOST): string {
   return (host?.trim() || hostname().replace(/\.local$/, '')).toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+/, '').slice(0, 32) || 'unknown'
 }
 
-export function takeRefusal(o: { inbox: boolean; roamer: boolean; lanes: boolean; record: boolean; observation: boolean }): string | undefined {
-  if (o.inbox) return 'INBOX_ONLY'
-  if (o.roamer) return 'ROAMER'
-  if (!o.lanes) return 'LANES_ON is off'
-  if (!o.record) return 'recording is off'
-  if (!o.observation) return 'ONSEN_OBSERVATION is off'
-}
-
-/** The connector parameter distinguishes this probe from a normal member inbox read. */
-export async function deliveryMode(req: ActionReq, path: string, connector: string): Promise<'take' | 'pull'> {
-  const r = await req('GET', path + '?' + new URLSearchParams({ limit: '1', connector }), undefined, 5000).catch(() => null)
-  return r?.status === 200 ? 'take' : 'pull'
-}
-
 export type ItemRequest = (...args: [...Parameters<ActionReq>, signal?: AbortSignal]) => ReturnType<ActionReq>
 
 export class TakeMode {
   readonly path: string
   readonly connector: string
-  checking = true
   active = false
   observationRequired = false
   private stopped = false
@@ -39,14 +24,15 @@ export class TakeMode {
   }
 
   async probe(): Promise<void> {
-    const mode = await deliveryMode(this.req, this.path, this.connector)
+    const query = new URLSearchParams({ limit: '1', connector: this.connector })
+    const r = await this.req('GET', this.path + '?' + query, undefined, 5000).catch(() => null)
     if (this.stopped) return
-    this.checking = false
-    if (mode === 'pull') {
-      if (this.reason === 'not_current_connector') this.pause(this.reason, 45_000)
-      else this.pause('mode probe did not return 200', 60_000)
+    if (r?.status !== 200) {
+      const code = r?.json?.error?.code
+      this.pause(r ? `HTTP ${r.status} ${code ?? 'probe refused'}` : 'probe unavailable', code === 'not_current_connector' ? 45_000 : 60_000)
       return
     }
+    clearTimeout(this.timer)
     this.reason = ''
     this.active = this.observationRequired = true
     this.log('onsen take: started ' + this.connector)
@@ -56,7 +42,7 @@ export class TakeMode {
   pause(reason: string, ms: number): void {
     if (this.stopped) return
     if (this.reason === reason && this.timer) return
-    if (reason !== this.reason) this.log('onsen take: ' + reason)
+    if (reason !== this.reason) this.log(`onsen take: ${this.connector} ${reason}; retry in ${ms / 1000}s`)
     this.reason = reason
     if (this.active) { this.active = false; this.changed(false) }
     clearTimeout(this.timer)
