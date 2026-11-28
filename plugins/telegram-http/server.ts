@@ -560,7 +560,7 @@ async function keyboardAsk(chat: string, text: string, btns: InlineButton[], whe
   return true
 }
 /** a press in Onsen on a command's choice: what the Telegram tap on that button does (runControlCallback), then applied */
-async function applyKeyboardControl(ka: KeyboardAsk, h: Onsen.ActionHandle, c: Onsen.ActionControl): Promise<boolean> {
+async function applyKeyboardControl(ka: KeyboardAsk, h: Onsen.ActionHandle, c: Onsen.ActionControl, taken: boolean): Promise<boolean> {
   const acts = onsenActions!
   const idx = /^\d{1,2}$/.test(c.option_id) ? Number(c.option_id) - 1 : -1
   if (ka.ended || idx < 0 || idx >= ka.datas.length) { acts.cancel(h, ka.ended ? '這個選項已經按過了' : `不認得的選項 ${c.option_id}`); return false }
@@ -568,9 +568,9 @@ async function applyKeyboardControl(ka: KeyboardAsk, h: Onsen.ActionHandle, c: O
   const here = ka.where                                                       // answered where the command was typed
   const reply = (msg: string, opts?: ReplyOptions) => sendTextWithMaybeKeyboard(ka.chat, msg, opts?.keyboard, here)
   let ok = true
-  try { await Onsen.withSender('system:control', () => runControlCallback(ka.datas[idx]!, String(process.env.TELEGRAM_HTTP_PORT ?? HTTP_PORT), reply, () => { ok = false })) }
+  try { await Onsen.withSender('system:control', () => runControlCallback(ka.datas[idx]!, String(process.env.TELEGRAM_HTTP_PORT ?? HTTP_PORT), reply, taken ? () => { ok = false } : undefined)) }
   catch (e) { ok = false; log('warn', `connector: the choice ${c.option_id} of action ${c.action_id} failed: ${e instanceof Error ? e.message : e}`) }
-  if (!ok) { acts.cancel(h, '選項未能套用'); return false }
+  if (taken && !ok) { acts.cancel(h, '選項未能套用'); return false }
   acts.applied(h, { at: new Date().toISOString() })
   log('info', `connector: action ${c.action_id} (a command's choice): option ${c.option_id} pressed in Onsen, done as a tap on it`)
   return ok
@@ -1837,7 +1837,7 @@ function promptOf(h: Onsen.ActionHandle | null | undefined): PermPrompt | undefi
 }
 /** WO-176: Onsen's control item for one of this agent's Actions (a person pressed an option in Onsen), handed over by the agent-inbox daemon
  *  (POST /onsen/action): pressed here as a press in Telegram would be, then reported applied; a prompt that is gone: cancelled, nothing pressed */
-async function applyActionControl(c: Onsen.ActionControl): Promise<boolean> {
+async function applyActionControl(c: Onsen.ActionControl, taken = false): Promise<boolean> {
   const acts = onsenActions
   if (!acts) return false
   const p = [...permPrompts.values()].find(x => x.action?.id === c.action_id)
@@ -1846,7 +1846,7 @@ async function applyActionControl(c: Onsen.ActionControl): Promise<boolean> {
   const pa = [...pickerAsks.values()].find(x => x.h.id === c.action_id)   // WO-197: a screen menu this daemon asked about in Onsen
   if (pa) return applyPickerControl(pa, h, c)
   const ka = [...keyboardAsks.values()].find(x => x.h.id === c.action_id)   // WO-197 segment 2: a command's choice
-  if (ka) return applyKeyboardControl(ka, h, c)
+  if (ka) return applyKeyboardControl(ka, h, c, taken)
   const ca = [...clearAsks.values()].find(x => x.h.id === c.action_id)      // WO-197 segment 2: /clear's 「不要讓它看到之前的」
   if (ca) return applyClearControl(ca, h, c)
   if (dutyOfficer) {
@@ -5046,7 +5046,7 @@ async function routeInboxItem(row: InboxItem, change?: 'edited' | 'version'): Pr
     let applied = false
     try {
       const c = Onsen.actionControlOf(payload)
-      if (c && c.action_id === row.action_id) applied = await applyActionControl(c)
+      if (c && c.action_id === row.action_id) applied = await applyActionControl(c, true)
     } finally { receiver.report([item], applied ? 'completed' : 'not_applied') }
     return
   }

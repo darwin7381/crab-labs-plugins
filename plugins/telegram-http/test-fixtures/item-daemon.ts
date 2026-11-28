@@ -24,6 +24,10 @@ if (process.env.ROAMER_MODE === '1') {
   const lanes = await import('../lanes.ts')
   spyOn(lanes, 'claudePidOf').mockImplementation(req => Number(req.headers['x-test-claude-pid']) || null)
 }
+if (process.env.C6_CHOICE_FAILURE === '1') {
+  const controls = await import('../channel-bot-control.ts')
+  spyOn(controls, 'handleCallbackData').mockImplementation(async () => { throw new Error('fixture choice failed') })
+}
 if (process.env.C6_ROAMER_MENU === '1') {
   const finder = await import('../session-finder.ts')
   const dir = process.env.AGENT_WORKSPACE_DIR!

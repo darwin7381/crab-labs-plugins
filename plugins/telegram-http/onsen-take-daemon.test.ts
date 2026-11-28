@@ -661,6 +661,29 @@ test('a later successful probe drains the local poll before the bridge can carry
   await waitFor(() => d.f.calls.some(c => c.body?.connector === 'mac-mini/' + member && c.path.endsWith('/observation')))
 }, 9000)
 
+for (const mode of ['pull', 'take']) test('a command choice that throws follows ' + mode + ' Action semantics', async () => {
+  const actions = startOnsenStandin({ 'test-member': 'adam' })
+  clean.push(() => actions.stop())
+  const take = mode === 'take'
+  const d = await daemon({ C6_CHOICE_FAILURE: '1', ONSEN_OWNER: 'joey', CHANNEL_BOT_TMUX_SESSION: 'lab',
+    ONSEN_TAKE: take ? 'adam' : '' }, take ? 200 : 409, undefined, actions.port)
+  const post = (path: string, body: unknown) => fetch(d.base + path, { method: 'POST',
+    headers: { Authorization: 'Bearer test-loopback', 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+  const cmd = command(d, 'model', '/model', '100')
+  if (take) await waitFor(() => cmd.state === 'completed')
+  else expect((await post('/onsen/person', { kind: 'person_message', payload: cmd.payload })).status).toBe(200)
+  await waitFor(() => actions.actions.size === 1)
+  const action = [...actions.actions.values()][0]!, payload = actions.press(action.id, '1')
+  if (take) {
+    const control = d.f.add('choice', 'control', { action_id: action.id, payload })
+    await waitFor(() => control.reason === 'not_applied')
+  } else expect((await post('/onsen/action', payload)).ok).toBe(true)
+  const calls = () => actions.acalls.filter(c => c.path === '/v1/actions/' + action.id + (take ? '/cancel' : '/applied'))
+  await waitFor(() => calls().length === 1)
+  expect(d.log()).toContain('fixture choice failed')
+  expect(actions.acalls.some(c => c.path.endsWith(take ? '/applied' : '/cancel'))).toBe(false)
+}, 12000)
+
 test('/roam without a target creates one menu Action; a returned choice is handled once through control', async () => {
   const actions = startOnsenStandin({ 'test-member': member })
   clean.push(() => actions.stop())
