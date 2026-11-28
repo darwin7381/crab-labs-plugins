@@ -84,7 +84,7 @@ import { topicLink } from './lanes-topics.ts'
 import { startStartupPickerWatchdog, handleStartupPickerCallback, capturePane, detectStartupPicker, driveStartupPicker, rearmStartupPicker, useLanesMenuRules, permissionShaped, type DetectedPicker, type PickerTarget } from './startup-picker.ts'   // WO-168: its own-pane looks are pane-look's
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
 import { expandHiddenEntities } from './entities.ts'
-import { FORWARDERS, bearerIdentity, claimedIdentity, loadTable, readCredentialFile, readOwnCredential, resolveInbound, verdictMeta, type Verdict } from './mesh-identity.ts'
+import { FORWARDERS, bearerIdentity, cachedCredentialFile, claimedIdentity, loadTable, readCredentialFile, readOwnCredential, resolveInbound, verdictMeta, type Verdict } from './mesh-identity.ts'
 import { OnsenInbox, OnsenPuller, OnsenSender, dedupeKeyOf, isMailboxInject, itemKey, recipientNote, switchOn, type HandResult, type PullItem } from './onsen-inbox.ts'
 import * as Onsen from './onsen-client.ts'
 import * as OnsenEdit from './onsen-edit.ts'
@@ -345,15 +345,52 @@ const tg: RoamerTelegram | null = ROAMER
 const botName = (): string => tg?.botUsername ?? ''
 // Onsen (WO-139): every Telegram message in or out of this daemon becomes one record in Onsen (onsen-client.ts: local spool first, synced in order).
 // Telegram daemon only. ONSEN_BASE / ONSEN_RECORD / ONSEN_AGENTS / ONSEN_CREDENTIAL_FILE come from the plist or the machine config (fleet-config.ts).
-// The credential is the agent's mesh credential, kept by its agent-inbox daemon (<workspace>/.agent-inbox-state/mesh-credential); never logged.
+// The Telegram client's default credential is kept by its agent-inbox daemon (<workspace>/.agent-inbox-state/mesh-credential).
 const ONSEN_AGENT = Onsen.agentName(process.env, process.env.AGENT_WORKSPACE_DIR ?? dirname(STATE_DIR))
 /** WO-175: this agent's daemons report the moments of the Calls it receives (lanes on, recording on, ONSEN_CALL_STATE not off): the two old start receipts
  *  (the agent-inbox daemon's when a lane takes a scheduled run, the main's M1 bind) are off then: the Call's `running` is the start receipt BTCC reads */
 const CALL_STATE = Lanes.LANES_ON && Onsen.recordFor(process.env, ONSEN_AGENT) && Onsen.callStateOn(process.env, ONSEN_AGENT)
-const ONSEN_CRED_FILE = (process.env.ONSEN_CREDENTIAL_FILE ?? '').trim() || join(process.env.AGENT_WORKSPACE_DIR ?? dirname(STATE_DIR), '.agent-inbox-state', 'mesh-credential')
+const ONSEN_BASE = Onsen.onsenBase(process.env)
+const FLEET_CORE_BASE = (process.env.FLEET_CORE_BASE ?? 'https://core.kbro.ai').replace(/\/+$/, '')
+// Without a configured BTCC base, the scheduler and comms log are off.
+const BTCC_API_BASE = (process.env.BTCC_API_BASE ?? '').trim().replace(/\/+$/, '')
+const ONSEN_CRED_FILE = (process.env.ONSEN_CREDENTIAL_FILE ?? '').trim()
+const telegramMeshFile = join(process.env.AGENT_WORKSPACE_DIR ?? dirname(STATE_DIR), '.agent-inbox-state', 'mesh-credential')
+const readBenchCredential = ONSEN_CRED_FILE ? cachedCredentialFile(ONSEN_CRED_FILE) : null
+const readMeshCredential = cachedCredentialFile(join(STATE_DIR, 'mesh-credential'), value =>
+  log('info', `mesh credential: ${value ? 'loaded (outbound calls are signed)' : 'none (outbound calls unsigned)'}`))
+// A gateway can serve both backends. Match the most specific mounted path, including
+// the two BTCC mail routes that a mail URL or roster entry can address on that gateway.
+const authBases = [
+  ...['mail', 'mailbox'].map(route => ({ base: BTCC_API_BASE ? URL.parse(`${BTCC_API_BASE}/api/mesh/${route}`) : null, bench: false })),
+  { base: URL.parse(ONSEN_BASE), bench: true },
+  { base: URL.parse(FLEET_CORE_BASE), bench: true },
+  { base: URL.parse(BTCC_API_BASE), bench: false },
+].sort((a, b) => (b.base?.pathname.length ?? 0) - (a.base?.pathname.length ?? 0))
+
+function onBase(url: URL, base: URL | null): boolean {
+  if (!base || url.origin !== base.origin) return false
+  const path = base.pathname.replace(/\/+$/, '')
+  return url.pathname === path || url.pathname.startsWith(`${path}/`)
+}
+
+function credentialFor(url: string | null, fallback = readMeshCredential): string | null {
+  // The roster can advertise BTCC's mailbox inject even on a machine with no BTCC_API_BASE.
+  if (readBenchCredential && url && !isMailboxInject(url)) {
+    const target = URL.parse(url)
+    if (target && authBases.find(({ base }) => onBase(target, base))?.bench) return readBenchCredential()
+  }
+  return fallback()
+}
+
+function meshAuth(url: string | null = null): Record<string, string> {
+  const value = credentialFor(url)
+  return value ? { Authorization: `Bearer ${value}` } : {}
+}
+
 const onsen: Onsen.OnsenClient | null = INBOX_ONLY ? null : new Onsen.OnsenClient({ fastStatus: process.env.ONSEN_STATUS_FAST !== '0',
-  dir: join(STATE_DIR, 'onsen'), base: Onsen.onsenBase(process.env), agent: ONSEN_AGENT, record: Onsen.recordFor(process.env, ONSEN_AGENT),
-  credential: () => readCredentialFile(ONSEN_CRED_FILE), credentialWhere: ONSEN_CRED_FILE, log,
+  dir: join(STATE_DIR, 'onsen'), base: ONSEN_BASE, agent: ONSEN_AGENT, record: Onsen.recordFor(process.env, ONSEN_AGENT),
+  credential: () => credentialFor(ONSEN_BASE, () => readCredentialFile(telegramMeshFile)), credentialWhere: ONSEN_CRED_FILE || telegramMeshFile, log,
   joeyChat: () => { try { return String(loadAccess().allowFrom[0] ?? '') } catch { return '' } },
 })
 const ONSEN_TAKE_ON = switchOn(process.env.ONSEN_TAKE, ONSEN_AGENT)
@@ -2031,24 +2068,6 @@ function permOffScreen(p: PermPrompt, reason: string): void {
 const INBOX_REGISTRY_PATH = process.env.AGENT_INBOX_REGISTRY
   ?? join(process.env.HOME ?? '', '.claude', 'agent-inbox', 'registry.json')
 const INBOX_SELF = process.env.AGENT_INBOX_SELF ?? 'unknown-agent'
-// BTCC control plane (Comms log, Scheduler run acks). Deliberately no built-in default:
-// the deployment sets BTCC_API_BASE (machine config, see fleet-config.ts). Unset = these
-// features are off; mesh delivery itself still works.
-const BTCC_API_BASE = (process.env.BTCC_API_BASE ?? '').trim().replace(/\/+$/, '')
-
-// This daemon's own mesh credential (`<STATE_DIR>/mesh-credential`, provisioned per identity;
-// access design v1.1). Re-read when the file changes, so provisioning or rotation needs no
-// restart. Absent → calls go out unsigned exactly as before (dual track).
-let ownCred: { mtimeMs: number; value: string | null } = { mtimeMs: -1, value: null }
-function meshAuth(): Record<string, string> {
-  let m = -2
-  try { m = statSync(join(STATE_DIR, 'mesh-credential')).mtimeMs } catch {}
-  if (m !== ownCred.mtimeMs) {
-    ownCred = { mtimeMs: m, value: m >= 0 ? readOwnCredential(STATE_DIR) : null }
-    log('info', `mesh credential: ${ownCred.value ? 'loaded (outbound calls are signed)' : 'none (outbound calls unsigned)'}`)
-  }
-  return ownCred.value ? { Authorization: `Bearer ${ownCred.value}` } : {}
-}
 
 // ---- Scheduler daemon-level auto-ack (SCHEDULER-MODULE backlog #1) ----------
 // When a BTCC Scheduler wake-up ([scheduled][tag][run:N]) is CONFIRMED written
@@ -2084,27 +2103,24 @@ function maybeAutoAckScheduled(runId: string | undefined): void {
 
 // WO-151 3a / 3b (Relay part 3, onsen-inbox.ts): this agent-inbox daemon takes what is sent to it from Onsen (ONSEN_PULL) and writes its calls there
 // (ONSEN_SEND; WO-158, 1.52.0: only there, no push to the roster url; off = the push, the stop switch). Each switch: a comma list of agent names or
-// `*` (the plist, then the machine config), read at start; one base, ONSEN_BASE (default https://core.kbro.ai/api/onsen); the credential is this
-// daemon's mesh credential. Off: neither runs; only the dedupe keys /inject delivers are
+// `*` (the plist, then the machine config), read at start; one base, ONSEN_BASE (default https://core.kbro.ai/api/onsen).
+// The default credential is this daemon's mesh credential. Off: neither runs; only the dedupe keys /inject delivers are
 // recorded (onsen-inbox.json), so that turning ONSEN_PULL on later never hands on again what /inject already delivered.
 const ONSEN_PULL_ON = INBOX_ONLY && switchOn(process.env.ONSEN_PULL, INBOX_SELF)
 const ONSEN_SEND_ON = INBOX_ONLY && switchOn(process.env.ONSEN_SEND, INBOX_SELF)
 const onsenInbox: OnsenInbox | null = INBOX_ONLY ? new OnsenInbox({ file: join(STATE_DIR, 'onsen-inbox.json'), log }) : null
-const ONSEN_INBOX_BASE = Onsen.onsenBase(process.env)
 const onsenReq = ONSEN_PULL_ON || ONSEN_SEND_ON ? (() => {
-  // WO-212 bench V0 (Chiron's sub-agent 02:43Z): with ONSEN_CREDENTIAL_FILE named (the lab's LAB_ONSEN=bench), the inbox's own pull/send signs with that
-  // file too, as the Telegram daemon's client does (:353); before, it sent the production mesh credential to the bench (401). Unset: as before
-  const inboxCred = (process.env.ONSEN_CREDENTIAL_FILE ?? '').trim() ? () => readCredentialFile(ONSEN_CRED_FILE) : () => readOwnCredential(STATE_DIR)
-  const c = new Onsen.OnsenClient({ dir: join(STATE_DIR, 'onsen'), base: ONSEN_INBOX_BASE, agent: INBOX_SELF, record: false, credential: inboxCred, log })
+  const c = new Onsen.OnsenClient({ dir: join(STATE_DIR, 'onsen'), base: ONSEN_BASE, agent: INBOX_SELF, record: false,
+    credential: () => credentialFor(ONSEN_BASE, () => readOwnCredential(STATE_DIR)), log })
   return (m: 'GET' | 'POST', path: string, b?: unknown, t?: number) => c.request(m, path, b, t)
 })() : null
-const onsenPuller: OnsenPuller | null = ONSEN_PULL_ON && onsenReq && onsenInbox ? new OnsenPuller({ req: onsenReq, base: ONSEN_INBOX_BASE, inbox: onsenInbox,
+const onsenPuller: OnsenPuller | null = ONSEN_PULL_ON && onsenReq && onsenInbox ? new OnsenPuller({ req: onsenReq, base: ONSEN_BASE, inbox: onsenInbox,
   deliver: (it, again) => deliverPulled(it, again), log, host: (process.env.ONSEN_HOST ?? '').trim() || hostname().replace(/\.local$/, ''),
   ...(Number(process.env.ONSEN_PERSON_RETRY_MS) > 0 ? { laterMs: Number(process.env.ONSEN_PERSON_RETRY_MS) } : {}),   // WO-194 A.2: tests only
   ...(process.env.ONSEN_PULL_WAIT_S ? { waitS: Number(process.env.ONSEN_PULL_WAIT_S) } : {}),
   ...(process.env.ONSEN_PULL_BACKOFF_MS ? { minBackoffMs: Number(process.env.ONSEN_PULL_BACKOFF_MS), maxBackoffMs: Number(process.env.ONSEN_PULL_BACKOFF_MS) * 4 } : {}) }) : null
 const onsenSender: OnsenSender | null = ONSEN_SEND_ON && onsenReq ? new OnsenSender({ req: onsenReq, log }) : null
-if (INBOX_ONLY) log('info', `onsen inbox: pull ${onsenPuller ? 'on' : 'off'}, send ${onsenSender ? 'on' : 'off'}${onsenReq ? ` (${ONSEN_INBOX_BASE})` : ''}; ${onsenInbox?.keyCount ?? 0} delivered key(s), last_seq ${onsenInbox?.lastSeq ?? 0}, ${onsenInbox?.pending.length ?? 0} pending`)
+if (INBOX_ONLY) log('info', `onsen inbox: pull ${onsenPuller ? 'on' : 'off'}, send ${onsenSender ? 'on' : 'off'}${onsenReq ? ` (${ONSEN_BASE})` : ''}; ${onsenInbox?.keyCount ?? 0} delivered key(s), last_seq ${onsenInbox?.lastSeq ?? 0}, ${onsenInbox?.pending.length ?? 0} pending`)
 
 /** The roster (agent-registry-sync's copy of agent-registry.json). WO-158: with ONSEN_SEND on only the names are needed (send_to_agent's name check,
  *  the lanes' peer list); `url` is read only for a mailbox-type identity (BTCC's mailbox inject) and, with ONSEN_SEND off, for the push. */
@@ -2153,7 +2169,7 @@ const SEND_MAX_CHARS = 3500
 // MAIL_ONSEN=1 (machine config) sends every mailbox call there; unset or 0 = BTCC as before (the stop switch). Read at start.
 const MAIL_ONSEN = (process.env.MAIL_ONSEN ?? '') === '1'
 function mailUrl(path: string): string | null {
-  if (MAIL_ONSEN && path.startsWith('/api/mesh/mail')) return `${(process.env.FLEET_CORE_BASE ?? 'https://core.kbro.ai').replace(/\/+$/, '')}/api/onsen/mail${path.slice('/api/mesh/mail'.length)}`
+  if (MAIL_ONSEN && path.startsWith('/api/mesh/mail')) return `${FLEET_CORE_BASE}/api/onsen/mail${path.slice('/api/mesh/mail'.length)}`
   return BTCC_API_BASE ? `${BTCC_API_BASE}${path}` : null
 }
 log('info', `mail: ${MAIL_ONSEN ? 'Onsen (/api/onsen/mail, MAIL_ONSEN=1)' : 'BTCC (/api/mesh/mail)'}`)
@@ -2162,7 +2178,7 @@ async function btccMail(method: 'GET' | 'POST', path: string, body?: unknown): P
   if (!url) return { status: 503, json: { detail: 'BTCC_API_BASE is not configured on this machine' } }
   const r = await fetch(url, {
     method,
-    headers: { 'Content-Type': 'application/json', 'User-Agent': `agent-inbox/${INBOX_SELF}`, ...meshAuth() },
+    headers: { 'Content-Type': 'application/json', 'User-Agent': `agent-inbox/${INBOX_SELF}`, ...meshAuth(url) },
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
     signal: AbortSignal.timeout(10000),
   })
@@ -2174,14 +2190,14 @@ async function btccMail(method: 'GET' | 'POST', path: string, body?: unknown): P
 // a status the tools explain ("改用搜尋" for ask), not a tool crash.
 // WO-167: the wall lives in Onsen (/api/onsen/feed/*, the same endpoints and shapes). FEED_ONSEN=1 (machine config, as MAIL_ONSEN) sends every
 // feed call there (fleet-mail.ts feedPath); unset or 0 = /api/feed as before (the stop switch). Read at start. Callers keep naming /api/feed/*.
-const FLEET_CORE_BASE = (process.env.FLEET_CORE_BASE ?? 'https://core.kbro.ai').replace(/\/+$/, '')
 const FEED_ONSEN = (process.env.FEED_ONSEN ?? '') === '1'
 log('info', `feed: ${FEED_ONSEN ? 'Onsen (/api/onsen/feed, FEED_ONSEN=1)' : 'Fleet Core (/api/feed)'}`)
 async function coreFeed(method: 'GET' | 'POST', path: string, body?: unknown, timeoutMs = 10000): Promise<{ status: number; json: any }> {
   try {
-    const r = await fetch(`${FLEET_CORE_BASE}${feedPath(path, FEED_ONSEN)}`, {
+    const url = `${FLEET_CORE_BASE}${feedPath(path, FEED_ONSEN)}`
+    const r = await fetch(url, {
       method,
-      headers: { 'Content-Type': 'application/json', 'User-Agent': `agent-inbox/${INBOX_SELF}`, ...meshAuth() },
+      headers: { 'Content-Type': 'application/json', 'User-Agent': `agent-inbox/${INBOX_SELF}`, ...meshAuth(url) },
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
       signal: AbortSignal.timeout(timeoutMs),
     })
@@ -2484,7 +2500,7 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
         headers: {
           'Content-Type': 'application/json',
           ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Inject-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
-          ...meshAuth(),
+          ...meshAuth(pushUrl),
         },
         body: JSON.stringify({ text: body, from: INBOX_SELF, ...payload }),
         signal: AbortSignal.timeout(8000),
@@ -3127,10 +3143,11 @@ if (isControlEnabled() || isRoamerEnabled()) {
       return isRateLimitMenu(lines) || (pk && Lanes.mainMenuOwned(pk.options)) ? 'the lanes main-wall probe' : null
     } } : {}),
     mail: async (title, body, to) => {
-      let cred = ''
-      try { cred = readFileSync(DUTY_CREDENTIAL, 'utf8').trim() } catch {}
-      if (!cred) return 'no duty-officer credential on this machine'
       const url = mailUrl('/api/mesh/mail/send')
+      const cred = credentialFor(url, () => {
+        try { return readFileSync(DUTY_CREDENTIAL, 'utf8').trim() } catch { return null }
+      })
+      if (!cred) return 'no duty-officer credential on this machine'
       if (!url) return 'BTCC_API_BASE is not configured on this machine'
       try {
         const r = await fetch(url, {

@@ -52,6 +52,22 @@ export function readCredentialFile(path: string): string | null {
   }
 }
 
+/** Recheck the file on rotation, removal or first provisioning. */
+export function cachedCredentialFile(path: string, changed?: (value: string | null) => void): () => string | null {
+  let mtimeMs: number | undefined
+  let value: string | null = null
+  return () => {
+    let current = -1
+    try { current = statSync(path).mtimeMs } catch {}
+    if (current !== mtimeMs) {
+      value = current >= 0 ? readCredentialFile(path) : null
+      mtimeMs = current
+      changed?.(value)
+    }
+    return value
+  }
+}
+
 export function tablePath(): string {
   return process.env.MESH_CREDENTIALS_TABLE ?? join(homedir(), '.claude', 'agent-inbox', 'mesh-credentials.json')
 }
