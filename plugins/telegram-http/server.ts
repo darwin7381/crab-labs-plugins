@@ -377,7 +377,7 @@ if (ONSEN_TAKE_ON) {
         if (active) { if (connectorReady) { itemClaims!.start(); itemPeek!.reset() } } else itemPeek!.stop()
         registryStatusChanged?.()
       }, line => log('info', line))
-    itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, ROAMER ? () => itemPeek!.reset() : Lanes.offerMissed, () => registryStatusChanged?.(), takeMode.now)
+    itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, ROAMER ? () => itemPeek!.reset() : Lanes.offerMissed, () => registryStatusChanged?.(), takeMode.now, t => roamerItems?.stateOf(t))
     if (ROAMER && itemClaims.carriedBy(takeMode.connector)) CONNECTOR = onsen.cfg.record = takeMode.observationRequired = true
     onsen.watchItemReports(line => itemClaims!.replay(line), (line, ok) => itemClaims!.acknowledged(line, ok), line => itemClaims!.reportBody(line))
     itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at), () => itemPeek!.reset())

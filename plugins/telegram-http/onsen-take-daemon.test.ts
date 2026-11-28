@@ -731,17 +731,22 @@ async function target(d: Awaited<ReturnType<typeof daemon>>) {
   writeFileSync(transcript, '')
   const write = (fields: object) => appendFileSync(transcript, JSON.stringify({ entrypoint: 'cli', timestamp: new Date().toISOString(), ...fields }) + '\n')
   const select = () => writeFileSync(roamerState(d.root).ROAMER_STATE_FILE, JSON.stringify({ current_target: { tmux, claude_pid: child.pid, cwd, session_id: sid } }))
-  const client = new Client({ name: 'lab', version: '1' }), got: any[] = []
-  client.fallbackNotificationHandler = async n => { if (n.method === 'notifications/claude/channel') got.push(n.params) }
-  await client.connect(new StreamableHTTPClientTransport(new URL(d.base + '/mcp'), { requestInit: { headers: { 'x-test-claude-pid': String(child.pid) } } }))
-  clean.push(() => client.close())
+  const got: any[] = []
+  async function connect() {
+    const client = new Client({ name: 'lab', version: '1' })
+    client.fallbackNotificationHandler = async n => { if (n.method === 'notifications/claude/channel') got.push(n.params) }
+    await client.connect(new StreamableHTTPClientTransport(new URL(d.base + '/mcp'), { requestInit: { headers: { 'x-test-claude-pid': String(child.pid) } } }))
+    clean.push(() => client.close())
+    return client
+  }
+  const client = await connect()
   function switchSession() {
     sid = randomUUID()
     transcript = join(project, sid + '.jsonl')
     writeFileSync(transcript, '')
     status('idle')
   }
-  return { child, get sid() { return sid }, cwd, get transcript() { return transcript }, switchSession, select, status, client, got, accept: (msg: any) => write({ type: 'user', message: { content:
+  return { child, get sid() { return sid }, cwd, get transcript() { return transcript }, switchSession, select, status, client, connect, got, accept: (msg: any) => write({ type: 'user', message: { content:
     `<channel source="telegram" chat_id="1" message_id="${msg.meta.message_id}" onsen_claims="${msg.meta.onsen_claims}">hello</channel>` } }),
     stop: () => write({ type: 'system', subtype: 'turn_duration' }) }
 }
@@ -859,6 +864,55 @@ test('after a daemon restart a long turn still ends on its original target trans
   expect(row.session_id).toBe(a.sid)
   expect(b.got).toHaveLength(0)
 }, 15000)
+
+test('a missed item waits through fresh peeks and restart until its session changes state', async () => {
+  const d = await daemon(roamerEnv, 200, roamerState), a = await target(d)
+  a.select()
+  // Server-stamped taken_at leaves one second of the normal 20 s acceptance window.
+  d.f.advance(-19_000)
+  const row = d.f.add('unseen')
+  await waitFor(() => row.reason === 'not_taken')
+  expect(a.got.filter(n => n.content === row.id)).toHaveLength(1)
+  a.status('idle') // refreshing the same status timestamp is not a state change
+  await Bun.sleep(1300)
+  expect(row.failures).toBe(1)
+  expect(a.got.filter(n => n.content === row.id)).toHaveLength(1)
+  await d.restart()
+  await a.connect()
+  const other = d.f.add('still-receiving')
+  await waitFor(() => a.got.some(n => n.content === other.id))
+  expect(row.failures).toBe(1)
+  expect(row.state).toBe('waiting')
+  expect(a.got.filter(n => n.content === row.id)).toHaveLength(1)
+  a.status('busy')
+  await Bun.sleep(350)
+  a.status('idle')
+  await waitFor(() => a.got.filter(n => n.content === row.id).length === 2)
+  a.accept(a.got.filter(n => n.content === row.id)[1])
+  await waitFor(() => row.claim?.session_id === a.sid)
+  expect(row.failures).toBe(1)
+}, 16000)
+
+test('a missed session can change state while a different busy target is selected', async () => {
+  const d = await daemon(roamerEnv, 200, roamerState), a = await target(d), b = await target(d)
+  a.select(); b.status('busy')
+  d.f.advance(-19_000)
+  const row = d.f.add('await-edge')
+  await waitFor(() => row.reason === 'not_taken')
+  d.f.advance(Date.now() - d.f.now()) // the next take gets a fresh acceptance window
+  b.select()
+  await Bun.sleep(400)
+  a.status('busy')
+  await Bun.sleep(400)
+  a.status('idle')
+  await Bun.sleep(400)
+  expect(b.got).toHaveLength(0)
+  a.select()
+  await waitFor(() => a.got.length === 2)
+  a.accept(a.got[1])
+  await waitFor(() => row.claim?.session_id === a.sid)
+  expect(row.failures).toBe(1)
+}, 12000)
 
 test('changing target during take releases that attempt before writing either stream', async () => {
   const d = await daemon(roamerEnv, 200, roamerState)

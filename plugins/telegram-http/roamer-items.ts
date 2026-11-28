@@ -1,9 +1,9 @@
 import { statSync } from 'fs'
 import { dirname } from 'path'
-import type { ItemRef, ReceivingTarget } from './onsen-items.ts'
+import type { ItemRef, ReceivingState, ReceivingTarget } from './onsen-items.ts'
 import type { ItemReceiver } from './onsen-receive.ts'
 import type { Claims } from './onsen-claims.ts'
-import { REGISTRY_SETTLE_MS, TurnWatch, type Registry } from './onsen-status.ts'
+import { REGISTRY_SETTLE_MS, TurnWatch, type RegEntry, type Registry } from './onsen-status.ts'
 
 type Notification = { method: string; params: unknown }
 type Offer = { target: ReceivingTarget; stream: string }
@@ -24,19 +24,29 @@ export class RoamerItems {
     revisit(): void
   }) {}
 
+  private edge(reg: RegEntry): ReceivingState {
+    const watch = this.watches.get(reg.sessionId)
+    return { status: reg.status, turn: watch?.turnFacts()?.id ?? null, lastTurn: watch?.lastTurn()?.id ?? null }
+  }
+  stateOf(t: ReceivingTarget): ReceivingState | undefined {
+    const reg = this.o.registry.entries().find(e => e.pid === t.claude_pid && e.sessionId === t.session_id)
+    if (reg && this.watches.has(reg.sessionId)) return this.edge(reg)
+  }
   private offerTo(): Offer | null {
     const target = this.o.selected()
     if (!target || !this.o.alive(target.claude_pid)) return null
     const reg = this.o.registry.main()
     if (!reg || reg.sessionId !== target.session_id || reg.pid !== target.claude_pid || reg.status !== 'idle') return null
+    if (!this.watches.has(reg.sessionId)) return null
     const stream = this.o.stream(target)
-    return stream ? { target, stream } : null
+    return stream ? { target: { ...target, stateAtOffer: this.edge(reg) }, stream } : null
   }
 
   async offer(refs: ItemRef[], notification: Notification): Promise<void> {
     const dest = this.offerTo()
     if (!dest) return
     const { target, stream } = dest
+    if (refs.some(ref => this.o.claims.waitingForState(target.session_id, ref.onsen_item_id))) return
     // A long turn may outgrow TurnWatch's ordinary tail before the daemon restarts.
     try { target.transcriptOffset = statSync(target.transcript).size } catch { target.transcriptOffset = 0 }
     const given = (await this.o.receiver.receive(refs.map(r => ({ ...r, target })))).given
@@ -88,15 +98,21 @@ export class RoamerItems {
         this.o.watch.changed()
       }
       if (reg?.status !== 'busy') this.busyTurns.delete(sid)
+      if (reg) this.o.claims.observeState(sid, this.edge(reg))
       // The common status feed closes the selected session. A switched-away session still has its own registry facts.
       if (sid !== selected?.session_id && reg?.status === 'idle' && !watch.busy())
         this.o.claims.statusRecord(sid, 'idle', id => this.o.registry.backgroundAgents(id, dirname(t.transcript)), REGISTRY_SETTLE_MS)
+    }
+    for (const sid of this.o.claims.waitingSessions()) {
+      if (live.has(sid)) continue
+      const reg = entries.find(e => e.sessionId === sid)
+      if (reg) this.o.claims.observeState(sid, { status: reg.status })
     }
     if (selected && switched && this.o.alive(selected.claude_pid) && !this.o.claims.targets().some(t => t.session_id === selected.session_id))
       this.o.refreshSession(selected, selectedEntry.sessionId)
     for (const sid of this.watches.keys()) if (!live.has(sid)) { this.watches.delete(sid); this.busyTurns.delete(sid) }
     const dest = this.offerTo()
-    const gate = dest ? dest.target.session_id + '/' + dest.stream : ''
+    const gate = dest ? JSON.stringify([dest.target.session_id, dest.stream, dest.target.stateAtOffer]) : ''
     if (gate !== this.gate) { this.gate = gate; this.o.revisit(); this.o.watch.changed() }
   }
   private current() { return this.watches.get(this.o.selected()?.session_id ?? '') }

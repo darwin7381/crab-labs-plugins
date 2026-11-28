@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
 import { dirname } from 'path'
 import { genuineAssistantAfterFile } from './liveness.ts'
-import type { InboxItem, ItemRef, ReceivingTarget } from './onsen-items.ts'
+import type { InboxItem, ItemRef, ReceivingState, ReceivingTarget } from './onsen-items.ts'
 import type { ClaimStore, ItemReport, Outcome, ReportFields } from './onsen-receive.ts'
 
 const intermediate = new Set<Outcome>(['in_session', 'owed', 'background', 'stuck'])
@@ -11,6 +11,10 @@ type Claim = {
   turn?: string; registry_session?: string; conversation?: string; replies?: string[]
   intakeAt?: string; target?: ReceivingTarget
   stop?: { turn: string; at: number }
+}
+// Away from a target the registry still supplies its status. Only its own transcript can supply a turn.
+function sameState(before: ReceivingState, now: ReceivingState): boolean {
+  return before.status === now.status && (now.turn === undefined || (before.turn === now.turn && before.lastTurn === now.lastTurn))
 }
 type Done = { item_id: string; claim_id: string; at: number }
 type Spool = {
@@ -22,11 +26,12 @@ type Spool = {
 export class Claims implements ClaimStore {
   private rows: Record<string, Claim> = Object.create(null)
   private done: Done[] = []
+  private waits = new Map<string, { state: ReceivingState; ids: string[] }>()
   private connector?: string
   private timers = new Map<string, ReturnType<typeof setTimeout>>()
 
   constructor(readonly file: string, readonly spool: Spool, readonly missed: (id: string) => void,
-    readonly changed: () => void, readonly now = Date.now) {
+    readonly changed: () => void, readonly now = Date.now, readonly targetState?: (t: ReceivingTarget) => ReceivingState | undefined) {
     try {
       const data = JSON.parse(readFileSync(file, 'utf8'))
       this.rows = Object.assign(Object.create(null), data.claims)
@@ -35,6 +40,7 @@ export class Claims implements ClaimStore {
         row.session_id = row.registry_session
         delete row.registry_session
       }
+      this.waits = new Map(data.waits ?? [])
       this.done = data.done ?? []
       this.connector = data.connector
     } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e }
@@ -58,8 +64,14 @@ export class Claims implements ClaimStore {
     mkdirSync(dirname(this.file), { recursive: true, mode: 0o700 })
     const tmp = this.file + '.' + process.pid + '.tmp'
     this.done = this.done.filter(d => d.at > this.now() - week).slice(-5000)
-    writeFileSync(tmp, JSON.stringify({ claims: this.rows, done: this.done, connector }), { mode: 0o600 })
+    writeFileSync(tmp, JSON.stringify({ claims: this.rows, done: this.done, connector, waits: [...this.waits] }), { mode: 0o600 })
     renameSync(tmp, this.file)
+  }
+  waitingSessions() { return this.waits.keys() }
+  waitingForState(session: string, id: string): boolean { return this.waits.get(session)?.ids.includes(id) ?? false }
+  observeState(session: string, state: ReceivingState): void {
+    const wait = this.waits.get(session)
+    if (wait && !sameState(wait.state, state)) { this.waits.delete(session); this.save() }
   }
   private clock(id: string): void {
     clearTimeout(this.timers.get(id))
@@ -125,6 +137,16 @@ export class Claims implements ClaimStore {
   replay({ item_id: id, body }: ItemReport): void {
     const row = this.rows[id]
     if (row?.claim_id !== body.claim_id) return
+    if (body.outcome === 'not_taken' && row.target && row.last_outcome !== 'not_taken') {
+      const session = row.target.session_id
+      const state = this.targetState?.(row.target) ?? row.target.stateAtOffer
+      if (state) {
+        const old = this.waits.get(session)
+        const ids = old && sameState(old.state, state) ? old.ids : []
+        if (!ids.includes(id)) ids.push(id)
+        this.waits.set(session, { state, ids })
+      }
+    }
     row.last_outcome = body.outcome
     if (body.outcome === 'in_session') { row.in_session_at = body.at; row.session_id ??= body.session_id }
   }
@@ -138,8 +160,14 @@ export class Claims implements ClaimStore {
   acknowledged(line: ItemReport, accepted: boolean): void {
     const { item_id: id, body } = line
     if (intermediate.has(body.outcome)) return
-    if (accepted && body.outcome === 'completed' && !this.done.some(d => d.claim_id === body.claim_id && d.item_id === id))
-      this.done.push({ item_id: id, claim_id: body.claim_id, at: this.now() })
+    if (accepted && body.outcome === 'completed') {
+      if (!this.done.some(d => d.claim_id === body.claim_id && d.item_id === id))
+        this.done.push({ item_id: id, claim_id: body.claim_id, at: this.now() })
+      for (const [sid, wait] of this.waits) {
+        wait.ids = wait.ids.filter(waiting => waiting !== id)
+        if (!wait.ids.length) this.waits.delete(sid)
+      }
+    }
     if (this.rows[id]?.claim_id === body.claim_id) delete this.rows[id]
     this.save(); this.clock(id); this.changed()
   }
