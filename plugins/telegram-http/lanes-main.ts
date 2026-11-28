@@ -538,7 +538,7 @@ export function createMain(E: MainEnv) {
           resume_claim: claimed.has(ref.onsen_item_id) ? { ...r.resume_claim, waiting: true } : null })
         return
       }
-      receiver.bind([ref], receipt.session, receipt.prompt)
+      receiver.bind([ref], 'main', receipt.prompt, receipt.session)
       const terminal = r.resume_claim?.terminal
       if (terminal) receiver.report([ref], terminal.outcome, terminal.fields)
       else if (r.received === 'stop') receiver.claims.finalStop(receipt.session, receipt.prompt)
@@ -757,7 +757,7 @@ export function createMain(E: MainEnv) {
     const at = new Date().toISOString()                                                           // WO-201: bound_at, what "output after it" is measured from
     for (const r of all) J().write('msg', r.id, 'bound', { gen: g.id, prompt_id: prompt, via_pull: true, bound_at: at,
       ...(r.carried_resume ? { resume_told: prompt } : {}) })
-    for (const r of got) if (r.onsen_items) E.itemReceiver?.()?.bind(r.onsen_items, g.session_id, prompt)
+    for (const r of got) if (r.onsen_items) E.itemReceiver?.()?.bind(r.onsen_items, 'main', prompt, g.session_id)
     for (const r of got) J().write('wake', r.id, 'wake', { reason: `pulled into the running turn ${prompt}` })
     try { E.bound?.(got.map(r => J().get('msg', r.id)!)) } catch (e) { E.log('warn', `lanes: bound hook: ${e}`) }
     mentionsReached(dg)                                                                       // WO-181: bound into its turn: the mentions it carried are read
@@ -1049,7 +1049,7 @@ export function createMain(E: MainEnv) {
       setMain(g, 'in_turn', { prompt_id: prompt, tool_open: null, stopped_prompt: null })
     }
     const accepted = items(canBind)
-    for (const r of accepted) if (r.onsen_items) receiver?.bind(r.onsen_items, g.session_id, prompt)
+    for (const r of accepted) if (r.onsen_items) receiver?.bind(r.onsen_items, 'main', prompt, g.session_id)
     const at = new Date().toISOString()
     for (const r of accepted) J().write('msg', r.id, 'bound', { gen: g.id, prompt_id: prompt, bound_at: at,
       ...(isResume(r) && !receiver?.claims.owns(r.onsen_items[0].onsen_item_id) ? { resume_claim: { session: g.session_id, prompt } } : {}),

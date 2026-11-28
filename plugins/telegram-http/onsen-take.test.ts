@@ -874,19 +874,20 @@ test('C4 a lost POST response and a lost DELETE race keep the decision across re
   expect(r.offers).toEqual([])
 })
 
-test('a pre-C6 claim and a replayed main wire report retain the original receiving UUID through restart', async () => {
+test.each(['pre-C6', 'C6'])('%s main claim replays as main and only its local UUID can finish the turn', async version => {
   const r = rig(), row = r.f.add('old', 'message', { session_id: 'main' }), sid = crypto.randomUUID()
   await r.mode.probe()
   await r.receiver.receive([itemRef(row)])
   const saved = JSON.parse(readFileSync(r.file, 'utf8'))
-  Object.assign(saved.claims.old, { registry_session: sid, session_id: 'main', turn: 'turn' })
+  const oldSession = version === 'C6' ? sid : 'main'
+  Object.assign(saved.claims.old, { registry_session: version === 'C6' ? undefined : sid, session_id: oldSession, turn: 'turn' })
   writeFileSync(r.file, JSON.stringify(saved))
   const claims = new Claims(r.file, r.client, () => {}, () => {}, r.f.now)
-  r.client.recordItemReport({ item_id: row.id, body: { claim_id: row.claim!.id, outcome: 'in_session', session_id: 'main', at: new Date().toISOString() } })
-  r.client.watchItemReports(l => claims.replay(l), (l, ok) => claims.acknowledged(l, ok), l => claims.reportBody(l))
+  r.client.recordItemReport({ item_id: row.id, body: { claim_id: row.claim!.id, outcome: 'in_session', session_id: oldSession, at: new Date().toISOString() } })
+  r.client.watchItemReports(l => claims.replay(l), (l, ok) => claims.acknowledged(l, ok))
   await r.sync()
   expect(row.session_id).toBe('main')
-  expect(row.claim!.session_id).toBe(sid)
+  expect(row.claim!.session_id).toBe('main')
   claims.finalStop('main', 'turn')
   claims.statusRecord(sid, 'idle', () => 0, 0)
   claims.finalStop(sid, 'turn')
@@ -895,6 +896,23 @@ test('a pre-C6 claim and a replayed main wire report retain the original receivi
   claims.statusRecord(sid, 'idle', () => 0, 0)
   await r.sync()
   expect(r.outcomes('old')).toEqual(['in_session', 'completed'])
+  expect(r.f.history.map(h => h.body.session_id)).toEqual(['main', 'main'])
+})
+
+test('an intake spooled just before a crash restores its local turn without sending the binding to Onsen', async () => {
+  const r = rig(), row = r.f.add('crash'), sid = crypto.randomUUID()
+  await r.mode.probe(); await r.receiver.receive([itemRef(row)])
+  const beforeBind = readFileSync(r.file)
+  r.receiver.bind([itemRef(row)], 'main', 'receiving-turn', sid)
+  writeFileSync(r.file, beforeBind)
+  const restored = new Claims(r.file, r.client, () => {}, () => {}, r.f.now)
+  r.client.watchItemReports(l => restored.replay(l), (l, ok) => restored.acknowledged(l, ok))
+  restored.finalStop(sid, 'receiving-turn')
+  restored.statusRecord(sid, 'idle', () => 0, 0)
+  await r.sync()
+  expect(r.outcomes(row.id)).toEqual(['in_session', 'completed'])
+  expect(r.f.history.map(h => h.body.session_id)).toEqual(['main', 'main'])
+  expect(JSON.stringify(r.f.history)).not.toContain(sid)
 })
 
 test('the four roamer bot names resolve to their registered members without lanes', () => {
@@ -1077,7 +1095,7 @@ test('idle main takes before offer, binds, completes only after final Stop and i
   row.session_id = 'main'
   await r.bind(row)
   expect(row.session_id).toBe('main')
-  expect(row.claim?.session_id).toBe(r.sid)
+  expect(row.claim?.session_id).toBe('main')
   r.claims.finalStop('another-session', 'turn')
   r.f.advance(3001); r.status('idle'); await r.sync()
   expect(r.outcomes(row.id)).toEqual(['in_session'])
@@ -1097,7 +1115,7 @@ test('claim attribution survives restart and follows the quote or the conversati
   const first = r.f.add('one', 'message', { message_id: '23' }), second = r.f.add('two', 'message', { message_id: '24' })
   await r.bind(first)
   r.enqueue(second); await r.hook('PostToolUse'); await r.sync()
-  expect(second.claim?.session_id).toBe(r.sid) // settled 48 (C6): the receiving Claude session UUID
+  expect(second.claim?.session_id).toBe('main')
   const oldLedger = JSON.parse(readFileSync(r.file, 'utf8'))
   delete oldLedger.claims[first.id].message_id
   writeFileSync(r.file, JSON.stringify(oldLedger))
@@ -1208,7 +1226,7 @@ test('while busy mail waits, a person binds inside PostToolUse, pre-switch work 
   expect(r.claims.held()).toEqual([])
   await r.hook('PostToolUse'); await r.sync()
   expect(mail.claim).toBeNull(); expect(r.outcomes('legacy')).toEqual([])
-  expect(message.claim?.session_id).toBe(r.sid)
+  expect(message.claim?.session_id).toBe('main')
   for (const id of r.claims.held()) { const it = r.f.rows.get(id)!; expect(!!it.in_session_at || r.f.now() - Date.parse(it.claim!.taken_at) < 20_000).toBe(true) }
 })
 
@@ -1219,7 +1237,7 @@ test('claim invariant after every idle, busy and walled main transition', async 
     const held = [...r.f.rows.values()].filter(row => row.state === 'claimed')
     expect(r.claims.held().sort()).toEqual(held.map(row => row.id).sort())
     for (const row of held) {
-      if (row.in_session_at) expect(row.claim!.session_id).toBe(r.sid)
+      if (row.in_session_at) expect(row.claim!.session_id).toBe('main')
       else {
         const offered = r.m.items(it => it.state === 'offered' && it.onsen_items?.some((ref: any) => ref.onsen_item_id === row.id))
         expect(offered).toHaveLength(1)
@@ -1424,7 +1442,7 @@ test('asked restart closes the commander’s work and cuts the peer on the same 
 
 test('restart renews the same connector, terminal report survives outage and blocks peek/take until ack', async () => {
   const r = rig(), row = r.f.add('restart')
-  await r.mode.probe(); await r.receiver.receive([itemRef(row)]); r.receiver.bind([itemRef(row)], 's', 't'); await r.sync()
+  await r.mode.probe(); await r.receiver.receive([itemRef(row)]); r.receiver.bind([itemRef(row)], 'main', 't'); await r.sync()
   r.claims.stop(); r.mode.stop()
   const other = new TakeMode('adam', r.client.request.bind(r.client), () => {}, () => {}, 'mac-mini')
   await other.probe()
@@ -1816,7 +1834,7 @@ test('one album offer acquires its three rows in one request and sends one notif
   await until(() => r.offers.length === 1)
   expect(r.f.calls.filter(c => c.path.endsWith('/take')).map(c => c.body.item_ids)).toEqual([['a','b','c']])
   await r.hook('UserPromptSubmit', { dids: [did] }); await r.sync()
-  expect(album.every(row => row.claim?.session_id === r.sid)).toBe(true)
+  expect(album.every(row => row.claim?.session_id === 'main')).toBe(true)
 })
 
 for (const take of [false, true]) test('both closed-work notices on inherited rows, take=' + take, async () => {

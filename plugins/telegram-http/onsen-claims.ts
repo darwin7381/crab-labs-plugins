@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
 import { dirname } from 'path'
 import type { Journal } from './lanes-state.ts'
 import { genuineAssistantAfterFile } from './liveness.ts'
-import type { InboxItem, ItemRef, ReceivingState, ReceivingTarget } from './onsen-items.ts'
+import { claudeSessionId, roamerSessionId, type InboxItem, type ItemRef, type ReceivingState, type ReceivingTarget } from './onsen-items.ts'
 import type { ClaimStore, ItemReport, Outcome, ReportFields } from './onsen-receive.ts'
 
 const intermediate = new Set<Outcome>(['in_session', 'owed', 'background', 'stuck'])
@@ -17,10 +17,11 @@ type Claim = {
 function sameState(before: ReceivingState, now: ReceivingState): boolean {
   return before.status === now.status && (now.turn === undefined || (before.turn === now.turn && before.lastTurn === now.lastTurn))
 }
-// A main or roamer claim is bound to a Claude session UUID (settled 48); a lane claim to its lane id. A Claude session reports its reply ids even when empty.
-const claudeSession = (s?: string) => !!s && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)
+// Hooks and transcripts identify a Claude process locally. Lane events identify their lane directly.
+const localSession = (row: Claim) => row.registry_session ?? row.session_id
 type Done = { item_id: string; claim_id: string; at: number }
 type Spool = {
+  cfg: { agent: string }
   recordItemReport(line: ItemReport): boolean
   hasItemReports(): boolean
 }
@@ -42,17 +43,17 @@ export class Claims implements ClaimStore {
     try {
       const data = JSON.parse(readFileSync(file, 'utf8'))
       this.rows = Object.assign(Object.create(null), data.claims)
-      // Pre-C6 main claims stored the receiving UUID separately from the wire value "main".
-      for (const row of Object.values(this.rows)) if (row.registry_session) {
-        row.session_id = row.registry_session
-        delete row.registry_session
+      // C6 persisted the registry UUID in session_id. Earlier ledgers already kept the two identities apart.
+      for (const row of Object.values(this.rows)) if (claudeSessionId(row.session_id)) {
+        row.registry_session = row.session_id
+        row.session_id = row.target ? roamerSessionId(spool.cfg.agent, row.registry_session) : 'main'
       }
       this.waits = new Map(data.waits ?? [])
       this.selections = data.selections ?? []
       this.receivers = new Map(data.receivers ?? [])
       // A C6 ledger from before ruling 27 can still hold an accepted or unacknowledged cut claim.
       for (const [id, r] of Object.entries(this.rows))
-        if (r.target && r.in_session_at && r.session_id && !this.receivers.has(id)) this.receivers.set(id, r.session_id)
+        if (r.target && r.in_session_at && !this.receivers.has(id)) this.receivers.set(id, r.target.session_id)
       this.done = data.done ?? []
       this.connector = data.connector
       this.pollOffset = data.pollOffset ?? null
@@ -165,7 +166,7 @@ export class Claims implements ClaimStore {
     for (const [id, r] of Object.entries(this.rows))
       if (r.target?.session_id === session && !r.in_session_at && receipts.includes(r.claim_id)) {
         r.intakeAt = at
-        this.bind(id, session, turn)
+        this.bind(id, roamerSessionId(this.spool.cfg.agent, session), turn, session)
       }
   }
   cutTarget(t: ReceivingTarget): void {
@@ -179,25 +180,28 @@ export class Claims implements ClaimStore {
       }
     }
   }
-  bind(id: string, session: string, turn: string): void {
+  bind(id: string, session: string, turn: string, registrySession?: string): void {
     if (!this.owns(id)) return
     const row = this.rows[id]!
-    Object.assign(row, { session_id: session, turn })
-    if (!row.in_session_at) this.report(id, 'in_session', { session_id: session })
+    Object.assign(row, { session_id: session, registry_session: registrySession, turn })
+    if (!row.in_session_at) this.report(id, 'in_session')
   }
   report(id: string, outcome: Outcome, fields: ReportFields = {}): boolean {
     const row = this.rows[id]
     if (!this.owns(id)) return false
     if (row.last_outcome === outcome) return true
     const body = { claim_id: row.claim_id, outcome, at: new Date(this.now()).toISOString(),
-      ...(outcome === 'completed' && (row.replies || claudeSession(row.session_id)) ? { response_message_ids: row.replies ?? [] } : {}), ...fields }
-    if (!this.spool.recordItemReport({ item_id: id, body })) throw new Error('could not spool item report for ' + id)
-    this.replay({ item_id: id, body })
+      ...(row.session_id ? { session_id: row.session_id } : {}),
+      ...(outcome === 'completed' && (row.replies || row.registry_session) ? { response_message_ids: row.replies ?? [] } : {}), ...fields }
+    const line: ItemReport = { item_id: id, body }
+    if (outcome === 'in_session' && row.turn) line.binding = { turn: row.turn, registry_session: row.registry_session }
+    if (!this.spool.recordItemReport(line)) throw new Error('could not spool item report for ' + id)
+    this.replay(line)
     this.save(); this.clock(id)
     return true
   }
   /** Restore a line appended before a crash between the spool append and ledger rename. */
-  replay({ item_id: id, body }: ItemReport): void {
+  replay({ item_id: id, body, binding }: ItemReport): void {
     const row = this.rows[id]
     if (row?.claim_id !== body.claim_id) return
     if (body.outcome === 'not_taken' && row.target && row.last_outcome !== 'not_taken') {
@@ -212,16 +216,13 @@ export class Claims implements ClaimStore {
     }
     row.last_outcome = body.outcome
     if (body.outcome === 'in_session') {
-      row.in_session_at = body.at; row.session_id ??= body.session_id
-      if (row.target && row.session_id && !this.receivers.has(id)) this.receivers.set(id, row.session_id)
+      row.in_session_at = body.at
+      const legacy = claudeSessionId(body.session_id) ? body.session_id : undefined
+      row.registry_session ??= binding?.registry_session ?? row.target?.session_id ?? legacy
+      row.turn ??= binding?.turn
+      row.session_id ??= legacy ? (row.target ? roamerSessionId(this.spool.cfg.agent, legacy) : 'main') : body.session_id
+      if (row.target && !this.receivers.has(id)) this.receivers.set(id, row.target.session_id)
     }
-  }
-  /** A queued pre-C6 report has the old wire value even after the ledger has been migrated. */
-  reportBody({ item_id, body }: ItemReport): ItemReport['body'] {
-    const row = this.rows[item_id]
-    if (body.outcome === 'in_session' && body.session_id === 'main' && row?.claim_id === body.claim_id && row.session_id)
-      return { ...body, session_id: row.session_id }
-    return body
   }
   acknowledged(line: ItemReport, accepted: boolean): void {
     const { item_id: id, body } = line
@@ -246,7 +247,7 @@ export class Claims implements ClaimStore {
       if (replyToMessageId != null) { if (row.message_id !== replyToMessageId) continue }
       else {
         const continued = row.last_outcome === 'background' && !!session
-        if (session && row.session_id !== session || !turn || !continued && row.turn !== turn) continue
+        if (session && localSession(row) !== session || !turn || !continued && row.turn !== turn) continue
       }
       const replies = row.replies ??= []
       if (!replies.includes(message)) { replies.push(message); updated = true }
@@ -256,14 +257,14 @@ export class Claims implements ClaimStore {
   finalStop(session: string, turn: string): void {
     let updated = false
     for (const row of Object.values(this.rows)) {
-      if (row.session_id !== session) continue
+      if (localSession(row) !== session) continue
       if (row.stop?.turn !== turn && (row.turn === turn || row.last_outcome === 'background')) { row.stop = { turn, at: this.now() }; updated = true }
     }
     if (updated) this.save()
   }
   continued(session: string, turn: string): void {
     let updated = false
-    for (const row of Object.values(this.rows)) if (row.session_id === session && row.stop?.turn === turn) { delete row.stop; updated = true }
+    for (const row of Object.values(this.rows)) if (localSession(row) === session && row.stop?.turn === turn) { delete row.stop; updated = true }
     if (updated) this.save()
   }
   private complete(id: string, row: Claim): void {
@@ -273,11 +274,11 @@ export class Claims implements ClaimStore {
   statusRecord(session: string | null, member: string, background: (session: string) => number | null, settleMs: number, memberRecord = false): void {
     for (const [id, row] of Object.entries(this.rows)) {
       if (!row.stop || !this.owns(id)) continue
-      if (memberRecord && !row.target && (member === 'offline' || (session && session !== row.session_id))) {
+      if (memberRecord && !row.target && (member === 'offline' || (session && session !== localSession(row)))) {
         this.complete(id, row)
         continue
       }
-      if (!session || row.session_id !== session || ['busy', 'stuck', 'compacting'].includes(member) || this.now() < row.stop.at + settleMs) continue
+      if (!session || localSession(row) !== session || ['busy', 'stuck', 'compacting'].includes(member) || this.now() < row.stop.at + settleMs) continue
       const count = background(session)
       if (count == null) continue
       if (count > 0) this.report(id, 'background')

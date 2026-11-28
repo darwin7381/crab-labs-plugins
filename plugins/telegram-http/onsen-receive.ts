@@ -5,9 +5,10 @@ import type { Journal } from './lanes-state.ts'
 
 export type Outcome = 'in_session' | 'not_taken' | 'completed' | 'owed' | 'background' | 'not_applied'
   | 'usage_limit' | 'usage_limit_probe' | 'error' | 'cut' | 'cut_person' | 'stopped' | 'stuck' | 'reassigned' | 'superseded'
-export type ReportFields = { session_id?: string; response_message_ids?: string[]; retry_after?: string | null
+export type ReportFields = { response_message_ids?: string[]; retry_after?: string | null
   half_done?: boolean; command_message_id?: string; note?: string }
-export type ItemReport = { item_id: string; body: { claim_id: string; at: string; outcome: Outcome } & ReportFields }
+export type ItemReport = { item_id: string; binding?: { turn: string; registry_session?: string }
+  body: { claim_id: string; at: string; outcome: Outcome; session_id?: string } & ReportFields }
 export type ReceiveResult = { given: Set<string>; gone: Set<string>; claimed: Set<string> }
 const empty = (): ReceiveResult => ({ given: new Set(), gone: new Set(), claimed: new Set() })
 export const itemIds = (refs: ItemRef[]) => refs.map(r => r.onsen_item_id)
@@ -20,7 +21,7 @@ export type ClaimStore = {
   completed(id: string): boolean
   wasOwed(id: string): boolean
   taken(row: InboxItem, ref: ItemRef): void
-  bind(id: string, session: string, turn: string): void
+  bind(id: string, session: string, turn: string, registrySession?: string): void
   report(id: string, outcome: Outcome, fields?: ReportFields): boolean
   finalStop(session: string, turn: string): void
   continued(session: string, turn: string): void
@@ -40,8 +41,8 @@ export class ItemReceiver {
     return reported
   }
 
-  bind(refs: ItemRef[] | undefined, session: string, turn: string): void {
-    for (const ref of refs ?? []) this.claims.bind(ref.onsen_item_id, session, turn)
+  bind(refs: ItemRef[] | undefined, session: string, turn: string, registrySession?: string): void {
+    for (const ref of refs ?? []) this.claims.bind(ref.onsen_item_id, session, turn, registrySession)
   }
 
   async receive(refs: ItemRef[], hook = false, binding = false, onGone?: (ids: Set<string>) => void,

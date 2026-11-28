@@ -7,7 +7,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { createEvents } from './lanes-events.ts'
 import { Journal } from './lanes-state.ts'
-import { itemRef } from './onsen-items.ts'
+import { itemRef, roamerSessionId } from './onsen-items.ts'
 import { osProcStart } from './onsen-status.ts'
 import { startOnsenStandin } from './test-fixtures/onsen-standin.ts'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
@@ -131,7 +131,7 @@ async function activePerson(id: string) {
   expect(row.state).toBe('claimed')
   const offer = offers.find(n => n.content.includes(row.id))
   await hook('UserPromptSubmit', { dids: [offer.meta.did] })
-  await waitFor(() => row.claim?.session_id === sid)
+  await waitFor(() => row.claim?.session_id === 'main')
   expect(row.session_id).toBe('main')
   const stop = async () => {
     await hook('Stop', { phase: 'final' })
@@ -161,7 +161,7 @@ test('a mid-turn arrival and the original message each complete with only their 
     from: 'joey', via: 'web', text: 'mid-turn-message', client: { chat: '1', msg_id: 'form-24', user_id: '1', user: 'Joey' } } })
   await waitFor(() => d.journal().some(r => r.rec === 'msg' && r.onsen_items?.some((i: any) => i.onsen_item_id === second.id)))
   await hook('PostToolUse', { tool_name: 'Bash' })
-  await waitFor(() => second.claim?.session_id === entry.sessionId) // settled 48 (C6): the receiving Claude session UUID
+  await waitFor(() => second.claim?.session_id === 'main')
   const responseIds: string[] = []
   for (const row of [first, second]) {
     const reply = await client.callTool({ name: 'reply', arguments: { chat_id: '1', reply_to: row.payload.client.msg_id, text: 'answer to ' + row.id } })
@@ -1135,7 +1135,7 @@ async function target(d: Awaited<ReturnType<typeof daemon>>, resumed?: string) {
     writeFileSync(transcript, '')
     status('idle')
   }
-  return { child, get sid() { return sid }, cwd, get transcript() { return transcript }, switchSession, select, status, client, connect, got, accept: (msg: any) => write({ type: 'user', message: { content:
+  return { child, get sid() { return sid }, get onsenId() { return roamerSessionId(member, sid) }, cwd, get transcript() { return transcript }, switchSession, select, status, client, connect, got, accept: (msg: any) => write({ type: 'user', message: { content:
     `<channel source="telegram" chat_id="1" message_id="${msg.meta.message_id}" onsen_claims="${msg.meta.onsen_claims}">hello</channel>` } }),
     stop: () => write({ type: 'system', subtype: 'turn_duration' }) }
 }
@@ -1155,14 +1155,14 @@ test('roamer switches between two live streams in one cwd, binds on intake and c
   await Bun.sleep(350)
   expect(one.claim!.session_id).toBeNull()
   a.accept(a.got[0])
-  await waitFor(() => one.claim?.session_id === a.sid)
+  await waitFor(() => one.claim?.session_id === a.onsenId)
   expect(one.session_id).toBe('main')
   b.select()
   const two = d.f.add('second', 'message', { session_id: null })
   await waitFor(() => b.got.length === 1)
   b.accept(b.got[0])
-  await waitFor(() => two.claim?.session_id === b.sid)
-  expect(two.session_id).toBe(b.sid)
+  await waitFor(() => two.claim?.session_id === b.onsenId)
+  expect(two.session_id).toBe(b.onsenId)
   expect(a.got.map(n => n.content)).toEqual(['first'])
   expect(b.got.map(n => n.content)).toEqual(['second'])
   expect(unaddressed.state).toBe('waiting')
@@ -1181,7 +1181,7 @@ test('roamer switches between two live streams in one cwd, binds on intake and c
   unlinkSync(paused)
   await waitFor(() => two.state === 'completed', 9000)
   expect(two.response_message_ids).toEqual([])
-  expect(one.claim?.session_id).toBe(a.sid)
+  expect(one.claim?.session_id).toBe(a.onsenId)
   a.stop()
   await waitFor(() => one.state === 'completed', 9000)
   expect(one.response_message_ids).toHaveLength(1)
@@ -1189,7 +1189,7 @@ test('roamer switches between two live streams in one cwd, binds on intake and c
   const dying = d.f.add('kill target', 'mail')
   await waitFor(() => b.got.length === 2)
   b.accept(b.got[1])
-  await waitFor(() => dying.claim?.session_id === b.sid)
+  await waitFor(() => dying.claim?.session_id === b.onsenId)
   b.child.kill(); await b.child.exited
   await waitFor(() => dying.state === 'waiting' && dying.reason === 'cut')
   expect(d.f.history.filter(h => h.item_id === dying.id && h.body.outcome === 'cut')).toHaveLength(1)
@@ -1202,7 +1202,7 @@ test('a final Stop and reply are completed when the roamer target exits inside t
   const row = d.f.add('answered-before-exit')
   await waitFor(() => a.got.length === 1)
   a.accept(a.got[0])
-  await waitFor(() => row.claim?.session_id === a.sid)
+  await waitFor(() => row.claim?.session_id === a.onsenId)
   const reply = await a.client.callTool({ name: 'reply', arguments: { chat_id: '1', text: 'done' } })
   const id = /onsen:(\d+)/.exec(JSON.stringify(reply.content))?.[1]
   expect(id).toBeTruthy()
@@ -1222,11 +1222,11 @@ test('a session change inside the same target PID cuts the old claim and deliver
   const first = d.f.add('before-clear')
   await waitFor(() => a.got.length === 1)
   a.accept(a.got[0])
-  await waitFor(() => first.claim?.session_id === a.sid)
+  await waitFor(() => first.claim?.session_id === a.onsenId)
   const old = a.sid, oldTranscript = a.transcript
   a.status('idle', '')
   await Bun.sleep(350)
-  expect(first.claim?.session_id).toBe(old)
+  expect(first.claim?.session_id).toBe(roamerSessionId(member, old))
   expect(JSON.parse(readFileSync(roamerState(d.root).ROAMER_STATE_FILE, 'utf8')).current_target.session_id).toBe(old)
   a.switchSession()
   const second = d.f.add('after-clear')
@@ -1237,7 +1237,7 @@ test('a session change inside the same target PID cuts the old claim and deliver
   expect(first).toMatchObject({ state: 'waiting', reason: 'cut', session_id: 'main' })
   expect(d.f.calls.filter(c => c.path.endsWith('/take') && c.body.item_ids.includes(first.id))).toHaveLength(1)
   a.accept(a.got[1])
-  await waitFor(() => second.claim?.session_id === a.sid)
+  await waitFor(() => second.claim?.session_id === a.onsenId)
   appendFileSync(oldTranscript, JSON.stringify({ type: 'system', subtype: 'turn_duration' }) + '\n')
   await Bun.sleep(300)
   expect(second.state).toBe('claimed')
@@ -1251,7 +1251,7 @@ test('a final Stop before a same-PID switch completes the old row with only its 
   a.select()
   const old = d.f.add('answered-before-clear')
   await waitFor(() => a.got.length === 1)
-  a.accept(a.got[0]); await waitFor(() => old.claim?.session_id === a.sid)
+  a.accept(a.got[0]); await waitFor(() => old.claim?.session_id === a.onsenId)
   const reply = async (text: string) => {
     const result = await a.client.callTool({ name: 'reply', arguments: { chat_id: '1', text } })
     return /onsen:(\d+)/.exec(JSON.stringify(result.content))?.[1]
@@ -1269,7 +1269,7 @@ test('a final Stop before a same-PID switch completes the old row with only its 
   const fresh = d.f.add('for-the-replacement')
   await waitFor(() => a.got.length === 2)
   expect(a.got[1].content).toBe(fresh.id)
-  a.accept(a.got[1]); await waitFor(() => fresh.claim?.session_id === a.sid)
+  a.accept(a.got[1]); await waitFor(() => fresh.claim?.session_id === a.onsenId)
   expect(d.f.calls.filter(c => c.path.endsWith('/take') && c.body.item_ids.includes(old.id))).toHaveLength(1)
 }, 14000)
 
@@ -1279,14 +1279,14 @@ test('after a daemon restart a long turn still ends on its original target trans
   const row = d.f.add('carry turn', 'message', { session_id: null })
   await waitFor(() => a.got.length === 1)
   a.accept(a.got[0])
-  await waitFor(() => row.claim?.session_id === a.sid)
+  await waitFor(() => row.claim?.session_id === a.onsenId)
   b.select()
   appendFileSync(a.transcript, JSON.stringify({ type: 'assistant', message: { content: 'x'.repeat(2 << 20) } }) + '\n')
   await d.restart()
   a.stop()
   await waitFor(() => row.state === 'completed', 9000)
   expect(d.f.history.filter(h => h.item_id === row.id).map(h => h.body.outcome)).toEqual(['in_session', 'completed'])
-  expect(row.session_id).toBe(a.sid)
+  expect(row.session_id).toBe(a.onsenId)
   expect(b.got).toHaveLength(0)
 }, 15000)
 
@@ -1315,7 +1315,7 @@ test('a missed item waits through fresh peeks and restart until its session chan
   a.status('idle')
   await waitFor(() => a.got.filter(n => n.content === row.id).length === 2)
   a.accept(a.got.filter(n => n.content === row.id)[1])
-  await waitFor(() => row.claim?.session_id === a.sid)
+  await waitFor(() => row.claim?.session_id === a.onsenId)
   expect(row.failures).toBe(1)
 }, 16000)
 
@@ -1336,7 +1336,7 @@ test('a missed session can change state while a different busy target is selecte
   a.select()
   await waitFor(() => a.got.length === 2)
   a.accept(a.got[1])
-  await waitFor(() => row.claim?.session_id === a.sid)
+  await waitFor(() => row.claim?.session_id === a.onsenId)
   expect(row.failures).toBe(1)
 }, 12000)
 
@@ -1351,7 +1351,7 @@ test('changing target during take delivers only to the UUID selected at arrival'
   await waitFor(() => a.got.length === 1)
   expect(a.got[0].content).toBe('moves')
   a.accept(a.got[0])
-  await waitFor(() => row.claim?.session_id === a.sid)
+  await waitFor(() => row.claim?.session_id === a.onsenId)
   expect(b.got).toHaveLength(0)
   expect(d.f.calls.filter(c => c.path.endsWith('/take') && c.body.item_ids.includes(row.id))).toHaveLength(1)
 }, 12000)
@@ -1375,7 +1375,7 @@ test('album parts arriving on opposite sides of a roam stay in their respective 
     expect(target.got[0].meta.attachment_name).toBe(row.id + '.pdf')
     expect(target.got[0].meta.attachment_name_2).toBeUndefined()
     target.accept(target.got[0])
-    await waitFor(() => row.claim?.session_id === target.sid)
+    await waitFor(() => row.claim?.session_id === target.onsenId)
   }
   expect(d.f.calls.filter(c => c.path.endsWith('/take')).map(c => c.body.item_ids).sort()).toEqual([['left'], ['right']])
 }, 12000)
@@ -1391,7 +1391,7 @@ test('a busy arrival and a late first peek keep A across a switch to B and a dae
   const fresh = d.f.add('fresh-for-B')
   await waitFor(() => b.got.length === 1)
   expect(b.got[0].content).toBe(fresh.id)
-  b.accept(b.got[0]); await waitFor(() => fresh.claim?.session_id === b.sid)
+  b.accept(b.got[0]); await waitFor(() => fresh.claim?.session_id === b.onsenId)
   await d.restart(); await a.connect(); await b.connect()
   const delayed = d.f.add('late-first-peek-for-A', 'message', { created_at: arrived, session_id: 'main' })
   await Bun.sleep(400)
@@ -1400,17 +1400,17 @@ test('a busy arrival and a late first peek keep A across a switch to B and a dae
   await waitFor(() => a.got.length === 2)
   expect(a.got.map(n => n.content).sort()).toEqual([deferred.id, delayed.id].sort())
   for (const msg of a.got) a.accept(msg)
-  await waitFor(() => [deferred, delayed].every(row => row.claim?.session_id === a.sid))
+  await waitFor(() => [deferred, delayed].every(row => row.claim?.session_id === a.onsenId))
   expect(b.got.map(n => n.content)).toEqual([fresh.id])
 }, 16000)
 
 test('cut waits with its warning while A is gone and resumes only in A under its new PID', async () => {
   const d = await daemon(roamerEnv, 200, roamerState), a = await target(d), b = await target(d)
   a.select()
-  const rows = [d.f.add('preset-main'), d.f.add('filled-uuid', 'message', { session_id: null })]
+  const rows = [d.f.add('preset-main'), d.f.add('filled-session', 'message', { session_id: null })]
   await waitFor(() => a.got.length === 2)
   for (const msg of a.got) a.accept(msg)
-  await waitFor(() => rows.every(row => row.claim?.session_id === a.sid))
+  await waitFor(() => rows.every(row => row.claim?.session_id === a.onsenId))
   b.select(); a.child.kill(); await a.child.exited
   await waitFor(() => rows.every(row => row.state === 'waiting' && row.reason === 'cut'))
   await d.restart(); await b.connect()
@@ -1426,12 +1426,12 @@ test('cut waits with its warning while A is gone and resumes only in A under its
   await waitFor(() => resumed.got.length === 2)
   expect(resumed.got.map(m => m.content).sort()).toEqual(rows.map(r => r.id).sort())
   for (const msg of resumed.got) resumed.accept(msg)
-  await waitFor(() => rows.every(row => row.claim?.session_id === a.sid))
-  expect(rows.map(row => row.session_id)).toEqual(['main', a.sid])
+  await waitFor(() => rows.every(row => row.claim?.session_id === a.onsenId))
+  expect(rows.map(row => row.session_id)).toEqual(['main', a.onsenId])
   expect(b.got).toHaveLength(1)
 }, 16000)
 
-test('an older cut recovers the first intake UUID from detail and keeps an ambiguous preset waiting', async () => {
+test('cut recovery recognizes public and legacy intake ids and leaves ambiguous or foreign ids waiting', async () => {
   const d = await daemon(roamerEnv, 200, roamerState), a = await target(d), b = await target(d)
   b.select()
   const fresh = d.f.add('new-in-B')
@@ -1441,13 +1441,16 @@ test('an older cut recovers the first intake UUID from detail and keeps an ambig
     row.events!.push({ kind: 'in_session', session_id: received, note: null }, { kind: 'cut', note: null })
     return row
   }
-  const known = legacy('old-known', a.sid), ambiguous = legacy('old-main-only', 'main')
+  const known = legacy('known', a.onsenId), old = legacy('old-known', a.sid), ambiguous = legacy('old-main-only', 'main')
+  const foreign = legacy('foreign', roamerSessionId('time-travelers', b.sid))
   known.events!.push({ kind: 'in_session', session_id: b.sid, note: null }, { kind: 'cut', note: null })
-  await waitFor(() => a.got.length === 1)
-  expect(a.got[0].content).toBe(known.id)
-  a.accept(a.got[0]); await waitFor(() => known.claim?.session_id === a.sid)
+  await waitFor(() => a.got.length === 2)
+  expect(a.got.map(msg => msg.content).sort()).toEqual([known.id, old.id].sort())
+  for (const msg of a.got) a.accept(msg)
+  await waitFor(() => [known, old].every(row => row.claim?.session_id === a.onsenId))
   expect(b.got.map(m => m.content)).toEqual([fresh.id])
   expect(ambiguous).toMatchObject({ state: 'waiting', reason: 'cut', claim: null })
+  expect(foreign).toMatchObject({ state: 'waiting', reason: 'cut', claim: null })
   expect(d.f.calls.some(c => c.path.endsWith('/take') && c.body.item_ids.includes(ambiguous.id))).toBe(false)
 }, 12000)
 

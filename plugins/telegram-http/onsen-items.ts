@@ -1,4 +1,14 @@
+import { createHash } from 'node:crypto'
 import type { TakeMode } from './onsen-take.ts'
+
+export const claudeSessionId = (id?: string | null): id is string =>
+  !!id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)
+
+/** Onsen accepts a decimal suffix. The transcript's UUID survives a new PID, tmux pane or connector. */
+export function roamerSessionId(member: string, uuid: string): string {
+  const digest = createHash('sha256').update(uuid.toLowerCase()).digest('hex').slice(0, 32)
+  return `${member}.roam.${BigInt('0x' + digest)}`
+}
 
 export type InboxItem = {
   id: string; number: number; member: string; session_id: string | null; kind: string; from: string; waiter?: string

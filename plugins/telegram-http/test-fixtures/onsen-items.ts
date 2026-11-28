@@ -10,10 +10,14 @@ const iso = (ms: number) => new Date(ms).toISOString()
 const memberName = /^[a-z0-9][a-z0-9_.-]{0,63}$/
 const refKinds = new Set('ticket schedule run incident alert op mail call message form telegram item'.split(' '))
 const timestamp = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)$/i
-function validCreate(b: any): boolean {
+function recipientSession(member: string, session: unknown): boolean {
+  return session === 'main' || (typeof session === 'string' && session.length <= 120 && session.startsWith(member + '.')
+    && /^[a-z0-9][a-z0-9-]*\.[a-zA-Z0-9_-]+\.[0-9]+$/.test(session))
+}
+function validCreate(member: string, b: any): boolean {
   const fields = ['kind', 'session_id', 'body', 'not_before', 'deadline', 'expires_at', 'waiter', 'refs']
   return b && Object.keys(b).every(k => fields.includes(k)) && ['resume', 'self', 'keepwarm'].includes(b.kind)
-    && (b.session_id == null || typeof b.session_id === 'string')
+    && (b.session_id == null || recipientSession(member, b.session_id))
     && (b.waiter == null || typeof b.waiter === 'string' && memberName.test(b.waiter))
     && (b.body == null || b.body.format === 'markdown' && typeof b.body.text === 'string' && Object.keys(b.body).length === 2)
     && [b.not_before, b.deadline, b.expires_at].every(t => t == null || typeof t === 'string' && timestamp.test(t) && Number.isFinite(Date.parse(t)))
@@ -157,7 +161,7 @@ export function fakeItems(member = 'adam', actionPort?: number, clock?: () => nu
     const base = `/v1/members/${member}/items`
     if (req.method === 'POST' && /^\/v1\/members\/[^/]+\/items$/.test(path)) {
       if (path !== base) return error(403, 'not_authorized')
-      if (!key || !validCreate(b)) return error(400, 'invalid_request')
+      if (!key || !validCreate(member, b)) return error(400, 'invalid_request')
       const old = creates.get(key)
       if (old && rows.has(old.id)) return Bun.deepEquals(old.body, b) ? old.result.clone() : error(409, 'version_conflict')
       const id = crypto.randomUUID()
@@ -250,6 +254,8 @@ export function fakeItems(member = 'adam', actionPort?: number, clock?: () => nu
       if (!row) return error(404, 'not_found')
       if (req.method === 'GET') return detail(view(row))
       if (req.method !== 'PUT' || !path.endsWith('/report') || !b.claim_id || !b.at || 'answered' in b) return error(400, 'invalid_request')
+      if ((b.outcome === 'in_session' || b.session_id != null) && b.session_id !== member + '.main' && !recipientSession(member, b.session_id))
+        return error(400, 'invalid_request', { message: 'session_id 是收件成員的對話編號' })
       if (b.outcome === 'superseded' && row.kind !== 'resume') return error(400, 'invalid_request')
       const k = row.id + '/' + b.claim_id, prior = terminal.get(k)
       if (prior) return prior === b.outcome ? detail(view(row)) : error(409, 'version_conflict')

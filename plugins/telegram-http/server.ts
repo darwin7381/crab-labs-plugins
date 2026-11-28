@@ -390,7 +390,7 @@ function meshAuth(url: string | null = null): Record<string, string> {
 }
 
 const onsen: Onsen.OnsenClient | null = INBOX_ONLY ? null : new Onsen.OnsenClient({ fastStatus: process.env.ONSEN_STATUS_FAST !== '0',
-  dir: join(STATE_DIR, 'onsen'), base: ONSEN_BASE, agent: ONSEN_AGENT, record: Onsen.recordFor(process.env, ONSEN_AGENT),
+  dir: join(STATE_DIR, 'onsen'), base: ONSEN_BASE, agent: ONSEN_AGENT, roamer: ROAMER, record: Onsen.recordFor(process.env, ONSEN_AGENT),
   credential: () => credentialFor(ONSEN_BASE, () => readCredentialFile(telegramMeshFile)), credentialWhere: ONSEN_CRED_FILE || telegramMeshFile, log,
   joeyChat: () => { try { return String(loadAccess().allowFrom[0] ?? '') } catch { return '' } },
 })
@@ -432,7 +432,7 @@ if (ONSEN_TAKE_ON) {
       itemClaims!.acknowledged(line, ok)
       // The spool advances its cursor after this callback. A waiting lane can take as soon as it drains.
       if (!ROAMER) queueMicrotask(() => { if (takeMode!.canReceive && !itemClaims!.blocked()) Lanes.sweepQueue() })
-    }, line => itemClaims!.reportBody(line))
+    })
     itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at), () => itemPeek!.reset(), due => !!takeKeepwarm?.matchesWindow(due))
     itemPeek = new ItemPeek(takeMode, ROAMER ? () => new Map() : Lanes.itemIndex, routeInboxItem, () => !itemClaims!.blocked(),
       ROAMER ? undefined : Lanes.sweepQueue, ROAMER ? waiting => roamerItems?.fullList(waiting) : undefined)

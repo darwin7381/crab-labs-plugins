@@ -1,13 +1,12 @@
 import { statSync } from 'fs'
 import { dirname } from 'path'
-import type { InboxItem, ItemRef, ReceivingState, ReceivingTarget } from './onsen-items.ts'
+import { claudeSessionId, roamerSessionId, type InboxItem, type ItemRef, type ReceivingState, type ReceivingTarget } from './onsen-items.ts'
 import type { ItemReceiver } from './onsen-receive.ts'
 import type { Claims } from './onsen-claims.ts'
 import { REGISTRY_SETTLE_MS, TurnWatch, type RegEntry, type Registry } from './onsen-status.ts'
 
 type Notification = { method: string; params: unknown }
 type Offer = { target: ReceivingTarget; stream: string }
-const sessionUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 /** Keep watching the original receiving turn across /roam and reconnects. All leases and reports belong to the common receiver. */
 export class RoamerItems {
@@ -53,6 +52,7 @@ export class RoamerItems {
   }
   async destination(row: InboxItem): Promise<string | null> {
     this.recordSelection()
+    const member = this.o.receiver.mode.member
     let session = this.o.claims.firstReceiver(row.id)
     if (!session && (row.reason === 'cut' || row.released || row.failures)) {
       // A previous connector may have acknowledged the cut and discarded its local claim.
@@ -67,15 +67,21 @@ export class RoamerItems {
       if (first) {
         // Older events can repeat Item.session_id. A sender preset alone cannot identify a receiver.
         let sid = first.session_id !== created.session_id ? first.session_id : null
-        if (!sessionUUID.test(sid ?? '') && created.session_id === null) sid = detail.session_id
-        if (!sid || !sessionUUID.test(sid)) return null
+        const receiverId = (s?: string | null) => claudeSessionId(s) ||
+          (s?.startsWith(member + '.roam.') && /^\d{1,39}$/.test(s.slice(member.length + 6)))
+        if (!receiverId(sid) && created.session_id === null) sid = detail.session_id
+        if (!sid || !receiverId(sid)) return null
         this.o.claims.recoverReceiver(row.id, sid)
         session = sid
       } else if (detail.reason === 'cut' && !detail.events?.some(e => e.kind === 'taken')) return null
     }
     session ??= this.o.claims.selectedAt(Date.parse(row.created_at ?? ''))?.session_id
-    if (session) this.pending.set(row.id, session)
-    return session ?? null
+    if (!session) return null
+    const local = claudeSessionId(session)
+    const destination = local ? roamerSessionId(member, session) : session
+    this.pending.set(row.id, destination)
+    // After a switch of connector, only Onsen's public id may survive. Wait for the matching registry entry.
+    return local ? session : this.o.registry.entries().find(e => roamerSessionId(member, e.sessionId) === destination)?.sessionId ?? null
   }
   fullList(waiting: ReadonlyMap<string, number>): void {
     for (const id of this.pending.keys()) if (!waiting.has(id)) this.pending.delete(id)
@@ -135,8 +141,11 @@ export class RoamerItems {
     const selectedEntry = selected && entries.find(e => e.pid === selected.claude_pid)
     const switched = selected && selectedEntry && selectedEntry.sessionId !== selected.session_id
     if (selected && !switched && this.o.alive(selected.claude_pid)) all.push(selected)
-    const wanted = new Set(this.pending.values())
-    for (const reg of entries) if (wanted.has(reg.sessionId) && this.o.alive(reg.pid)) all.push(this.targetFor(reg))
+    const pending = new Set(this.pending.values()), wanted = new Set<string>()
+    for (const reg of entries) if (pending.size && pending.has(roamerSessionId(this.o.receiver.mode.member, reg.sessionId)) && this.o.alive(reg.pid)) {
+      wanted.add(reg.sessionId)
+      all.push(this.targetFor(reg))
+    }
     const live = new Set<string>()
     for (const t of all) {
       const sid = t.session_id

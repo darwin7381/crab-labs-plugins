@@ -85,6 +85,7 @@ export type StatusFact = { idem_key: string; agent: string; state: StatusState; 
 export type FormAck = { ids: number[]; at: string }
 /** fw (WO-190, local only, never posted): this message's files are being stored in Onsen; the sync joins their ids when it sends the line */
 import type { ItemReport } from './onsen-receive.ts'
+import { claudeSessionId, roamerSessionId } from './onsen-items.ts'
 import { isDeepStrictEqual } from 'node:util'
 import { ItemWrites, type ItemWrite } from './onsen-item-writes.ts'
 export type SpoolLine = { k: 'm'; r: OnsenItem; fw?: 1 } | { k: 'e'; r: OnsenEvent } | { k: 'l'; r: RestartLineDraw } | { k: 'u'; r: RestartLineLift }
@@ -350,6 +351,7 @@ export type OnsenConfig = {
   dir: string
   base: string
   agent: string
+  roamer?: boolean
   /** false (ONSEN_RECORD=0): nothing is recorded or synced; chat_history still asks Onsen */
   record: boolean
   /** the agent's mesh credential, read fresh each time (null: none) */
@@ -452,12 +454,9 @@ export class OnsenClient {
   /** WO-175: what became of the Call lines sent lately (idem → fate), and who waits for one not sent yet */
   private itemReports = 0
   private reportedThrough: number
-  private itemBody?: (line: ItemReport) => ItemReport['body']
   private itemAck?: (line: ItemReport, ok: boolean) => void
 
-  watchItemReports(replay: (line: ItemReport) => void, ack: (line: ItemReport, ok: boolean) => void,
-    body?: (line: ItemReport) => ItemReport['body']): void {
-    this.itemBody = body
+  watchItemReports(replay: (line: ItemReport) => void, ack: (line: ItemReport, ok: boolean) => void): void {
     this.itemAck = ack
     this.itemReports = 0
     for (const { line } of this.pendingReports()) { this.itemReports++; replay(line.r) }
@@ -1045,7 +1044,10 @@ export class OnsenClient {
       if (t.line.k === 'ir') {
         // The FIFO cursor can now pass a report acknowledged ahead of a stuck record.
         if (t.end <= this.reportedThrough) { this.writeCursor(t.end); i++; continue }
-        const line = t.line.r, body = this.itemBody?.(line) ?? line.body
+        const line = t.line.r
+        // A C6 spool may outlive both its local claim and take mode. Migrate its wire body even without a watcher.
+        const sid = line.body.session_id
+        const body = claudeSessionId(sid) ? { ...line.body, session_id: this.cfg.roamer ? roamerSessionId(this.cfg.agent, sid) : 'main' } : line.body
         const path = '/v1/items/' + encodeURIComponent(line.item_id) + '/report'
         const key = ['ir', line.item_id, body.claim_id, body.outcome].map(encodeURIComponent).join(':')
         const r = await this.put(path, body, cred, undefined, { 'Idempotency-Key': key }).catch(e => ({ status: 0, json: { error: errText(e) } }))
