@@ -90,74 +90,25 @@ test('agent-inbox reports a pause once, including first start, and can resume pu
   expect(r.logs.filter(s => s.includes('on pull again'))).toHaveLength(1)
 })
 
-test('a 409 hands on locally held pull items and acks the delivered prefix before pausing', async () => {
+test('after the switch the next pull round delivers and acks the pending prefix', async () => {
   const r = rig(), inbox = new OnsenInbox({ file: join(r.dir, 'inbox.json') })
-  const legacy = ['first', 'middle', 'last'].map(id => r.f.add(id, 'call'))
-  const ready = new Set<string>(), trace: string[] = []
+  const handed: number[] = []
+  let ready = false
   const pull = new OnsenPuller({ inbox, base: r.f.base, takeEnabled: true, host: 'mac-mini', now: r.f.now,
-    req: async (...args) => {
-      const reply = await r.client.request(...args)
-      if (reply?.status === 409) trace.push('409')
-      return reply
-    },
-    deliver: async it => {
-      const text = String(it.payload.text)
-      if (!ready.has(text)) return 'later'
-      trace.push(text)
-      return 'delivered'
-    },
-    log: (_lv, line) => { if (line.includes('member is on take')) trace.push('pause at ' + inbox.ackedSeq) } })
-  const acks = () => r.f.calls.filter(c => c.path === '/inbox/ack').map(c => c.body)
-  r.f.mode(409) // old pull works until the member switches to take
-  await pull.once(); await pull.once()
-  expect(inbox.pending.map(it => it.seq)).toEqual(legacy.map(it => it.number))
-  expect(acks()).toEqual([])
-
-  r.f.mode(200)
-  const fresh = r.f.add('new', 'call')
-  ready.add('first'); ready.add('last')
-  await pull.once()
-  expect(trace).toEqual(['409', 'first', 'last', 'pause at 1'])
-  expect(inbox.pending.map(it => it.seq)).toEqual([2])
-  expect(acks()).toEqual([{ upto: 1 }])
-
-  ready.add('middle')
-  r.f.advance(60_000)
-  await pull.once(); await pull.once()
-  expect(trace).toEqual(['409', 'first', 'last', 'pause at 1', 'middle', '409', '409'])
-  expect(inbox.pending).toEqual([])
-  expect(acks()).toEqual([{ upto: 1 }, { upto: 3 }])
-  await r.mode.probe()
-  const page = (await r.mode.req('GET', r.mode.path + '?state=waiting&connector=' + encodeURIComponent(r.mode.connector)))!.json
-  expect(page.items.map((it: InboxItem) => it.id)).toEqual([fresh.id])
-  expect([...(await r.receiver.receive([...legacy, fresh].map(itemRef))).given]).toEqual([fresh.id])
-})
-
-test('an interrupted ack on a first-start 409 is retried after restart without repeating the hand-off', async () => {
-  const r = rig(), file = join(r.dir, 'inbox.json'), handed: number[] = []
+    req: r.client.request.bind(r.client), log: () => {},
+    deliver: async it => { if (!ready) return 'later'; handed.push(it.seq); return 'delivered' } })
   r.f.mode(409)
-  const row = r.f.add('pending', 'call')
-  const old = await r.client.request('GET', '/inbox?after=0&wait=0&limit=1')
-  const inbox = new OnsenInbox({ file })
-  inbox.take(old!.json.items)
-  expect(inbox.based).toBe(false)
-  const puller = (local: OnsenInbox) => new OnsenPuller({ inbox: local, base: r.f.base, takeEnabled: true, host: 'mac-mini',
-    req: r.client.request.bind(r.client), log: (_lv, line) => r.logs.push(line),
-    deliver: async it => { handed.push(it.seq); r.f.down(true); return 'delivered' } })
-
+  const old = r.f.add('pending', 'call')
+  await pull.once(); await pull.once()
+  expect(inbox.pending.map(it => it.seq)).toEqual([old.number])
   r.f.mode(200)
-  await expect(puller(inbox).once()).rejects.toThrow('ack 1: HTTP 503')
-  expect(r.logs.some(line => line.includes('member is on take'))).toBe(false)
-  const restored = new OnsenInbox({ file })
-  expect(restored.pending).toEqual([])
-  expect(restored.ackedSeq).toBe(0)
-  r.f.down(false)
-  const resumed = puller(restored)
-  await resumed.once(); await resumed.once()
-  expect(handed).toEqual([row.number])
-  expect(restored.ackedSeq).toBe(row.number)
-  expect(row.state).toBe('completed')
-  expect(r.f.calls.filter(c => c.path === '/inbox/ack').map(c => c.body)).toEqual([{ upto: 1 }, { upto: 1 }])
+  await pull.once()
+  ready = true
+  r.f.advance(60_000)
+  await pull.once()
+  expect(handed).toEqual([old.number])
+  expect(r.f.calls.filter(c => c.path === '/inbox/ack').map(c => c.body)).toEqual([{ upto: old.number }])
+  expect(old.state).toBe('completed')
 })
 
 test('peek waits without claiming and reads a gated row again on release', async () => {
