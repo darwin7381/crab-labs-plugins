@@ -9,7 +9,7 @@ type Row = InboxItem & { waiter: string; preview: string; line: string; created_
 const iso = (ms: number) => new Date(ms).toISOString()
 
 /** A disposable member inbox. Server time, ownership, versions and idempotency live on this side of HTTP. */
-export function fakeItems() {
+export function fakeItems(member = 'adam') {
   let now = Date.now(), seq = 0, claimSeq = 0, owner = '', seen = 0
   const rows = new Map<string, Row>(), writes = new Map<string, Response>(), terminal = new Map<string, string>()
   const givenByPull = new Set<Row>()
@@ -38,7 +38,7 @@ export function fakeItems() {
     const number = ++seq
     const payload = kind === 'message' ? { message_id: 'm' + number, conversation_id: 'conv', kind: 'text', from: 'joey',
       via: 'telegram', text: id, client: { name: 'telegram', chat: '1', msg_id: String(number), user_id: '1', user: 'Joey' }, sent_at: iso(now) } : { text: id }
-    const row: Row = { id, number, member: 'adam', from: 'joey', session_id: kind === 'message' || extra.message_id ? 'main' : null, note: null, kind, refs: [], state: 'waiting', reason: null,
+    const row: Row = { id, number, member, from: 'joey', session_id: kind === 'message' || extra.message_id ? 'main' : null, note: null, kind, refs: [], state: 'waiting', reason: null,
       waiter: extra.from ?? 'joey', relay: null, preview: String(extra.payload?.text ?? payload.text), line: id,
       created_at: iso(now), completed_at: null, cancelled_at: null, about_item_id: null, edit_of_item_id: null,
       half_done: false, not_before: null, deadline: null, expires_at: null, failures: 0, released: false, version: 0, events: [], claim: null,
@@ -61,7 +61,7 @@ export function fakeItems() {
     const url = new URL(req.url), path = url.pathname, q = url.searchParams
     const b = req.method === 'GET' ? {} : await req.json() as any, key = req.headers.get('Idempotency-Key')
     const connector = b.connector ?? q.get('connector')
-    const envelope = () => ({ api_version: '1', as_of: iso(now), viewer: 'adam', read_by: null,
+    const envelope = () => ({ api_version: '1', as_of: iso(now), viewer: member, read_by: null,
       ...(connector ? { changed_after: iso(now - 1000).replace('Z', '+00:00') } : {}) })
     const detail = (data: unknown) => Response.json({ ...envelope(), data })
     calls.push({ path, query: q, body: b, key })
@@ -70,10 +70,10 @@ export function fakeItems() {
     expire()
     // Existing resources used by the real tg daemon alongside the Item API.
     if (path.endsWith('/batch')) return Response.json({ results: (b.items ?? []).map(() => ({ id: ++seq })) })
-    if (path === '/v1/conversations/by-chat/1') return detail({ id: 'conv', members: ['joey', 'adam'] })
+    if (path === '/v1/conversations/by-chat/1') return detail({ id: 'conv', members: ['joey', member] })
     if (path === '/v1/messages' && req.method === 'POST') return detail({ id: String(++seq), delivery: 'sent' })
-    if (path.endsWith('/observation') && b.connector === undefined) return detail({ name: 'adam', kind: 'agent' })
-    if (path.endsWith('/commands')) return detail({ name: 'adam', kind: 'agent' })
+    if (path.endsWith('/observation') && b.connector === undefined) return detail({ name: member, kind: 'agent' })
+    if (path.endsWith('/commands')) return detail({ name: member, kind: 'agent' })
     if (path === '/inbox' && req.method === 'GET') {
       if (mode === 200) return error(409, 'take_member')
       const after = Number(q.get('after'))
@@ -90,7 +90,7 @@ export function fakeItems() {
       pullAcked = Math.max(pullAcked, b.upto)
       return Response.json({ acked: 1 })
     }
-    const base = '/v1/members/adam/items'
+    const base = `/v1/members/${member}/items`
     if (connector && path.startsWith(base) && mode !== 200) return error(mode, mode === 409 ? 'not_take_member' : mode === 400 ? 'invalid_request' : 'not_found')
     if (connector) {
       if (owner && owner !== connector && now < seen + 45_000) return error(409, 'not_current_connector', { current: owner })
@@ -127,10 +127,10 @@ export function fakeItems() {
       }
       const waiting = [...rows.values()].filter(r => r.state === 'waiting')
       answer = detail({ claim_id, items: given.map(view), waiting: waiting.length, next_not_before: waiting.map(r => r.not_before).filter(Boolean).sort()[0] ?? null })
-    } else if (path === '/v1/members/adam/observation' && req.method === 'PUT') {
+    } else if (path === `/v1/members/${member}/observation` && req.method === 'PUT') {
       if (!Array.isArray(b.held_item_ids)) return error(400, 'invalid_request')
       for (const id of b.held_item_ids) { const r = rows.get(id); if (r?.claim?.connector === connector) r.claim.expires_at = iso(now + 45_000) }
-      answer = detail({ name: 'adam', kind: 'agent' })
+      answer = detail({ name: member, kind: 'agent' })
     } else {
       const row = rows.get(decodeURIComponent(path.split('/')[3] ?? ''))
       if (!row) return error(404, 'not_found')

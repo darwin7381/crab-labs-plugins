@@ -841,9 +841,11 @@ export class RoamerTelegram {
   // Retry polling with backoff on any error. Previously only 409 was retried — a single ETIMEDOUT/ECONNRESET/DNS failure rejected bot.start(), the catch
   // returned, and polling stopped permanently while the process stayed alive. 2026-05-13 by Joey: the inner loop wrapped in an outer try/catch so a sync
   // throw in the IIFE itself gets logged and retried instead of silently terminating the loop.
+  private stopped = false
+  private timers: ReturnType<typeof setInterval>[] = []
   private async pollLoop(): Promise<void> {
     const h = this.host!
-    for (let attempt = 1; ; attempt++) {
+    for (let attempt = 1; !this.stopped; attempt++) {
       try {
         await this.bot.start({
           onStart: info => {
@@ -866,7 +868,7 @@ export class RoamerTelegram {
         })
         return // bot.stop() was called — clean exit from the loop
       } catch (err) {
-        if (h.shuttingDown()) return
+        if (this.stopped || h.shuttingDown()) return
         // bot.stop() mid-setup rejects with grammy's "Aborted delay" — expected, not an error.
         if (err instanceof Error && err.message === 'Aborted delay') return
         const is409 = err instanceof GrammyError && err.error_code === 409
@@ -886,19 +888,19 @@ export class RoamerTelegram {
     this.host = host
     this.registerHandlers()
     if (!host.staticAccess) {
-      setInterval(() => this.checkApprovals(), 5000).unref()
+      this.timers.push(setInterval(() => this.checkApprovals(), 5000).unref())
       // #16: sweep expired pairing codes even when no message traffic triggers a gate() call — otherwise a dead code sits in access.json (and counts toward
       // the 3-pending cap) until the next inbound.
-      setInterval(() => {
+      this.timers.push(setInterval(() => {
         try {
           const a = host.readAccessFile()
           if (pruneExpired(a)) { host.saveAccess(a); this.log('info', 'pairing sweep: pruned expired pending code(s)') }
         } catch (err) { this.log('warn', `pairing sweep failed: ${err instanceof Error ? err.message : err}`) }
-      }, PAIRING_PRUNE_INTERVAL_MS).unref()
+      }, PAIRING_PRUNE_INTERVAL_MS).unref())
     }
     this.pollRunning = true
     void (async () => {
-      while (!host.shuttingDown()) {
+      while (!this.stopped && !host.shuttingDown()) {
         try { await this.pollLoop(); break } catch (err) {
           this.log('error', `pollLoop crashed unexpectedly: ${err} — restarting in 5s`)
           await new Promise(r => setTimeout(r, 5000))
@@ -911,5 +913,9 @@ export class RoamerTelegram {
   }
 
   /** bot.stop() signals the poll loop to end; the current getUpdates request may take up to its long-poll timeout to return */
-  stop(): Promise<void> { return Promise.resolve(this.bot.stop()) }
+  async stop(): Promise<void> {
+    this.stopped = true
+    for (const timer of this.timers) clearInterval(timer)
+    if (this.bot.isRunning()) await this.bot.stop()
+  }
 }

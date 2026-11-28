@@ -5,10 +5,10 @@ export function machineName(host = process.env.ONSEN_HOST): string {
   return (host?.trim() || hostname().replace(/\.local$/, '')).toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+/, '').slice(0, 32) || 'unknown'
 }
 
-export function takeRefusal(o: { inbox: boolean; roamer: boolean; lanes: boolean; record: boolean; observation: boolean }): string | undefined {
+export function takeRefusal(o: { inbox: boolean; roamer: boolean; targetRouting?: boolean; lanes: boolean; record: boolean; observation: boolean }): string | undefined {
   if (o.inbox) return 'INBOX_ONLY'
-  if (o.roamer) return 'ROAMER'
-  if (!o.lanes) return 'LANES_ON is off'
+  if (o.roamer && !o.targetRouting) return 'ROAMER'
+  if (!o.lanes && !o.targetRouting) return 'LANES_ON is off'
   if (!o.record) return 'recording is off'
   if (!o.observation) return 'ONSEN_OBSERVATION is off'
 }
@@ -33,7 +33,7 @@ export class TakeMode {
   private offset = 0
   readonly now = () => Date.now() + this.offset
 
-  constructor(readonly member: string, readonly req: ItemRequest, readonly changed: (active: boolean) => void,
+  constructor(readonly member: string, readonly req: ItemRequest, readonly changed: (active: boolean) => void | Promise<void>,
     readonly log: (line: string) => void, machine = machineName(),
     readonly later = (fn: () => void, ms: number) => setTimeout(fn, ms)) {
     this.path = '/v1/members/' + encodeURIComponent(member) + '/items'
@@ -53,7 +53,7 @@ export class TakeMode {
     this.reason = ''
     this.active = this.observationRequired = true
     this.log('onsen take: started ' + this.connector)
-    this.changed(true)
+    await this.changed(true)
   }
 
   pause(reason: string, ms: number): void {

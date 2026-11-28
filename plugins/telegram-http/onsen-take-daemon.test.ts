@@ -44,7 +44,7 @@ async function waitFor(ok: () => boolean | Promise<boolean>, ms = 5000) {
   expect(await ok()).toBe(true)
 }
 async function daemon(env: Record<string, string> = {}, initialMode = 200, setup?: (root: string, f: ReturnType<typeof fakeItems>) => Record<string, string> | Promise<Record<string, string>>) {
-  const f = fakeItems(), root = mkdtempSync(join(tmpdir(), 'take-daemon-')), state = join(root, 'tg'), lanes = join(root, '.lanes')
+  const f = fakeItems(env.LANES_AGENT || 'adam'), root = mkdtempSync(join(tmpdir(), 'take-daemon-')), state = join(root, 'tg'), lanes = join(root, '.lanes')
   clean.push(async () => { try { await f.stop() } finally { rmSync(root, { recursive: true, force: true }) } })
   f.mode(initialMode)
   for (const dir of [state, lanes, join(root, 'home')]) mkdirSync(dir)
@@ -599,6 +599,32 @@ test('roamer stays on its local mock bot and never probes items', async () => {
   await waitFor(() => d.log().includes('staying on pull: ROAMER'))
   expect(d.f.calls.filter(c => c.path.endsWith('/items'))).toHaveLength(0)
 })
+
+const member = 'space-roamers'
+const roamerEnv = { GENESIS_LANES: '0', ROAMER_MODE: '1', ROAMER_BOT_NAME: 'space_roamers', LANES_AGENT: member, ONSEN_OBSERVATION: member }
+const roamerState = (root: string) => ({ ROAMER_STATE_FILE: join(root, 'roamer-state.json') })
+
+test('a switched roamer starts with no bot token, registers commands and observes as its own member', async () => {
+  const d = await daemon(roamerEnv, 200, roamerState)
+  const h = await fetch(d.base + '/healthz').then(r => r.json())
+  expect(h.connector.on).toBe(true)
+  expect(h.polling).toBe(false)
+  await waitFor(() => d.f.calls.some(c => c.body?.connector === 'mac-mini/' + member && c.path.endsWith('/observation')))
+  const names = d.f.calls.find(c => c.path === '/v1/members/' + member + '/commands')!.body.commands.map((c: any) => c.name)
+  expect(names).toEqual(expect.arrayContaining(['roam', 'roam_status', 'resume_list', 'resume', 'resume_previous', 'restart', 'kill_stuck',
+    'clear', 'agents', 'mcp', 'init', 'compact', 'model', 'effort', 'codexgate', 'sigint']))
+})
+
+for (const [name, mode, named] of [['not selected', 200, false], ['409', 409, true], ['404', 404, true]] as const)
+  test('roamer keeps its local bot when ' + name, async () => {
+    const bot = startBotApiMock({}, { pollHoldMs: 100 })
+    clean.push(() => bot.stop())
+    const d = await daemon({ ...roamerEnv, TELEGRAM_BOT_TOKEN: bot.token, TELEGRAM_API_ROOT: bot.url, ...(named ? {} : { ONSEN_TAKE: '' }) }, mode, roamerState)
+    await waitFor(async () => (await fetch(d.base + '/healthz').then(r => r.json())).polling)
+    expect((await fetch(d.base + '/healthz').then(r => r.json())).connector.on).toBe(false)
+    expect(d.f.calls.filter(c => c.path.endsWith('/items'))).toHaveLength(named ? 1 : 0)
+    expect(d.f.calls.some(c => c.path.endsWith('/commands') || c.path.endsWith('/observation'))).toBe(false)
+  })
 
 function command(d: Awaited<ReturnType<typeof daemon>>, id: string, text: string, tgId: string) {
   return d.f.add(id, 'control', { message_id: 'm-' + id, payload: { message_id: 'm-' + id, from: 'joey', conversation_id: 'conv',

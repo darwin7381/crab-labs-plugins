@@ -149,21 +149,11 @@ const STATIC = process.env.TELEGRAM_ACCESS_MODE === 'static'
 // daemon's fate (Joey 4557: 喚醒通道不能跟 TG 共命運).
 const INBOX_ONLY = process.env.CHANNEL_INBOX_ONLY === '1'
 
-// WO-197 final (1.59.0, Chiron's ruling A): a roamer (ROAMER_MODE=1) polls its own bot through roamer-telegram.ts, as a daemon did before with
-// ONSEN_BRIDGE off. Every other Telegram daemon is a connector, always (onsen-connector.ts): its bot is carried by the machine's telegram-bridge; it has
-// no long poll, no Bot API call, no Telegram code loaded, and starts without a bot token; everything it says is written into Onsen. ONSEN_BRIDGE is not
-// read here any more (only the bridge reads it, to know which bots to carry). No other setting makes a daemon talk to Telegram.
-const CONNECTOR_AGENT = Onsen.agentName(process.env, process.env.AGENT_WORKSPACE_DIR ?? dirname(STATE_DIR))
 const ROAMER = !INBOX_ONLY && Onsen.isRoamerEnv(process.env)
-const CONNECTOR = !INBOX_ONLY && !ROAMER
-if (!TOKEN && ROAMER) {
-  process.stderr.write(
-    `telegram channel: TELEGRAM_BOT_TOKEN required\n` +
-    `  set in ${ENV_FILE}\n` +
-    `  format: TELEGRAM_BOT_TOKEN=123456789:AAH...\n`,
-  )
-  process.exit(1)
-}
+const roamerMember = Onsen.roamerMember(process.env)
+const CONNECTOR_AGENT = roamerMember && switchOn(process.env.ONSEN_TAKE, roamerMember) ? roamerMember
+  : Onsen.agentName(process.env, process.env.AGENT_WORKSPACE_DIR ?? dirname(STATE_DIR))
+let CONNECTOR = !INBOX_ONLY && !ROAMER
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 /** WO-189: the files of Joey's Onsen messages taken into INBOX_DIR, by their attachment_file_id (onsen:<file id>): download_attachment answers with them */
 const onsenSaved = new Map<string, string>()
@@ -333,18 +323,13 @@ process.on('exit', code => {
 const TOKEN_TAIL = TOKEN && TOKEN.length >= 6 ? `...${TOKEN.slice(-6)}` : '(short)'
 log('info', `boot: ppid=${process.ppid} STATE_DIR=${STATE_DIR} TOKEN=${TOKEN_TAIL} STATIC=${STATIC}`)
 
-// WO-197 final (1.59.0): a roamer's Telegram (roamer-telegram.ts: the Bot, the send bound, the long poll, every Bot API call), imported here and
-// only here, only for ROAMER_MODE=1; null everywhere else (a connector, the agent-inbox daemon). The poll and the update handlers start further down
-// (tg.start), once everything they call is defined.
-const tg: RoamerTelegram | null = ROAMER
-  ? new (await import('./roamer-telegram.ts')).RoamerTelegram({ token: TOKEN!, ...(process.env.TELEGRAM_API_ROOT ? { apiRoot: process.env.TELEGRAM_API_ROOT } : {}), log })
-  : null
+let tg: RoamerTelegram | null = null
 /** the bot's username while a roamer polls ('' otherwise: a connector has no bot of its own) */
 const botName = (): string => tg?.botUsername ?? ''
 // Onsen (WO-139): every Telegram message in or out of this daemon becomes one record in Onsen (onsen-client.ts: local spool first, synced in order).
 // Telegram daemon only. ONSEN_BASE / ONSEN_RECORD / ONSEN_AGENTS / ONSEN_CREDENTIAL_FILE come from the plist or the machine config (fleet-config.ts).
 // The credential is the agent's mesh credential, kept by its agent-inbox daemon (<workspace>/.agent-inbox-state/mesh-credential); never logged.
-const ONSEN_AGENT = Onsen.agentName(process.env, process.env.AGENT_WORKSPACE_DIR ?? dirname(STATE_DIR))
+const ONSEN_AGENT = CONNECTOR_AGENT
 /** WO-175: this agent's daemons report the moments of the Calls it receives (lanes on, recording on, ONSEN_CALL_STATE not off): the two old start receipts
  *  (the agent-inbox daemon's when a lane takes a scheduled run, the main's M1 bind) are off then: the Call's `running` is the start receipt BTCC reads */
 const CALL_STATE = Lanes.LANES_ON && Onsen.recordFor(process.env, ONSEN_AGENT) && Onsen.callStateOn(process.env, ONSEN_AGENT)
@@ -360,29 +345,50 @@ let itemPeek: ItemPeek | undefined
 let itemReceiver: ItemReceiver | undefined
 let itemClaims: Claims | undefined
 let registryStatusChanged: (() => void) | undefined
+let connectorReady = false
 if (ONSEN_TAKE_ON) {
-  const reason = takeRefusal({ inbox: INBOX_ONLY, roamer: ROAMER, lanes: Lanes.LANES_ON, record: !!onsen?.cfg.record,
+  const reason = takeRefusal({ inbox: INBOX_ONLY, roamer: ROAMER, targetRouting: isRoamerEnabled() && !!roamerMember, lanes: Lanes.LANES_ON, record: Onsen.recordFor(process.env, ONSEN_AGENT, ROAMER),
     observation: switchOn(process.env.ONSEN_OBSERVATION, ONSEN_AGENT) })
   if (reason) log('info', `onsen take: staying on pull: ${reason}`)
   else if (onsen) {
     takeMode = new TakeMode(ONSEN_AGENT, (m, p, b, t, h, signal) => onsen.request(m, p, b, t, h, signal),
-      active => { if (active) { itemClaims!.start(); itemPeek!.reset() } else itemPeek!.stop(); registryStatusChanged?.() }, line => log('info', line))
-    itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, Lanes.offerMissed, () => registryStatusChanged?.(), takeMode.now)
+      async active => {
+        if (active && ROAMER && !CONNECTOR) {
+          await tg?.stop()
+          tg = null
+          CONNECTOR = onsen.cfg.record = true
+          if (connectorReady) { onsen.start(); startConnectorCommands(); startOnsenStatus(onsen) }
+        }
+        if (active) { itemClaims!.start(); if (connectorReady) itemPeek!.reset() } else itemPeek!.stop()
+        registryStatusChanged?.()
+      }, line => log('info', line))
+    itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, ROAMER ? () => itemPeek!.reset() : Lanes.offerMissed, () => registryStatusChanged?.(), takeMode.now)
     onsen.watchItemReports(line => itemClaims!.replay(line), (line, ok) => itemClaims!.acknowledged(line, ok))
     itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at), () => itemPeek!.reset())
-    Lanes.useItemReceiver(itemReceiver)
-    itemPeek = new ItemPeek(takeMode, Lanes.itemIndex, routeInboxItem, () => !itemClaims!.blocked())
-    Lanes.observeItemGates(() => itemPeek!.reset())
+    itemPeek = new ItemPeek(takeMode, ROAMER ? () => new Map() : Lanes.itemIndex, routeInboxItem, () => !itemClaims!.blocked())
+    if (!ROAMER) { Lanes.useItemReceiver(itemReceiver); Lanes.observeItemGates(() => itemPeek!.reset()) }
   }
 }
+if (ROAMER) await takeMode?.probe()
+if (!TOKEN && ROAMER && !CONNECTOR) {
+  process.stderr.write(
+    `telegram channel: TELEGRAM_BOT_TOKEN required\n` +
+    `  set in ${ENV_FILE}\n` +
+    `  format: TELEGRAM_BOT_TOKEN=123456789:AAH...\n`,
+  )
+  process.exit(1)
+}
+tg = ROAMER && !CONNECTOR
+  ? new (await import('./roamer-telegram.ts')).RoamerTelegram({ token: TOKEN!, ...(process.env.TELEGRAM_API_ROOT ? { apiRoot: process.env.TELEGRAM_API_ROOT } : {}), log })
+  : null
 if (onsen) { log('info', `onsen: agent=${ONSEN_AGENT} base=${onsen.cfg.base} record=${onsen.cfg.record ? 'on' : 'off'}`); onsen.start() }   // the sync loop (record on only)
 // 1.58.32 (Chiron): a roamer posts nothing to Onsen, so it adds nothing to the spool; what an older version left there stays as it is (not ours to delete)
-if (onsen && Onsen.isRoamerEnv(process.env)) log('info', `onsen: a roamer (ROAMER_MODE=1) records nothing into the Onsen spool; ${onsen.pendingBytes()} bytes an older version left in ${onsen.spool} are kept as they are, not sent`)
+if (onsen && ROAMER && !CONNECTOR) log('info', `onsen: a roamer (ROAMER_MODE=1) records nothing into the Onsen spool; ${onsen.pendingBytes()} bytes an older version left in ${onsen.spool} are kept as they are, not sent`)
 // Onsen step 3, the half Joey sees (WO-145, onsen-visible.ts): ONSEN_FORM_LINKS (a comma list of agent names or `*`, from the plist or the machine
 // config; unset or empty = off; recording on for this agent; the agent-inbox daemon has none). 1.59.0: ONSEN_REACT_SEEN (the ✍) and ONSEN_STATUS_PIN (the
 // pinned status) are the bridge's (it draws both from Onsen); a connector sends no Telegram reaction or pin, and a roamer records nothing
 const visibleOn = (name: OnsenVisible.Switch): boolean => !!onsen && onsen.cfg.record && !INBOX_ONLY && OnsenVisible.switchOn(process.env, name, ONSEN_AGENT)
-const ONSEN_VISIBLE = { forms: visibleOn('ONSEN_FORM_LINKS') }
+const ONSEN_VISIBLE = { get forms() { return visibleOn('ONSEN_FORM_LINKS') } }
 const ONSEN_FORM_HOSTS = OnsenVisible.formHosts(process.env)
 if (ONSEN_VISIBLE.forms) log('info', `onsen: form links on for ${ONSEN_AGENT} (${[...ONSEN_FORM_HOSTS].join(', ')})`)
 /** WO-145: a page answer's id (form-<Onsen message id>): not a Telegram message */
@@ -410,7 +416,7 @@ async function formLinks(chat: string, text: string, who: string): Promise<{ tex
 const onsenUpload: OnsenFiles.Upload = (bytes, o) => onsen ? onsen.uploadFile(bytes, o) : Promise.resolve({ error: 'Onsen is off here' })
 /** WO-192 (onsen-first.ts): Onsen's version, read the first time it is needed (onsenInboundNow: a page message's route), then every 10 min (recording
  *  on, the Telegram daemon) */
-const onsenVersion: OnsenFirst.OnsenVersion | null = onsen && onsen.cfg.record && !INBOX_ONLY
+const onsenVersion: OnsenFirst.OnsenVersion | null = onsen && (onsen.cfg.record || !!takeMode) && !INBOX_ONLY
   ? new OnsenFirst.OnsenVersion({ request: (m, p, b, t) => onsen!.request(m, p, b, t), log }) : null
 /** tests only: a comma list of waits in ms (ONSEN_BRIDGE_RETRY_MS, ONSEN_INBOUND_RETRY_MS) */
 const msList = (v: string | undefined): number[] | undefined => { const l = String(v ?? '').split(',').map(x => Number(x.trim())).filter(x => Number.isFinite(x) && x >= 0); return l.length ? l : undefined }
@@ -580,7 +586,7 @@ async function reportCommands(): Promise<void> {
  *  (handledHere). /clear's reply and choice: connectorClearHooks. false: no handler took it (it goes on to the session as a message) */
 async function connectorCommand(text: string, chat: string, ref: string, userId: string, user: string, topic: number | undefined, atIso?: string,
   via?: string, item?: ItemRef, commandId?: string): Promise<boolean> {
-  const t = text.trim()
+  const t = ROAMER ? text.trim().replace(/^(\/[\w-]+)@\w+(?=\s|$)/, '$1') : text.trim()
   if (!/^\/[A-Za-z]/.test(t)) return false
   const cmd = t.split(/\s+/)[0]!.toLowerCase().replace(/@\S+$/, '')
   const here: Lanes.TopicAsk = { chat, ...(topic != null ? { topic } : {}) }
@@ -588,7 +594,8 @@ async function connectorCommand(text: string, chat: string, ref: string, userId:
   const name = user || userId
   if (item) {
     const control = isControlEnabled() && (sharedTuiCommands().includes(cmd) || controlCommandsForBotApi().some(c => '/' + c.command === cmd) || ['/kill-stuck', '/sessions', '/list'].includes(cmd))
-    if (!control && !['/start', '/help', '/status', '/main', '/lanes'].includes(cmd)) return false
+    const roamer = isRoamerEnabled() && roamerCommandsForBotApi().some(c => '/' + c.command === cmd)
+    if (!control && !roamer && !['/start', '/help', '/status', '/main', '/lanes'].includes(cmd)) return false
     if (!itemReceiver || !(await itemReceiver.receive([item])).given.has(item.onsen_item_id)) throw new Error('command item not available')
   }
   let handled = false
@@ -3953,11 +3960,15 @@ if (tg) {
   }
   tg.start(host)
 } else if (CONNECTOR) {
-  log('info', `connector mode (${CONNECTOR_AGENT}; 1.59.0: every Telegram daemon but a roamer): no Telegram code loaded, no long poll, no Bot API call; everything goes through Onsen and the Telegram bridge${TOKEN ? ' (the bot token in the env is not used)' : ''}`)
-  void reportCommands().catch(() => {})
-  setInterval(() => { if (!commandsPut && Date.now() - commandsTriedAt > 60_000) void reportCommands().catch(() => {}) }, 5_000).unref?.()
+  startConnectorCommands()
 } else {
   log('info', 'agent-inbox mode: Telegram polling disabled — serving /mcp + /inject only')
+}
+
+function startConnectorCommands(): void {
+  log('info', `connector mode (${CONNECTOR_AGENT}): all bot traffic goes through Onsen and the Telegram bridge`)
+  void reportCommands().catch(() => {})
+  setInterval(() => { if (!commandsPut && Date.now() - commandsTriedAt > 60_000) void reportCommands().catch(() => {}) }, 5_000).unref?.()
 }
 
 // ============================================================================
@@ -4379,10 +4390,14 @@ function liveSetting(k: LiveKey): string | undefined {
   }
   return liveFile.v[k]
 }
-void takeMode?.probe()
+connectorReady = true
+if (ROAMER) { if (takeMode?.active) itemPeek!.reset() }
+else void takeMode?.probe()
 const jevScreenValue = (): string | undefined => liveSetting('JEV_SCREEN')
-if (!INBOX_ONLY && (Lanes.LANES_ON || onsen?.cfg.record)) registry.start()
-if (onsen && onsen.cfg.record && !INBOX_ONLY) {
+if (!INBOX_ONLY && !ROAMER && (Lanes.LANES_ON || onsen?.cfg.record)) registry.start()
+if (onsen?.cfg.record) startOnsenStatus(onsen)
+function startOnsenStatus(onsen: Onsen.OnsenClient): void {
+  if (ROAMER) registry.start()
   // WO-175 (ONSEN_CALL_STATE, on unless 0; lanes on): the Calls this agent received (the call id its pulled item carries, Onsen 0.24.1), their moments
   // as PUT /v1/calls/<id>/state through the spool. The router's and a lane run's end come from lanes.ts, the turn moments from the journal tap
   const calls = CALL_STATE ? new OnsenStatus.CallFacts({ sink: line => { onsen.recordCall(line) }, client: onsen }) : null   // client: a receipt waits for Onsen's answer (WO-175, Chiron 05:55Z)

@@ -1468,6 +1468,12 @@ export function agentName(env: NodeJS.ProcessEnv, workspaceDir: string): string 
   const b = basename(workspaceDir)
   return b.startsWith('claude-') ? b.slice(7) : b || 'unknown-agent'
 }
+/** The member registered for this roamer. Existing installations name their bot with underscores. */
+export function roamerMember(env: NodeJS.ProcessEnv): string | undefined {
+  if (!isRoamerEnv(env)) return
+  const name = env.LANES_AGENT?.trim() || env.ROAMER_BOT_NAME?.trim().toLowerCase().replace(/^@|_?bot$/g, '').replace(/_/g, '-')
+  if (name && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name)) return name
+}
 /** ONSEN_RECORD: on unless 0 / off / false / no */
 export function recordOn(env: NodeJS.ProcessEnv): boolean {
   const v = (env.ONSEN_RECORD ?? '').trim().toLowerCase()
@@ -1478,8 +1484,8 @@ export function recordOn(env: NodeJS.ProcessEnv): boolean {
 export const isRoamerEnv = (env: NodeJS.ProcessEnv): boolean => (env.ROAMER_MODE ?? '').trim() === '1'
 /** ONSEN_AGENTS (the canary switch): a comma list of agent names, or `*` (unset = `*`). Recording runs only for an agent in it, and only with ONSEN_RECORD on;
  *  never for a roamer (1.58.32) */
-export function recordFor(env: NodeJS.ProcessEnv, agent: string): boolean {
-  if (!recordOn(env) || isRoamerEnv(env)) return false
+export function recordFor(env: NodeJS.ProcessEnv, agent: string, roamerConnector = false): boolean {
+  if (!recordOn(env) || (isRoamerEnv(env) && !roamerConnector)) return false
   const list = (env.ONSEN_AGENTS ?? '*').split(',').map(x => x.trim()).filter(Boolean)
   return list.includes('*') || list.includes(agent)
 }

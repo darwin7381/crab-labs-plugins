@@ -230,8 +230,8 @@ plugins/telegram-http/server.ts::return OnsenInbound.inboundEffective(v, ONSEN_A
 plugins/telegram-http/onsen-connector.ts::export class BridgeSwitch {
 plugins/telegram-http/onsen-connector.ts::async waitReport(id: string, conv: string): Promise<Said> {
 plugins/telegram-http/onsen-connector.ts::`/v1/conversations/${cid}/messages/by-client-id/${encodeURIComponent(s)}`
-plugins/telegram-http/server.ts::const CONNECTOR = !INBOX_ONLY && !ROAMER
-plugins/telegram-http/server.ts::if (!TOKEN && ROAMER) {
+plugins/telegram-http/server.ts::let CONNECTOR = !INBOX_ONLY && !ROAMER
+plugins/telegram-http/server.ts::if (!TOKEN && ROAMER && !CONNECTOR) {
 plugins/telegram-http/server.ts::new (await import('./roamer-telegram.ts')).RoamerTelegram(
 plugins/telegram-http/server.ts::void reportCommands().catch(() => {})
 plugins/telegram-http/server.ts::async function connectorReply(o: { chat: string; sender: string; text: string; redact: Array<[string, string]>; rich: boolean; files: string[]
@@ -354,7 +354,7 @@ plugins/telegram-http/server.ts::const call = !answers && body?.call_id != null
 plugins/telegram-http/onsen-client.ts::export function answeredCall(refs: unknown): string | null {
 plugins/telegram-http/lanes-wo175.test.ts::1.58.32: the answer to a Call this agent made (refs.call → answers_call
 plugins/telegram-http/onsen-client.ts::export const isRoamerEnv = (env: NodeJS.ProcessEnv): boolean => (env.ROAMER_MODE ?? '').trim() === '1'
-plugins/telegram-http/onsen-client.ts::if (!recordOn(env) || isRoamerEnv(env)) return false
+plugins/telegram-http/onsen-client.ts::if (!recordOn(env) || (isRoamerEnv(env) && !roamerConnector)) return false
 plugins/telegram-http/server.ts::onsen: a roamer (ROAMER_MODE=1) records nothing into the Onsen spool
 plugins/telegram-http/onsen-spool-skip.test.ts::1.58.32: a roamer records nothing into the spool
 plugins/telegram-http/onsen-visible.ts::if (this.o.paused?.()) { if (s.timer) { clearTimeout(s.timer); s.timer = null } s.want = null; return }
