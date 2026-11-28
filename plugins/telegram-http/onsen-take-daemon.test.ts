@@ -241,10 +241,10 @@ test('a pulled person_edit without a date uses the retained original arrival', a
 test('the inbox daemon follows take_member and serves the take relays with its local switch unset', async () => {
   const d = await daemon({ CHANNEL_INBOX_ONLY: '1', AGENT_INBOX_SELF: 'adam', ONSEN_PULL: 'adam', ONSEN_TAKE: '' })
   await waitFor(() => d.log().includes('member is on take'))
-  for (const endpoint of ['inbound-log', 'scheduler-taken']) {
-    const reply = await fetch(d.base + '/lanes/' + endpoint, { method: 'POST', headers: { Authorization: 'Bearer test-loopback' }, body: '{}' })
-    expect(reply.status).toBe(200)
-  }
+  // C2 (147a21e) retired the scheduler start relay for take members (Onsen reports a scheduled run's start from its Item); the inbound log stays
+  const relay = (endpoint: string) => fetch(d.base + '/lanes/' + endpoint, { method: 'POST', headers: { Authorization: 'Bearer test-loopback' }, body: '{}' })
+  expect((await relay('inbound-log')).status).toBe(200)
+  expect((await relay('scheduler-taken')).status).toBe(404)
   expect(d.f.calls.some(c => c.path.endsWith('/items'))).toBe(false)
   expect(d.f.calls.filter(c => c.path === '/inbox')).toHaveLength(1)
   const health = await fetch(d.base + '/healthz').then(r => r.json())
