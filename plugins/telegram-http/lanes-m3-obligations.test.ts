@@ -753,7 +753,7 @@ test('scheduler receipt (1.36.2): a command the guard refuses completes nothing,
 // ------------------------------------------------------------------ PL1 (AUD): one store of "what happened". Every inbound event has an M3 record, whatever its route;
 // what the main must know is a field of that record; the ledger is an audit log that no view reads.
 const digestNow = () => { const d = L.__digest(); if (d) L.__journal().write('msg', `dg-pl1-${Date.now()}-${Math.random()}`, 'done', { kind: 'digest', events: d.fields.events }); return d?.text ?? '' }
-test('PL1 B04, T1-R P-201, T2-R E2/E11, T3-R E9: a no_reply notice is an M3 record (owner router, nothing owed) in the digest and the activity list; one answering our thread says so', async () => {
+test('PL1 B04, T1-R P-201, T2-R E2/E11, T3-R E9: a no_reply notice is in the digest and activity list, and an answer also reaches the lane that asked', async () => {
   digestNow()
   const d = await L.routeEvent(mk('eve', 'FYI：P-201 週五 09:00 上線，你那邊不用動。', { no_reply: true }))
   expect(d).toMatchObject({ rule: 'mesh-no-reply', target: 'ledger' })
@@ -764,9 +764,12 @@ test('PL1 B04, T1-R P-201, T2-R E2/E11, T3-R E9: a no_reply notice is an M3 reco
   const p = await start(mk('eve', '你們 mock-api 的 p95 現在多少？'))                         // a question of ours goes out on the lane's thread ...
   await call(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '1.2s' }); await call(p.tok, 'notify_joey', { outcome: 'normal', text: 'Eve 問 p95，回 1.2s' }); await end(p.lane)
   const th = E().get(p.id)!.thread
-  await L.routeEvent(mk('eve', '收到，謝謝（不用回）', { no_reply: true, thread: th, hop: 2 }))   // ... and her no_reply answer on it
-  expect(E().get(`mesh-m3-${n}`)).toMatchObject({ owner: 'router', answers: p.lane, thread: th, lane: p.lane })
-  expect(digestNow()).toContain('收到，謝謝')
+  const answer = mk('eve', '收到，謝謝（不用回）', { no_reply: true, thread: th, hop: 2 })
+  expect(await L.routeEvent(answer)).toMatchObject({ rule: 'mesh-no-reply', target: 'lane', lane: p.lane })
+  expect(E().get(answer.id)).toMatchObject({ owner: 'router', answers: p.lane, thread: th, lane: p.lane, obligations: [] })
+  expect(L.activityList(undefined)).toContain('收到，謝謝')
+  expect(await until(() => L.__runTok(p.lane)?.evId === answer.id)).toBe(true)
+  await end(p.lane)
 })
 
 test('PL1 B02, E01, G03 e2, T6-R E1: the must-know mark of a critical alert is a field of its record, and the digest renders it from that field', async () => {

@@ -1214,7 +1214,8 @@ function bindThread(ev: InEvent, d: Decision, kind: string): void {
   if (!t && owner && owner !== 'main' && newLanes.includes(owner)) { const lt = S.threads[S.lanes[owner]?.thread ?? '']; if (lt && !lt.key_kind) t = lt }   // the lane opened for it
   if (!t && d.thread && S.threads[d.thread] && !S.threads[d.thread].key_kind) t = S.threads[d.thread]
   if (!t) {
-    if (!owner) return                                                       // a record with no thread to go on: nothing to bind
+    // A ledger answer can carry the peer's own thread ID even when we have no local record for it.
+    if (!owner || (ev.trigger === 'no_reply' && d.thread)) return
     t = ensureThread(newThreadId(), owner, null, 0)
   }
   if (t.alias_of && S.threads[t.alias_of]) t = S.threads[t.alias_of]
@@ -2776,7 +2777,7 @@ export function effectiveClass(trigger: string, askedCls: string | undefined | n
   return row?.inherit === 'asking_run' && askedCls ? askedCls : trigger
 }
 
-function toThreadOwner(ev: InEvent, o: ThreadOwner, base: { rule: string }): Decision {
+function toThreadOwner(ev: InEvent, o: ThreadOwner, base: { rule: string }, mainThread = o.thread): Decision {
   const t = o.thread ? S.threads[o.thread] ?? null : null
   const quiet = stoppedQuiet(ev, t, o.owner)
   if (quiet) return quiet
@@ -2784,7 +2785,7 @@ function toThreadOwner(ev: InEvent, o: ThreadOwner, base: { rule: string }): Dec
   if (gate) return stopThread(ev, t, gate, o.owner)
   if (o.owner === 'main') {
     saveState()
-    return { ...base, target: 'main', note: `thread ${o.thread ?? '-'} belongs to main`, thread: o.thread ?? undefined }
+    return { ...base, target: 'main', note: `thread ${mainThread ?? '-'} belongs to main`, thread: mainThread ?? undefined }
   }
   ev.cls = effectiveClass(ev.trigger!, o.cls)
   return dispatch(ev, S.lanes[o.owner], base)
@@ -2824,15 +2825,21 @@ async function applyRule(r: Rule, ev: InEvent): Promise<Decision> {
       return { ...d, ...(t ? { thread: t.id } : {}), note: `${what}${d.note ? `: ${d.note}` : ''}` }
     }
     case 'ledger': {
-      // no_reply = "do not answer me", not "nobody needs to read this": when it answers something
-      // WE sent (thread / reply_to known), still open no session, but flag it for the main's digest
-      // so the asker learns the answer (found in proof 5: a peer lane closed its answer no_reply).
-      const o = (ev.thread || ev.reply_to_id) ? threadOwnerFor(ev) : null
-      // M3 (PL1): the notice has its record (information, owner router): it rides the next digest and is in the activity list
-      recordInbound(ev, { owner: 'router', lane: o && o.owner !== 'main' ? o.owner : null, thread: o?.thread ?? ev.thread ?? null, fields: o ? { answers: o.owner } : {} })
-      ledger({ lane: 'router', thread: o?.thread ?? ev.thread ?? null, event: ev.id, kind: 'fyi',
+      const o = threadOwnerFor(ev)
+      const thread = o?.thread ?? ev.thread ?? null
+      // Record the FYI before delivery so it stays in the activity list and the recipient owes no reply.
+      const record = recordInbound(ev, { owner: 'router', lane: o && o.owner !== 'main' ? o.owner : null, thread, fields: o ? { answers: o.owner } : {} })
+      ledger({ lane: 'router', thread, event: ev.id, kind: 'fyi',
         text: `${ev.from}${o ? `（回覆 ${o.owner} 的提問）` : ''}：${ev.text.slice(0, 300)}`,
         refs: { btcc_msg_id: ev.btcc_msg_id ?? null, ...(o ? { answers: o.owner } : {}) } })
+      if (o && ev.urgency !== 'silent') {
+        const d = toThreadOwner(ev, o, base, thread)
+        // M1 offers an item while its delivery is open. Finishing the main turn meets it without a reply.
+        if (d.target === 'main' && record && !record.obligations?.some((ob: Ob) => ob.kind === 'main')) {
+          events.add(ev.id, { kind: 'main', level: 'handed', owner: 'main' })
+        }
+        return d
+      }
       return { ...base, target: 'ledger', note: o ? `no session opened; answer to ${o.owner} → digest` : 'no session opened', thread: o?.thread ?? undefined }
     }
     case 'quoted_lane': {

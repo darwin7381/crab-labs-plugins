@@ -134,7 +134,7 @@ test('every source: one wake row each, decided_by new (rule wake:<id>) with the 
   expect(on.log()).not.toContain(CRED_ON)
 }, 120000)
 
-test('decision 1 through the daemon: a no_reply reply with reply_to to the main\'s call wakes the main (old: the ledger); the same marked urgency silent is recorded only', async () => {
+test('decision 1 through the daemon: both routers deliver a no_reply answer to the main, and record an explicitly silent notice only', async () => {
   // the main's own call (the agent-inbox daemon tells the tg daemon: /lanes/outbound), then eve's no_reply answer quoting it
   for (const d of [on, off]) {
     const tok = readFileSync(join(root, d === on ? 'on' : 'off', 'tok', String(d.port)), 'utf8').trim()
@@ -147,7 +147,7 @@ test('decision 1 through the daemon: a no_reply reply with reply_to to the main\
   for (const who of ['on', 'off'] as const) expect(await until(() => ['mesh-r1', 'mesh-r2'].every(id => rows(who).some(r => r.refs?.event_id === id)), 30000)).toBe(true)
   const one = (who: Who, id: string) => rows(who).filter(r => r.refs?.event_id === id)[0]
   expect(one('on', 'mesh-r1')).toMatchObject({ rule: 'wake:owner', target: 'held:offline', decided_by: 'new' })
-  expect(one('off', 'mesh-r1')).toMatchObject({ rule: 'mesh-no-reply', target: 'ledger', decided_by: 'old' })
+  expect(one('off', 'mesh-r1')).toMatchObject({ rule: 'mesh-no-reply', target: 'held:offline', decided_by: 'old' })
   expect(one('on', 'mesh-r2')).toMatchObject({ rule: 'wake:record-only', target: 'ledger', decided_by: 'new' })
   expect(one('off', 'mesh-r2')).toMatchObject({ rule: 'mesh-no-reply', target: 'ledger', decided_by: 'old' })
 }, 60000)
