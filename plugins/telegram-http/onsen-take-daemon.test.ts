@@ -343,6 +343,8 @@ test('C5 active connector schedules its own keepwarm with the legacy local switc
   await waitFor(() => [...d.f.rows.values()].some(r => r.kind === 'keepwarm'))
   const [row] = d.f.rows.values()
   expect(row).toMatchObject({ kind: 'keepwarm', from: 'adam', session_id: 'main', not_before: ts(1000 + 50 * 60_000), deadline: null })
+  // The server can expose the row before the connector acknowledges the POST. A crash in that gap legitimately replays the same key.
+  await waitFor(async () => (await (await fetch(d.base + '/healthz')).json()).onsen.pending_bytes === 0)
   await d.restart()
   await waitFor(() => d.f.calls.filter(c => c.query.get('kind') === 'keepwarm').length >= 2)
   expect(d.f.calls.filter(c => c.body.kind === 'keepwarm')).toHaveLength(1)
