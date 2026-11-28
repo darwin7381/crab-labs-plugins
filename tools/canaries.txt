@@ -389,7 +389,7 @@ plugins/telegram-http/lanes.ts::function mainCannotAct(): boolean
 # WO-200 (1.59.2): a person's message reaches a walled main; a refused one is reported blocked; a delayed Call is checked against Onsen first
 plugins/telegram-http/lanes-main.ts::function wallDelivery(
 plugins/telegram-http/lanes-main.ts::return wall.person && r.kind === 'joey' && !refused
-plugins/telegram-http/lanes-main.ts::if (wake === 'wall-clear' || (wake === 'person' && wallDelivery().person)) wallWakePending = true
+plugins/telegram-http/lanes-main.ts::if (wake === 'resume-ready' || wake === 'wall-clear' || (wake === 'person' && wallDelivery().person)) pumpAgain = true
 # WO-204 part 2 (1.59.4)
 plugins/telegram-http/lanes-main.ts::ready.filter(r => (!heldCut(r) || releasedCut(r))
 # WO-205 (1.59.5)

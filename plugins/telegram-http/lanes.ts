@@ -260,7 +260,7 @@ let D: LanesDeps
 /** lanes-golive (C2): what a lane's send carries besides to / text (the three lines of send_to_agent) */
 import type { InboxItem, ItemRef } from './onsen-items.ts'
 import { resumablePromise, chatWaiter, memberWaiter, projectPromises, promiseTime } from './onsen-promises.ts'
-import { ownItem, type ItemWriter } from './onsen-item-writes.ts'
+import { ownItem, type ItemWriter, type ItemWrite } from './onsen-item-writes.ts'
 
 export type LaneSendFields = { line: Line; title?: string; ask?: string; because?: string; deadline?: string; touches?: string[]; ref?: string }
 let LANES_DIR = ''
@@ -352,7 +352,8 @@ let main: MainApi
 /** M1 + M2 (lanes-main.ts) in this daemon: how they reach the main, Joey and the wall */
 function mainEnv() {
   return {
-    journal, agent: D.agent, log: D.log, registry: D.registry, itemReceiver: () => itemReceiver,
+    journal, agent: D.agent, log: D.log, registry: D.registry, itemReceiver: () => itemReceiver, takingItems,
+    writeItem: write => itemWriter?.(write), writtenItemId: key => itemClient?.writtenItemId(key),
     // WO-205: the tg daemon holds no BTCC credential; its agent-inbox daemon sends the alert with its own
     registryAlert: (a: { state: 'open' | 'clear'; session?: string; pid?: number; why?: string }): void => {
       void inboxPost('/lanes/registry-alert', a).then(r => D.log(r?.ok ? 'info' : 'warn', `lanes: registry alert ${a.state}: ${r?.text ?? 'the agent-inbox daemon did not answer'}`))

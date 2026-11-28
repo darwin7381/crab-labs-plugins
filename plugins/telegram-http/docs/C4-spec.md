@@ -1,6 +1,6 @@
 # WO-213 C4 主線被打斷後的 resume Item
 
-基準為 `wo213-c4` 的 `ef79d7a`。契約取自 2026-11-28 的 `onsen-ui/CONTRACT.md` §4b，啟動時 MD5 為 `74677ba677142a0feef8551eb96a5713`（已定至 56）。以下行號相對於基準的 `plugins/telegram-http/`。
+原始規格與以下 `plugins/telegram-http/` 行號以 `ef79d7a` 為基準。C4 審查修正版以 `origin/wo213-c5` 的 `38a6d46` 為基準，透過 C5 的 `takingItems()`、`recordItemWrite` 與 `writtenItemId` 共用寫入與回條。契約取自 2026-11-28 的 `onsen-ui/CONTRACT.md` §4b，啟動時 MD5 為 `74677ba677142a0feef8551eb96a5713`（已定至 56）。
 
 ## 產生與交入
 
@@ -21,7 +21,7 @@
 
 `lanes-main.ts:857,914` 能分辨主線開了回合，以及哪一列實際交入。同一段對話自行續跑被打斷的工作時，會作廢尚未交入的 resume。子代理的 hook、session 註冊、背景通知、重複錯誤通知都不足以證明主線自己繼續。claim 已有 in_session_at，或 M1 有 bound、done 記錄的 resume 已交入。背景通知回合與 final Stop 後等待 registry 結算的幾秒，都讓原 claim 正常完成。prompt 帶的 delivery id 可追到同一個 Onsen item id。補領失敗時仍能辨認是哪一列開的回合。若第一個 hook 是工具或 Stop，則以該代已交出的列和持有的 claim 綁定。
 
-保留中斷與 Onsen 列的關聯，以及尚未送達的寫入意圖。等待中的列用 `DELETE /v1/items/<id>`，送 `expected_version` 與 `outcome:"superseded"`。版本衝突時重讀該列。已領的用 C1 的 claim 與 report spool 送同一 outcome。兩者都成為 `cancelled/superseded`。建立、領走與 hook 可以交錯，重連後仍要保留作廢的決定。已定 55 的失敗數由 Onsen 計算，逾期後才到的中途回報只記事件。
+M2 保存中斷與列的關聯。resume、self、keepwarm 的建立與 DELETE 共用一種 Item spool 記錄，舊的 C5 self 記錄照樣重播。回應遺失時以原鍵重送。永久拒絕的寫入移到 rejected，記一次 log，其他 resume 仍可交入。等待中的列用 `DELETE /v1/items/<id>`，送 `expected_version` 與 `outcome:"superseded"`。版本衝突時重讀該列。已領的用 C1 的 claim 與 report spool 送同一 outcome。兩者都成為 `cancelled/superseded`。建立、領走與 hook 可以交錯，重連後仍要保留作廢的決定。已定 55 的失敗數由 Onsen 計算，逾期後才到的中途回報只記事件。
 
 ## 清單與驗收
 

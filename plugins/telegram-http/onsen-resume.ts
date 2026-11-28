@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import type { Row } from './lanes-state.ts'
 import type { ItemReceiver } from './onsen-receive.ts'
 import { itemRef, type InboxItem } from './onsen-items.ts'
+import type { ItemWrite } from './onsen-item-writes.ts'
 import { hhmmTaipei } from './usage-wall.ts'
 
 export const ACCOUNT_WALL = new Set(['rate_limit', 'billing_error', 'account_on_hold', 'authentication_failed', 'oauth_org_not_allowed', 'cloud_credential_error'])
@@ -33,13 +34,11 @@ type Resume = {
 }
 export type ResumeLine = { key: string; session: string; text: string }
 
-/** M2 keeps the unsent write and then the identity of the row written for this interrupted turn. */
+/** M2 correlates a cut with its Item. The shared Item spool owns the HTTP writes and their retries. */
 export class ResumeItems {
-  private sending = new Set<string>()
-
   constructor(readonly current: () => Row | undefined, readonly save: (entries: Resume[]) => void,
     readonly receiver: () => ItemReceiver | undefined, readonly delivered: (id: string) => boolean, readonly inInput: (id: string) => boolean,
-    readonly retire: (id: string, reason: 'superseded' | 'withdrawn') => void, readonly ready: () => void) {}
+    readonly retire: (id: string, reason: 'superseded' | 'withdrawn') => void, readonly ready: () => void, readonly write: (write: ItemWrite) => void, readonly writtenId: (key: string) => string | undefined) {}
 
   private entries(): Resume[] { return this.current()?.resume_items ?? [] }
 
@@ -164,28 +163,29 @@ export class ResumeItems {
     const all = this.entries(), entries = all.filter(e => !e.id || !receiver.claims.completed(e.id))
     if (entries.length !== all.length) this.save(entries)
     for (const e of entries) {
-      if (e.create) receiver.mode.writeItem?.({ key: e.key, item: e.create })
+      if (e.create) this.write({ key: e.key, item: e.create })
       else if ((e.superseded || e.withdrawn) && e.id && !e.rejected && !e.awaitingRelease && !receiver.taking(e.id)
         && (e.withdrawn || !receiver.claims.blocked()))
-        receiver.mode.writeItem?.({ key: e.id, id: e.id, outcome: e.withdrawn ? 'withdrawn' : 'superseded' })
+        this.write({ key: e.id, item: { kind: 'resume', refs: [] }, id: e.id, outcome: e.withdrawn ? 'withdrawn' : 'superseded' })
     }
   }
 
   /** Called before the spool advances its cursor, including on replay after a restart. */
   settled(write: ItemWrite, row?: InboxItem): void {
-    const entries = this.entries(), entry = entries.find(e => 'item' in write ? e.key === write.key : e.id === write.id)
+    if (write.item.kind !== 'resume') return
+    const entries = this.entries(), entry = entries.find(e => write.outcome ? e.id === write.id : e.key === write.key)
     if (!entry) return
-    if ('item' in write) {
+    if (!write.outcome) {
       if (write.item.kind !== 'resume' || !entry.create) return
       const other = entries.filter(e => e !== entry && (!row || e.id !== row.id))
       const seen = row && entries.find(e => e.id === row.id)
       const delivered = row && (row.in_session_at || this.delivered(row.id))
       const superseded = seen?.superseded || (delivered ? undefined : entry.superseded)
       const withdrawn = seen?.withdrawn || (delivered ? undefined : entry.withdrawn)
-      this.save(row ? [...other, { ...seen, ...entry, create: undefined, id: row.id, text: entry.create.body.text, superseded, withdrawn }] : other)
+      this.save(row ? [...other, { ...seen, ...entry, create: undefined, id: this.writtenId(write.key) ?? row.id, text: entry.create.body.text, superseded, withdrawn }] : other)
       if (row && (withdrawn || superseded)) this.retire(row.id, withdrawn ? 'withdrawn' : 'superseded')
     } else {
-      if (write.outcome !== this.cancelling(write.id)) return
+      if (write.outcome !== this.cancelling(write.id!)) return
       const receiver = this.receiver()
       if (row?.state === 'claimed' && row.claim && !row.in_session_at && !receiver?.claims.inSession(row.id)) {
         if (!receiver || row.claim.connector !== receiver.mode.connector || write.outcome === 'withdrawn') {
@@ -200,28 +200,6 @@ export class ResumeItems {
       // A refused DELETE must never let a later peek deliver this cancelled local offer.
       this.save(row ? entries.filter(e => e !== entry) : entries.map(e => e === entry ? { ...e, rejected: true } : e))
     }
-    if (!mode.active || !e.id) return
-    const id = e.id, path = '/v1/items/' + encodeURIComponent(id)
-    this.retire(id)
-    if (receiver.taking(id) || receiver.claims.blocked()) return
-    const detail = await mode.req('GET', path)
-    if (!mode.active) return
-    const row: InboxItem | undefined = detail?.json?.data
-    if (detail?.status !== 404) {
-      if (detail?.status !== 200 || row?.kind !== 'resume' || row.id !== id) throw Error('reading resume ' + id + ': HTTP ' + detail?.status)
-      if (row.state === 'claimed') {
-        if (row.claim?.connector === mode.connector && !receiver.taking(id) && !receiver.claims.blocked()) {
-          receiver.claims.taken(row, itemRef(row))
-          receiver.claims.report(id, 'superseded')
-        }
-        return
-      }
-      if (row.state === 'waiting') {
-        const ended = await mode.req('DELETE', path, { expected_version: row.version, outcome: 'superseded' })
-        if (ended?.status === 409) return // Another writer won. The next pump reads the new version or claim.
-        if (ended?.status !== 200 && ended?.status !== 404) throw Error('ending resume ' + id + ': HTTP ' + ended?.status)
-      }
-    }
-    this.save(this.entries().filter(entry => entry.key !== e.key))
+    this.ready()
   }
 }

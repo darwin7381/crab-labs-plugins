@@ -42,6 +42,9 @@ import type { ItemReceiver, Outcome, ReportFields } from './onsen-receive.ts'
 import { ACCOUNT_WALL, ResumeItems, resumeNotification, resumeText, type CutTurn, type ResumeLine } from './onsen-resume.ts'
 
 export type MainEnv = {
+  takingItems?: () => boolean
+  writeItem?: import('./onsen-item-writes.ts').ItemWriter
+  writtenItemId?: (key: string) => string | undefined
   itemReceiver?: () => ItemReceiver | undefined
   journal: Journal
   agent: string
@@ -202,19 +205,23 @@ export function createMain(E: MainEnv) {
   // A final Stop can arrive during an awaited stream write. Its cleared guard must stay cleared.
   let finalStops = 0
   let localResumeInFlight: CutTurn | undefined
-  let wallWakePending = false
+  let pumpAgain = false
   let seq = 0
   let restoredThrough = 0
 
   const J = (): Journal => E.journal
+  // An Item receipt changes the journal version, but does not change the main's ability to accept an offer.
+  const resumeWrites = new WeakMap<Row, number>()
+  const deliveryVersion = (g: Row): number => g.version - (resumeWrites.get(g) ?? 0)
+  const takingItems = E.takingItems ?? (() => E.itemReceiver?.()?.mode.active === true)
   const resumes = new ResumeItems(latestMain, entries => {
     const g = latestMain()
     const row = J().write('main', g?.id ?? UNREGISTERED, g?.state ?? 'gone', { resume_items: entries.length ? entries : null })
     if (row) resumeWrites.set(row, (resumeWrites.get(row) ?? 0) + 1)
-  }, () => E.itemReceiver?.(), resumeDelivered, id => items(r => (r.state === 'offered' || r.state === 'queued' && (r.resume_input_gen || inFlight.has(r.id)))
+  }, () => takingItems() ? E.itemReceiver?.() : undefined, resumeDelivered, id => items(r => (r.state === 'offered' || r.state === 'queued' && (r.resume_input_gen || inFlight.has(r.id)))
     && r.onsen_items?.[0]?.onsen_item_id === id).length > 0, (id, reason) => {
     for (const r of items(r => r.state !== 'done' && r.onsen_items?.[0]?.onsen_item_id === id)) closeItem(r, { reason })
-  }, () => { void pump('resume-ready') })
+  }, () => { void pump('resume-ready') }, write => E.writeItem?.(write), key => E.writtenItemId?.(key))
   const aidItem = (r: Row): AidItem => { const m = metaOf(r.notif); return { mid: m.message_id || m.btcc_msg_id || r.id, kind: m.message_id ? 'tg' : m.btcc_msg_id ? 'mesh' : 'sys',
     user: String(m.user ?? ''), no_reply: m.no_reply === 'true', system: m.user === 'lanes' || r.kind === 'handoff' || r.kind === 'carry', body: contentOf(r).slice(0, BODY_MAX) } }
   /** boot: fold done by the caller (journal.load); pick the live gen */
@@ -466,13 +473,13 @@ export function createMain(E: MainEnv) {
   }
 
   /** the gen is idle and has nothing offered: offer it the oldest owed item, with the information riding on it */
-  async function pump(wake?: 'person' | 'wall-clear'): Promise<void> {
+  async function pump(wake?: 'person' | 'wall-clear' | 'resume-ready'): Promise<void> {
     if (!E) return
     syncResumes()
     if (offering) {
-      // Only a person's wall probe or the keeper's clear needs an immediate pass after this one.
+      // A cleared wall or an acknowledged resume can make a queued item eligible during this offer.
       // Stream registration and ordinary enqueues keep the existing one-offer ordering.
-      if (wake === 'wall-clear' || (wake === 'person' && wallDelivery().person)) wallWakePending = true
+      if (wake === 'resume-ready' || wake === 'wall-clear' || (wake === 'person' && wallDelivery().person)) pumpAgain = true
       return
     }
     offering = true
@@ -480,11 +487,11 @@ export function createMain(E: MainEnv) {
       do {
         pumpAgain = false
         const receiver = E.itemReceiver?.()
-        if (receiver?.mode.active && !receiver.claims.blocked()) {
+        if (receiver && takingItems() && !receiver.claims.blocked()) {
           for (const r of items(r => r.resume_claim && !r.resume_claim.waiting)) await restoreResumeClaim(receiver, r)
         }
         await offerNext()
-      } while (wallWakePending)
+      } while (pumpAgain)
     } finally { offering = false }
   }
   /** A late did is proof of delivery even while the previous claim's release is ahead of us in the spool. */
@@ -542,10 +549,10 @@ export function createMain(E: MainEnv) {
     const probe = wall.probe
     const mayOffer = () => (g.state === 'idle' || g.state === 'walled') && (probe || (wall.active ? wall.person : canTake(g)))
     if (!mayOffer()) return
-    const version = g.version
+    const version = deliveryVersion(g)
     const stillReady = () => {
       const fresh = wallDelivery(g)
-      return currentGen() === g && g.version === version && fresh.active === wall.active && fresh.person === wall.person
+      return currentGen() === g && deliveryVersion(g) === version && fresh.active === wall.active && fresh.person === wall.person
         && fresh.probe === probe && mayOffer()
     }
     const eligible = (r: Row) => {
@@ -556,7 +563,7 @@ export function createMain(E: MainEnv) {
     // 002w (E, gap 4): the oldest owed item whose own stream (its `via`) can take it. An item whose stream is down waits without holding the rest:
     // 2a936a7 tried only the oldest, so a mesh item behind a closed inbox stream held every later one, Joey's Telegram messages included.
     const cut: CutTurn | undefined = g.cut_turn
-    const localResume = () => { const mode = E.itemReceiver?.()?.mode; return !mode?.active && !mode?.checking }
+    const localResume = () => !takingItems() && !E.itemReceiver?.()?.mode.checking
     const resume = cut && localResume() && g.resume_sent !== cut.at && (probe || !wall.active) && Date.now() >= (cut.retry_at ?? 0)
     // A person's successful turn can end M2's episode while an earlier cut still waits in M1.
     // The keeper timestamps clears to whole seconds, as in statusChanged.
@@ -632,7 +639,7 @@ export function createMain(E: MainEnv) {
         continue
       }
       // Consume the keeper's clear only after a write. A failed lookup or a disconnected stream still owes this offer.
-      if (probe && now.state === 'walled' && now.version === version) {
+      if (probe && now.state === 'walled' && deliveryVersion(now) === version) {
         setMain(now, 'walled', clearFields)
       }
       // 002w: the offer is awaited, and the main can take it in meanwhile: its UserPromptSubmit names the item (did) and binds it. Only an item still
@@ -657,7 +664,7 @@ export function createMain(E: MainEnv) {
         // on the agent's latest gen. Only a still-open interval between final Stops needs the guard.
         const now = J().lastMain ?? g
         const fields = { resumes: (now.resumes ?? 0) + 1, ...(before === finalStops ? { cut_turn: cut, resume_sent: cut.at } : {}) }
-        J().write('main', now.id, now.state, { ...fields, ...(probe && now === g && now.version === version ? clearFields : {}) })
+        J().write('main', now.id, now.state, { ...fields, ...(probe && now === g && deliveryVersion(now) === version ? clearFields : {}) })
       }
       syncResumes()
     }
@@ -841,7 +848,7 @@ export function createMain(E: MainEnv) {
   /** WO-201: the line Joey gets about items closed after a second cut (or a parked item that failed again): what they were, and that they are not
    *  given to the main again. It is the line about each (it meets their Joey line, as the asked-restart notice) */
   function tellClosed(rs: Row[], what: (r: Row) => string): void {
-    if (E.itemReceiver?.()?.mode.active) return
+    if (takingItems()) return
     const told = rs.filter(r => r.kind !== 'digest')
     if (!told.length) return
     const lines = Array.from(Map.groupBy(told, what), ([sentence, group]) =>
@@ -900,7 +907,7 @@ export function createMain(E: MainEnv) {
   function bareCut(g: Row, rs: Row[], why: string, at = Date.now()): CutTurn | undefined {
     if (g.resume_sent != null || itemCount(rs)) return
     // A replayed StopFailure can arrive after endClaim closed the prompt's M1 rows.
-    if (g.prompt_id && E.itemReceiver?.()?.mode.active && items(r => r.prompt_id === g.prompt_id && r.onsen_items).length) return
+    if (g.prompt_id && takingItems() && items(r => r.prompt_id === g.prompt_id && r.onsen_items).length) return
     if (why === 'gen_end') {
       let n: number | null | undefined
       try { if (g.session_id) n = E.registry?.backgroundAgents(g.session_id) } catch {}
@@ -910,13 +917,13 @@ export function createMain(E: MainEnv) {
   }
   function setMain(g: Row, state: MainPhase, fields: Record<string, unknown> = {}): void {
     const cut = fields.cut_turn as CutTurn | undefined
-    if (cut && E.itemReceiver?.()?.mode.active) {
+    if (cut && takingItems()) {
       J().write('main', g.id, state, { ...fields, ...resumes.cutFields(g, cut) })
       resumes.sync()
     } else J().write('main', g.id, state, fields)
   }
   function syncResumes(): void {
-    if (!E.itemReceiver?.()?.mode.active) return
+    if (!takingItems()) return
     const g = latestMain()
     // A pull-era cut can survive an upgrade or the startup probe. Transfer only an unsent one.
     if (g?.cut_turn && g.resume_sent !== g.cut_turn.at && localResumeInFlight?.at !== g.cut_turn.at) setMain(g, g.state as MainPhase, { cut_turn: g.cut_turn })
@@ -969,8 +976,8 @@ export function createMain(E: MainEnv) {
     if (g.stopped_prompt === prompt && g.prompt_id !== prompt) continueTurn(g, prompt)
     const open = g.prompt_id === prompt
     const receiver = E.itemReceiver?.()
-    const backgroundNotice = receiver?.mode.active && source === 'task-notification'
-    if (open && (!ids?.size || !receiver?.mode.active)) return
+    const backgroundNotice = takingItems() && source === 'task-notification'
+    if (open && (!ids?.size || !takingItems())) return
     if (open && ids) {
       // A tool hook can bind the offer before the prompt receipt identifies which text arrived.
       for (const r of items(r => r.state === 'bound' && r.gen === g.id && r.prompt_id === prompt && r.carried_resume
@@ -986,7 +993,7 @@ export function createMain(E: MainEnv) {
       return (offered || queued) && (!r.onsen_items || r.onsen_items.every((ref: ItemRef) => receiver?.claims.owns(ref.onsen_item_id))
         || resume && named && resumes.awaitingInput(r.onsen_items[0].onsen_item_id))
     }
-    if (!open && !backgroundNotice && source !== 'StopFailure' && receiver?.mode.active) {
+    if (!open && !backgroundNotice && source !== 'StopFailure' && takingItems()) {
       syncResumes()
       // A named delivery identifies this turn even when re-taking it failed. Without a prompt hook,
       // an offered Item with its current claim identifies the delivery that reached this generation.
@@ -1047,7 +1054,7 @@ export function createMain(E: MainEnv) {
     switch (ev) {
       case 'UserPromptSubmit': {
         if (p) {
-          const ids = promptRefs((E.itemReceiver?.()?.mode.active ? b.channel_dids ?? b.dids : b.dids) ?? [])
+          const ids = promptRefs((takingItems() ? b.channel_dids ?? b.dids : b.dids) ?? [])
           const late = ids.size ? items(r => r.state === 'queued' && r.onsen_items && identifies(ids, r)) : []
           // Record a queued resume's positive receipt before a re-take can find the Item under another claim.
           const toClaim = late.filter(r => !isResume(r) || !resumes.awaitingInput(r.onsen_items[0].onsen_item_id))
@@ -1297,7 +1304,7 @@ export function createMain(E: MainEnv) {
   let idleSeen: { gen: string; at: number; ev: number } | null = null
   function statusIdle(isIdle: boolean, now = Date.now(), interruptedAt: number | null = null): boolean {
     const g = currentGen()
-    const released = isIdle && g?.state === 'idle' && g.stopped_prompt && E.itemReceiver?.()?.mode.active ? resumes.inputIds(g.session_id, true) : []
+    const released = isIdle && g?.state === 'idle' && g.stopped_prompt && takingItems() ? resumes.inputIds(g.session_id, true) : []
     if (!g || !isIdle || (g.state !== 'in_turn' && !released.length)) { idleSeen = null; return false }
     const ev = lastEventAt.get(g.id) ?? 0
     const seen = !released.length && interruptedAt != null && interruptedAt > ev

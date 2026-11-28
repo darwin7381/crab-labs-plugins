@@ -41,11 +41,13 @@ async function mainRig(backoff = 300_000, onOffer = async () => true) {
   const journal = new Journal(join(r.dir, 'state.jsonl')), offers: any[] = [], notices: string[] = []
   const sid = crypto.randomUUID(), pid = 1051
   let member = 'idle', bg = 0, owes = false, wall: MainWall | null = null
-  const m = createMain({ journal, agent: 'adam', itemReceiver: () => r.receiver, log: () => {}, offer: async n => { offers.push(n); return onOffer() },
+  const writer = { write: (write: import('./onsen-item-writes.ts').ItemWrite) => { r.client.recordItemWrite(write); r.client.start() } }
+  const m = createMain({ journal, agent: 'adam', takingItems: () => r.mode.active, writeItem: write => writer.write(write), writtenItemId: key => r.client.writtenItemId(key), itemReceiver: () => r.receiver, log: () => {}, offer: async n => { offers.push(n); return onOffer() },
     wallBackoff: () => backoff, registry: { mainForAdoption: () => null, backgroundAgents: () => bg },
     streamOpen: () => true, memberState: () => member, expectedSession: () => [sid], pidAlive: () => true, context: () => '', info: () => null,
     genChanged: () => {}, refused: () => {}, done: () => {}, undone: () => {}, tellJoey: (_s, rule) => notices.push(rule), genuineAfter: () => 1,
     mainOwed: ids => owes ? ids.map(id => ({ id, from: 'joey', text: id, owes: ['reply'] })) : [], usageWall: () => wall })
+  r.client.watchItemWrites(m.itemWriteSettled)
   m.initMain(); r.attach(m)
   const hook = (event: string, data: Partial<MainEvent> = {}) => m.mainEvent({ event, pid, session_id: sid, prompt_id: 'turn', ...data })
   await hook('SessionStart', { source: 'startup' })
@@ -59,7 +61,7 @@ async function mainRig(backoff = 300_000, onOffer = async () => true) {
     expect(r.outcomes(row.id)).toContain('in_session')
     return did
   }
-  return { ...r, m, journal, offers, notices, hook, enqueue, bind, sid, setWall(value: MainWall | null) { wall = value }, status(s: string, n = 0) { member = s; bg = n; r.claims.statusRecord(s, () => bg, REGISTRY_SETTLE_MS) },
+  return { ...r, writer, m, journal, offers, notices, hook, enqueue, bind, sid, setWall(value: MainWall | null) { wall = value }, status(s: string, n = 0) { member = s; bg = n; r.claims.statusRecord(s, () => bg, REGISTRY_SETTLE_MS) },
     owing(value: boolean) { owes = value } }
 }
 
@@ -162,7 +164,7 @@ test('C4 switch to take imports an unsent pull cut, and waits for a pull stream 
 
 test.each(['queued create', 'waiting row'])('C4 a refused new prompt shares the session’s %s', async stage => {
   const r = await mainRig()
-  r.mode.writeItem = write => r.client.recordItemWrite(write)
+  r.writer.write = write => r.client.recordItemWrite(write)
   r.setWall({ walled: true, clearedMs: null })
   await r.hook('UserPromptSubmit')
   await r.hook('StopFailure', { error: 'rate_limit' })
@@ -236,7 +238,7 @@ test('C4 an in-session claim protects a resume before the M1 bound write', async
 
 test('C4 a delayed create acknowledgement respects an existing M1 delivery of that Item', async () => {
   const r = await mainRig()
-  r.mode.writeItem = write => r.client.recordItemWrite(write)
+  r.writer.write = write => r.client.recordItemWrite(write)
   r.setWall({ walled: true, clearedMs: null })
   const request = r.client.request.bind(r.client)
   let release!: () => void
@@ -387,7 +389,7 @@ test.each(['PreToolUse', 'Stop'])('C4 the first %s binds the offered resume clai
 test('C4 a late did whose re-take is blocked preserves the unrelated waiting resume', async () => {
   const r = await accountCut()
   r.client.stop()
-  r.mode.writeItem = write => r.client.recordItemWrite(write)
+  r.writer.write = write => r.client.recordItemWrite(write)
   const prior = r.f.add('prior-claim')
   await r.receiver.receive([itemRef(prior)])
   r.claims.report(prior.id, 'cut')
@@ -500,7 +502,7 @@ test.each(['late receipt', 'session end', 'confirmed idle'])('settled 59: a long
 test.each(['waiting', 'claimed before the receipt', 'claimed after the receipt'])('settled 59: after a blocked claim spool the late receipt completes an Item that is %s', async state => {
   const r = await accountCut()
   r.client.stop()
-  r.mode.writeItem = write => r.client.recordItemWrite(write)
+  r.writer.write = write => r.client.recordItemWrite(write)
   r.setWall({ walled: false, clearedMs: Date.now() + 1000 }); await r.m.pump()
   const did = r.offers[0].params.meta.did
   await r.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] })
@@ -639,7 +641,7 @@ test('settled 59: a new session receives its row without the previous session’
 
 test('settled 59: a carrier can finish before the create is acknowledged', async () => {
   const r = await mainRig()
-  r.mode.writeItem = write => r.client.recordItemWrite(write)
+  r.writer.write = write => r.client.recordItemWrite(write)
   await r.hook('UserPromptSubmit')
   await r.hook('StopFailure', { error: 'overloaded' })
   const line = r.m.currentGen()!.resume_items[0].create.body.text
@@ -653,11 +655,134 @@ test('settled 59: a carrier can finish before the create is acknowledged', async
   expect([...r.f.rows.values()].find(row => row.kind === 'resume')).toMatchObject({ state: 'cancelled', reason: 'withdrawn' })
 })
 
+test('C4 a resume create acknowledged during an unrelated take preserves the delivery claim', async () => {
+  const r = await mainRig()
+  const write = r.client.request.bind(r.client), request = r.mode.req
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  spyOn(r.client, 'request').mockImplementation(async (...args) => {
+    const reply = await write(...args)
+    if (args[0] === 'POST' && args[1] === r.mode.path) await gate
+    return reply
+  })
+  spyOn(r.mode, 'req').mockImplementation(async (...args) => {
+    const reply = await request(...args)
+    if (args[1].endsWith('/take')) {
+      release()
+      await until(() => r.m.currentGen()?.resume_items?.some((e: any) => !!e.id))
+    }
+    return reply
+  })
+  await r.hook('UserPromptSubmit')
+  await r.hook('StopFailure', { error: 'overloaded' })
+  await until(() => r.f.rows.size === 1)
+  const row = r.f.add('unrelated-message'), did = r.enqueue(row)
+  await until(() => r.offers.length > 0 || r.client.hasItemReports() || r.outcomes(row.id).includes('not_taken'))
+  await r.sync()
+  expect(r.outcomes(row.id)).not.toContain('not_taken')
+  expect(r.journal.get('msg', did)?.state).toBe('offered')
+  expect(r.offers).toHaveLength(1)
+})
+
+test.each([400, 403, 409])('C4 a permanent HTTP %i rejects one spooled create and leaves other resumes deliverable', async status => {
+  const r = await mainRig()
+  const request = r.client.request.bind(r.client)
+  let calls = 0, release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  spyOn(r.client, 'request').mockImplementation(async (...args) => {
+    if (args[0] !== 'POST' || args[1] !== r.mode.path) return request(...args)
+    calls++
+    await gate
+    return { status, json: { error: { code: 'invalid_request' } } }
+  })
+  await r.hook('UserPromptSubmit')
+  await r.hook('StopFailure', { error: 'overloaded' })
+  await until(() => calls === 1)
+  const other = r.f.add('previous-resume', 'resume', { from: 'adam', payload: { text: '之前的工作' } })
+  r.m.routeResume(itemRef(other), other.payload.text)
+  await until(() => r.offers.length === 1)
+  release()
+  await until(() => r.client.skipped.count === 1)
+  for (let i = 0; i < 10; i++) { await r.m.pump(); await r.sync() }
+  expect(calls).toBe(1)
+  expect(r.logs.filter(l => l.includes('moved to rejected.jsonl'))).toHaveLength(1)
+  expect(r.m.currentGen()?.resume_items?.some((e: any) => e.create)).toBe(false)
+  expect(r.client.pendingBytes()).toBe(0)
+  expect(JSON.parse(readFileSync(r.client.rejected, 'utf8').trim()).line.k).toBe('item')
+})
+
+test('C4 a permanently refused DELETE retires its local offer and advances the spool once', async () => {
+  const r = await accountCut()
+  r.client.stop()
+  r.writer.write = write => r.client.recordItemWrite(write)
+  const request = r.client.request.bind(r.client)
+  let deletes = 0
+  spyOn(r.client, 'request').mockImplementation(async (...args) => {
+    if (args[0] !== 'DELETE') return request(...args)
+    deletes++
+    return { status: 409, json: { error: { code: 'version_conflict' } } }
+  })
+  await r.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] })
+  for (let i = 0; i < 10; i++) { await r.m.pump(); await r.sync() }
+  r.m.routeResume(itemRef(r.row), r.row.payload.text)
+  expect([deletes, r.client.skipped.count, r.client.pendingBytes(), r.offers.length]).toEqual([1, 1, 0, 0])
+  expect(r.logs.filter(l => l.includes('moved to rejected.jsonl'))).toHaveLength(1)
+})
+
+test.each(['accepted', 'rejected'])('C4 an identical sentence keeps its own Item id while another create is %s', async outcome => {
+  const r = await mainRig()
+  r.writer.write = write => r.client.recordItemWrite(write)
+  r.setWall({ walled: true, clearedMs: null })
+  await r.hook('UserPromptSubmit')
+  await r.hook('StopFailure', { error: 'rate_limit' })
+  const text = r.m.currentGen()!.resume_items[0].create.body.text
+  const other = r.f.add('same-sentence', 'resume', { from: 'adam', payload: { text } })
+  r.m.routeResume(itemRef(other), text)
+  if (outcome === 'rejected') {
+    const request = r.client.request.bind(r.client)
+    spyOn(r.client, 'request').mockImplementation((...args) => args[0] === 'POST' && args[1] === r.mode.path
+      ? Promise.resolve({ status: 400, json: { error: 'invalid_request' } }) : request(...args))
+  }
+  await r.sync()
+  await r.hook('UserPromptSubmit', { prompt_id: 'independent', dids: [] })
+  await r.sync()
+  const count = outcome === 'accepted' ? 2 : 1
+  expect([...r.f.rows.values()].map(row => row.reason)).toEqual(Array(count).fill('superseded'))
+  expect(r.f.calls.filter(c => c.body.outcome === 'superseded')).toHaveLength(count)
+  expect(r.offers).toHaveLength(0)
+})
+
+test('C4 a waiting peek before the create acknowledgement shares the same supersede write', async () => {
+  const r = await mainRig()
+  r.setWall({ walled: true, clearedMs: null })
+  const request = r.client.request.bind(r.client)
+  let release!: () => void
+  const ack = new Promise<void>(resolve => { release = resolve })
+  const requests = spyOn(r.client, 'request').mockImplementation(async (...args) => {
+    const reply = await request(...args)
+    if (args[0] === 'POST' && args[1] === r.mode.path) await ack
+    return reply
+  })
+  await r.hook('UserPromptSubmit')
+  await r.hook('StopFailure', { error: 'rate_limit' })
+  await until(() => r.f.rows.size === 1)
+  const row = [...r.f.rows.values()][0]!
+  r.m.routeResume(itemRef(row), row.payload.text)
+  await r.hook('UserPromptSubmit', { prompt_id: 'independent', dids: [] })
+  release()
+  await until(() => row.state === 'cancelled')
+  await r.sync()
+  expect(requests.mock.calls.filter(([method, path]) => method === 'GET' && path === '/v1/items/' + row.id)).toHaveLength(1)
+  expect(r.f.calls.filter(c => c.body.outcome === 'superseded')).toHaveLength(1)
+  expect(r.offers).toHaveLength(0)
+})
+
 test('C4 a lost POST response and a lost DELETE race keep the decision across retries', async () => {
   const r = await mainRig()
-  const request = r.mode.req
+  r.writer.write = write => r.client.recordItemWrite(write)
+  const request = r.client.request.bind(r.client)
   let losePost = true, conflict = true
-  spyOn(r.mode, 'req').mockImplementation(async (...args) => {
+  spyOn(r.client, 'request').mockImplementation(async (...args) => {
     const [method, path] = args
     if (method === 'DELETE' && conflict) {
       conflict = false
@@ -669,12 +794,14 @@ test('C4 a lost POST response and a lost DELETE race keep the decision across re
   })
   await r.hook('UserPromptSubmit')
   await r.hook('StopFailure', { error: 'rate_limit' })
-  await until(() => r.logs.some(l => l.includes('POST response lost')))
+  await r.sync()
+  expect(r.logs.some(l => l.includes('POST response lost'))).toBe(true)
   await r.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] })
-  await until(() => !conflict && r.f.calls.some(c => c.body.expected_version === 1))
+  await r.sync() // replay the create, then encounter a newer version on the queued DELETE
   const row = [...r.f.rows.values()][0]!
   expect(row.state).toBe('waiting')
-  await until(() => { void r.m.pump(); return row.state === 'cancelled' })
+  await r.sync()
+  expect(row.state).toBe('cancelled')
   const posts = r.f.calls.filter(c => c.body.kind === 'resume')
   expect(posts).toHaveLength(2)
   expect(posts[0]!.key).toBe(posts[1]!.key)
