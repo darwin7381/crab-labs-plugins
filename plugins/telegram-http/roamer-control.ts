@@ -23,7 +23,7 @@ import { join, dirname } from 'node:path'
 import { homedir } from 'node:os'
 import { spawn } from 'node:child_process'
 import {
-  forwardSharedTuiSlash,
+  forwardSharedTuiSlash, type ClearHooks,
   tmuxHash6,
   sharedTuiCommands,
   listClaudeSessions,
@@ -959,6 +959,7 @@ export async function connectToSession(
 export async function handleRoamerSlash(
   text: string,
   replyToTg: (msg: string, opts?: ReplyOptions) => Promise<void>,
+  hooks?: ClearHooks,
 ): Promise<boolean> {
   if (!isRoamerEnabled()) return false
   const trimmed = text.trim()
@@ -1029,7 +1030,7 @@ export async function handleRoamerSlash(
 
   // Otherwise: shared TUI slashes (/clear /agents /mcp /resume /model /effort
   // /sigint /help /init /compact) → forwarded to current target tmux.
-  return handleTuiSlashForward(text, replyToTg)
+  return handleTuiSlashForward(text, replyToTg, hooks)
 }
 
 /**
@@ -1309,6 +1310,7 @@ export async function handleModelCallbackForCurrentTarget(
   replyToTg: (msg: string, opts?: ReplyOptions) => Promise<void>,
   cmd: '/model' | '/effort' = '/model',
   notApplied?: () => void,
+  hooks?: ClearHooks,
 ): Promise<boolean> {
   // /effort gets a strict 5-level whitelist; /model keeps the id-shape check.
   const ok = cmd === '/effort'
@@ -1331,12 +1333,13 @@ export async function handleModelCallbackForCurrentTarget(
     await replyToTg(`⚠️ target 已切換，這個選單是舊 target 的 — 重打 ${cmd} 開新選單`)
     return true
   }
-  return forwardSharedTuiSlash(`${cmd} ${value}`, target.tmux, replyToTg)
+  return forwardSharedTuiSlash(`${cmd} ${value}`, target.tmux, replyToTg, undefined, hooks)
 }
 
 async function handleTuiSlashForward(
   text: string,
   replyToTg: (msg: string, opts?: ReplyOptions) => Promise<void>,
+  hooks?: ClearHooks,
 ): Promise<boolean> {
   const trimmed = text.trim()
   if (!trimmed.startsWith('/')) return false
@@ -1360,7 +1363,7 @@ async function handleTuiSlashForward(
   // bare-/model picker reads THIS target's session jsonl for its "current
   // model" line instead of the unset channel-bot PROJECTS_DIR (issue #8).
   const projectsDirOverride = join(PROJECTS_ROOT, cwdSlug(state.current_target.cwd))
-  const handled = await forwardSharedTuiSlash(text, tmuxName, replyToTg, projectsDirOverride)
+  const handled = await forwardSharedTuiSlash(text, tmuxName, replyToTg, projectsDirOverride, hooks)
   if (handled) return true
 
   // Not a known shared TUI command. Show available list.

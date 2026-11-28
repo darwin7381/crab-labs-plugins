@@ -1932,3 +1932,45 @@ test('the mail lane takes its two coalesced events together and completes both',
   expect(takes.map(c => c.body.item_ids)).toEqual([['alpha','beta']])
   for (const r of rows) expect(d.f.history.filter(h => h.item_id === r.id).map(h => h.body.outcome)).toEqual(['in_session','completed'])
 }, 15000)
+
+for (const end of ['verified', 'failed', 'restart', 'direct command']) test('a busy model switch reports deferred until ' + end, async () => {
+  const actions = startOnsenStandin({ 'test-member': 'adam' })
+  clean.push(() => actions.stop())
+  const d = await daemon({ ONSEN_OWNER: 'joey', CHANNEL_BOT_TMUX_SESSION: 'lab' }, 200, root => {
+    const bin = join(root, 'bin')
+    mkdirSync(bin)
+    mkdirSync(join(root, 'home/.claude'), { recursive: true })
+    writeFileSync(join(bin, 'tmux'), `#!/bin/sh
+case "$1" in
+  capture-pane)
+    if test -f "$AGENT_WORKSPACE_DIR/allow-switch"; then echo '❯ '; else echo 'esc to interrupt'; fi;;
+  send-keys)
+    case "$4" in
+      "/model "*)
+        test -f "$AGENT_WORKSPACE_DIR/fail-switch" && exit 1
+        printf '{"model":"%s"}' "$(echo "$4" | cut -d" " -f2)" > "$HOME/.claude/settings.json";;
+    esac;;
+esac
+exit 0
+`, { mode: 0o700 })
+    return { PATH: bin + ':' + process.env.PATH }
+  }, actions.port)
+  const control = end === 'direct command' ? command(d, 'direct', '/model opus', '101') : await (async () => {
+    const cmd = command(d, 'model-menu', '/model', '100')
+    await waitFor(() => cmd.state === 'completed' && actions.actions.size === 1)
+    const action = [...actions.actions.values()][0]!, payload = actions.press(action.id, '1')
+    return d.f.add('pressed', 'control', { action_id: action.id, payload })
+  })()
+  const history = () => d.f.history.filter(h => h.item_id === control.id).map(h => h.body.outcome)
+  await waitFor(() => history().includes('deferred'))
+  expect(control.state).toBe('claimed')
+  expect(history()).toEqual(['deferred'])
+  expect(actions.acalls.filter(c => c.path.endsWith('/applied'))).toHaveLength(0)
+  if (end === 'restart') await d.restart()
+  else {
+    if (end === 'failed') writeFileSync(join(d.root, 'fail-switch'), '')
+    writeFileSync(join(d.root, 'allow-switch'), '')
+  }
+  await waitFor(() => control.state !== 'claimed', 8000)
+  expect(history()).toEqual(['deferred', end === 'failed' || end === 'restart' ? 'not_applied' : 'completed'])
+}, 15000)

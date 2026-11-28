@@ -678,7 +678,7 @@ async function runTuiSwitchCommand(opts: {
   tmuxName: string
   notify: (msg: string) => Promise<void>
   projectsDir?: string
-}): Promise<void> {
+}): Promise<boolean> {
   const { cmd, value, tmuxName, notify, projectsDir } = opts
   const t0 = Date.now()
   const full = `${cmd} ${value}`
@@ -688,6 +688,7 @@ async function runTuiSwitchCommand(opts: {
   // 1.27.8: effort fields of the global settings.json as they were before we
   // typed /effort (session scope). Set in phase 2; every exit path after that
   // puts them back if the TUI changed them.
+  let applied = false
   let effortSnap: EffortSnapshot | null = null
   try {
     // Phase 1 — wait for idle. Typing mid-turn queues the command as a chat
@@ -711,7 +712,7 @@ async function runTuiSwitchCommand(opts: {
         `❌ \`${full}\` 未執行 — claude 忙碌超過 ${Math.round(SWITCH_IDLE_WAIT_MS / 60000)} 分鐘，` +
         `為避免指令被排進訊息佇列造成卡死，已放棄。等 turn 結束後再試一次。`,
       )
-      return
+      return false
     }
 
     // Phase 2 — snapshot + type (Ctrl-U clears any draft first).
@@ -816,6 +817,7 @@ async function runTuiSwitchCommand(opts: {
     }
 
     if (confirmed) {
+      applied = true
       // #10 — session scope: undo the global-default side effect BEFORE
       // recording the confirmed switch, so detectCurrentModel's newest-
       // timestamp-wins logic prefers the confirmed switch over the (older,
@@ -868,6 +870,7 @@ async function runTuiSwitchCommand(opts: {
     // #7: release the per-tmux in-flight lock no matter how we exited.
     switchInFlight.delete(tmuxName)
   }
+  return applied
 }
 
 /**
@@ -1259,6 +1262,7 @@ async function forwardInputPassthrough(
  * absent: roamer, Onsen off): the plain reply. A failed /clear gets the failure line only. (WO-142's beforeClear, which drew the line first, is gone.)
  */
 export type ClearHooks = {
+  switchResult?: (verified: Promise<boolean>) => void
   command?: { from: string; message_id: string }
   afterClear?: (okText: string) => Promise<boolean>
 }
@@ -1412,6 +1416,7 @@ export async function forwardSharedTuiSlash(
       // two orchestrators race the same pane (double type, double Enter).
       const inFlight = switchInFlight.get(tmuxName)
       if (inFlight) {
+        hooks?.switchResult?.(Promise.resolve(false))
         await replyToTg(
           `⏳ 已有切換進行中（目標 \`${inFlight}\`）— 等它完成（成功/失敗都會通知）後再下 \`${cmd} ${args}\`。`,
         )
@@ -1432,8 +1437,10 @@ export async function forwardSharedTuiSlash(
           ? `🕐 claude 正在跑 turn — \`${cmd} ${args}\` 已排程，等 turn 結束後執行（最多等 ${Math.round(SWITCH_IDLE_WAIT_MS / 60000)} 分鐘），結果會再通知`
           : `📤 已送 \`${cmd} ${args}\` 到 ${tmuxName} — 生效與否稍後通知`,
       )
-      void runTuiSwitchCommand({ cmd, value: args, tmuxName, notify: msg => replyToTg(msg), projectsDir: projectsDirOverride })
+      const verified = runTuiSwitchCommand({ cmd, value: args, tmuxName, notify: msg => replyToTg(msg), projectsDir: projectsDirOverride })
+      hooks?.switchResult?.(verified)
     } catch (err) {
+      hooks?.switchResult?.(Promise.resolve(false))
       switchInFlight.delete(tmuxName)  // don't leave a stale lock if the pre-flight reply threw
       await replyToTg(`❌ ${cmd} 失敗: ${err instanceof Error ? err.message : err}`)
     }
@@ -2337,32 +2344,36 @@ export async function handleCallbackData(
   data: string,
   httpPort: string,
   replyToTg: (msg: string, opts?: ReplyOptions) => Promise<void>,
+  hooks?: ClearHooks,
 ): Promise<boolean> {
   // `model:<value>` — emitted by the bare-`/model` inline keyboard. Reuse the
   // `/model <value>` slash path (send-keys + auto-confirm) so logic isn't forked.
   if (data.startsWith('model:')) {
     const value = data.slice('model:'.length).trim()
     if (!value) {
+      hooks?.switchResult?.(Promise.resolve(false))
       await replyToTg('❌ empty model value in callback data')
       return true
     }
     // Model ids/aliases only — defense against forged callback payloads
     // (send-keys with shell-ish chars must never reach tmux).
     if (!/^[A-Za-z0-9._\[\]-]{1,48}$/.test(value)) {
+      hooks?.switchResult?.(Promise.resolve(false))
       await replyToTg(`❌ invalid model value in callback: \`${value.slice(0, 60)}\``)
       return true
     }
-    return handleControlSlash(`/model ${value}`, httpPort, replyToTg)
+    return handleControlSlash(`/model ${value}`, httpPort, replyToTg, hooks)
   }
   // `effort:<value>` — emitted by the bare-`/effort` inline keyboard. Strict
   // whitelist (5 known levels) — forged callback payloads never reach tmux.
   if (data.startsWith('effort:')) {
     const value = data.slice('effort:'.length).trim()
     if (!EFFORT_VALUE_RE.test(value)) {
+      hooks?.switchResult?.(Promise.resolve(false))
       await replyToTg(`❌ invalid effort value in callback: \`${value.slice(0, 30)}\``)
       return true
     }
-    return handleControlSlash(`/effort ${value}`, httpPort, replyToTg)
+    return handleControlSlash(`/effort ${value}`, httpPort, replyToTg, hooks)
   }
   if (!data.startsWith('resume:')) return false
   const uuidPrefix = data.slice('resume:'.length).trim()

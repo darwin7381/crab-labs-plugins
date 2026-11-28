@@ -5,12 +5,12 @@ import { genuineAssistantAfterFile } from './liveness.ts'
 import { claudeSessionId, roamerSessionId, type InboxItem, type ItemRef, type ReceivingState, type ReceivingTarget } from './onsen-items.ts'
 import type { ClaimStore, ItemReport, Outcome, ReportFields } from './onsen-receive.ts'
 
-const intermediate = new Set<Outcome>(['in_session', 'owed', 'background', 'stuck'])
+const intermediate = new Set<Outcome>(['in_session', 'owed', 'background', 'stuck', 'deferred'])
 const week = 7 * 86400_000
 type Claim = {
   claim_id: string; taken_at: string; session_id?: string; in_session_at?: string; last_outcome?: Outcome
   turn?: string; registry_session?: string; conversation?: string; message_id?: string; replies?: string[]
-  scheduled?: boolean; intakeAt?: string; target?: ReceivingTarget
+  pendingSwitch?: 'control' | 'command'; scheduled?: boolean; intakeAt?: string; target?: ReceivingTarget
   stop?: { turn: string; at: number }
 }
 // Away from a target the registry still supplies its status. Only its own transcript can supply a turn.
@@ -154,7 +154,7 @@ export class Claims implements ClaimStore {
     clearTimeout(this.timers.get(id))
     this.timers.delete(id)
     const row = this.rows[id]
-    if (!this.owns(id) || row.in_session_at) return
+    if (!this.owns(id) || row.in_session_at || row.pendingSwitch) return
     const expire = () => {
       if (!this.owns(id) || this.rows[id]?.in_session_at) return
       const outcome = this.unboundOutcome(id)
@@ -164,6 +164,22 @@ export class Claims implements ClaimStore {
     }
     const delay = Math.max(0, Date.parse(row.taken_at) + 20_000 - this.now())
     this.timers.set(id, setTimeout(expire, delay).unref())
+  }
+  waitForSwitch(id: string, control: boolean, verified: Promise<boolean>): void {
+    if (!this.owns(id)) return
+    const row = this.rows[id]!
+    row.pendingSwitch = control ? 'control' : 'command'
+    this.save()
+    this.clock(id)
+    if (control) this.report(id, 'deferred')
+    const finish = (applied: boolean) => {
+      if (this.rows[id]?.claim_id === row.claim_id) this.report(id, applied ? 'completed' : control ? 'not_applied' : 'error')
+    }
+    void verified.then(finish, () => finish(false))
+  }
+  recoverSwitches(): void {
+    for (const [id, row] of Object.entries(this.rows)) if (row.pendingSwitch && this.owns(id))
+      this.report(id, row.pendingSwitch === 'control' ? 'not_applied' : 'error')
   }
   start(): void { for (const id of this.held()) this.clock(id) }
   stop(): void { for (const timer of this.timers.values()) clearTimeout(timer); this.timers.clear() }

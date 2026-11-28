@@ -434,6 +434,7 @@ if (ONSEN_TAKE_ON) {
       // The spool advances its cursor after this callback. A waiting lane can take as soon as it drains.
       if (!ROAMER) queueMicrotask(() => { if (takeMode!.canReceive && !itemClaims!.blocked()) Lanes.sweepQueue() })
     })
+    itemClaims.recoverSwitches()
     itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at), () => itemPeek!.reset(), due => !!takeKeepwarm?.matchesWindow(due))
     itemPeek = new ItemPeek(takeMode, ROAMER ? () => new Map() : Lanes.itemIndex, routeInboxItem, () => !itemClaims!.blocked(),
       ROAMER ? undefined : Lanes.sweepQueue, ROAMER ? waiting => roamerItems?.fullList(waiting) : undefined)
@@ -624,8 +625,15 @@ async function keyboardAsk(chat: string, text: string, btns: InlineButton[], whe
   log('info', `connector: a command's choice in chat ${chat} asked in Onsen as an Action (${commandMenuKind(datas)}, ${ten.length} options; ${h.id})`)
   return true
 }
+function watchItemSwitch(item: ItemRef) {
+  const switchState = { pending: false, switchResult(verified: Promise<boolean>) {
+    switchState.pending = true
+    itemClaims!.waitForSwitch(item.onsen_item_id, item.kind === 'control', verified)
+  } }
+  return switchState
+}
 /** a press in Onsen on a command's choice: what the Telegram tap on that button does (runControlCallback), then applied */
-async function applyKeyboardControl(ka: KeyboardAsk, h: Onsen.ActionHandle, c: Onsen.ActionControl, taken: boolean, destination?: string | null): Promise<boolean> {
+async function applyKeyboardControl(ka: KeyboardAsk, h: Onsen.ActionHandle, c: Onsen.ActionControl, taken: boolean, destination?: string | null, hooks?: ReturnType<typeof watchItemSwitch>): Promise<boolean> {
   const acts = onsenActions!
   const idx = /^\d{1,2}$/.test(c.option_id) ? Number(c.option_id) - 1 : -1
   if (ka.ended || idx < 0 || idx >= ka.datas.length) { acts.cancel(h, ka.ended ? '這個選項已經按過了' : `不認得的選項 ${c.option_id}`); return false }
@@ -636,8 +644,9 @@ async function applyKeyboardControl(ka: KeyboardAsk, h: Onsen.ActionHandle, c: O
   }
   const reply = (msg: string, opts?: ReplyOptions) => sendTextWithMaybeKeyboard(ka.chat, msg, opts?.keyboard, here)
   let ok = true
-  try { await Onsen.withSender('system:control', () => runControlCallback(ka.datas[idx]!, String(process.env.TELEGRAM_HTTP_PORT ?? HTTP_PORT), reply, taken ? () => { ok = false } : undefined)) }
+  try { await Onsen.withSender('system:control', () => runControlCallback(ka.datas[idx]!, String(process.env.TELEGRAM_HTTP_PORT ?? HTTP_PORT), reply, taken ? () => { ok = false } : undefined, hooks)) }
   catch (e) { ok = false; log('warn', `connector: the choice ${c.option_id} of action ${c.action_id} failed: ${e instanceof Error ? e.message : e}`) }
+  if (hooks?.pending) return true
   if (taken && !ok) { acts.cancel(h, '選項未能套用'); return false }
   acts.applied(h, { at: new Date().toISOString() })
   log('info', `connector: action ${c.action_id} (a command's choice): option ${c.option_id} pressed in Onsen, done as a tap on it`)
@@ -682,6 +691,7 @@ async function connectorCommand(text: string, chat: string, ref: string, userId:
     if (targetCommand && !roamerItems!.selectedFor(item.destination)) { itemReceiver.report([item], 'not_taken'); return true }
   }
   let handled = false
+  const hooks = item && watchItemSwitch(item)
   try {
     handled = await handledHere({ chat, id: ref, from: userId, ...(via ? { via } : {}) }, 'command', () => Onsen.withSender('system:control', async () => {
       if (cmd === '/start') { await reply(START_TEXT); return true }
@@ -693,12 +703,12 @@ async function connectorCommand(text: string, chat: string, ref: string, userId:
         return true
       }
       if (Lanes.LANES_ON && cmd === '/lanes') { await reply(await Lanes.lanesCommand(t, name)); return true }
-      if (isControlEnabled() && await handleControlSlash(t, String(HTTP_PORT), reply, { ...connectorClearHooks(chat, ref, userId ? `tg:${userId}` : name, here, atIso), ...(item && commandId ? { command: { from: item.from, message_id: commandId } } : {}) })) return true
-      if (isRoamerEnabled() && await handleRoamerSlash(t, reply) !== false) return true
+      if (isControlEnabled() && await handleControlSlash(t, String(HTTP_PORT), reply, { ...hooks, ...connectorClearHooks(chat, ref, userId ? `tg:${userId}` : name, here, atIso), ...(item && commandId ? { command: { from: item.from, message_id: commandId } } : {}) })) return true
+      if (isRoamerEnabled() && await handleRoamerSlash(t, reply, hooks) !== false) return true
       return false
     }), h => h !== false)
     return handled
-  } finally { if (item) itemReceiver?.report([item], handled ? 'completed' : 'not_applied') }
+  } finally { if (item && !hooks?.pending) itemReceiver?.report([item], handled ? 'completed' : 'not_applied') }
 }
 /** WO-197 segment 2 (CONTRACT §7d): the Onsen thread a connector's person_message is in: its own `thread` (Onsen ≥ the field; learned for the reply
  *  tool's topic), else its client.thread looked up (GET /conversations/<id>/threads?client_thread=); undefined: outside threads, or not known */
@@ -1914,7 +1924,7 @@ function promptOf(h: Onsen.ActionHandle | null | undefined): PermPrompt | undefi
 }
 /** WO-176: Onsen's control item for one of this agent's Actions (a person pressed an option in Onsen), handed over by the agent-inbox daemon
  *  (POST /onsen/action): pressed here as a press in Telegram would be, then reported applied; a prompt that is gone: cancelled, nothing pressed */
-async function applyActionControl(c: Onsen.ActionControl, taken = false, destination?: string | null): Promise<boolean> {
+async function applyActionControl(c: Onsen.ActionControl, taken = false, destination?: string | null, hooks?: ReturnType<typeof watchItemSwitch>): Promise<boolean> {
   const acts = onsenActions
   if (!acts) return false
   const p = [...permPrompts.values()].find(x => x.action?.id === c.action_id)
@@ -1923,7 +1933,7 @@ async function applyActionControl(c: Onsen.ActionControl, taken = false, destina
   const pa = [...pickerAsks.values()].find(x => x.h.id === c.action_id)   // WO-197: a screen menu this daemon asked about in Onsen
   if (pa) return applyPickerControl(pa, h, c)
   const ka = [...keyboardAsks.values()].find(x => x.h.id === c.action_id)   // WO-197 segment 2: a command's choice
-  if (ka) return applyKeyboardControl(ka, h, c, taken, destination)
+  if (ka) return applyKeyboardControl(ka, h, c, taken, destination, hooks)
   const ca = [...clearAsks.values()].find(x => x.h.id === c.action_id)      // WO-197 segment 2: /clear's 「不要讓它看到之前的」
   if (ca) return applyClearControl(ca, h, c)
   if (dutyOfficer) {
@@ -3357,7 +3367,7 @@ async function pairedStatusText(name: string): Promise<string> {
 
 /** the choice a command offered (resume: roam: model: effort:), pressed: what the press does (a Telegram tap, or WO-197 segment 2: the Onsen Action's
  *  option, action_control) */
-async function runControlCallback(data: string, httpPort: string, reply: (msg: string, opts?: ReplyOptions) => Promise<void>, notApplied?: () => void): Promise<void> {
+async function runControlCallback(data: string, httpPort: string, reply: (msg: string, opts?: ReplyOptions) => Promise<void>, notApplied?: () => void, hooks?: ClearHooks): Promise<void> {
   // Roamer /model + /effort picker taps carry `@<hash6>` — validate + drive
   // the CURRENT target (issue #7). Plain model:/effort: stays channel-bot.
   if (isRoamerEnabled() && (data.startsWith('model:') || data.startsWith('effort:')) && data.includes('@')) {
@@ -3366,12 +3376,12 @@ async function runControlCallback(data: string, httpPort: string, reply: (msg: s
     const value = data.slice(prefix.length, at).trim()
     const hash = data.slice(at + 1).trim()
     const cmd = prefix === 'model:' ? '/model' as const : '/effort' as const
-    if (await handleModelCallbackForCurrentTarget(value, hash, reply, cmd, notApplied)) return
+    if (await handleModelCallbackForCurrentTarget(value, hash, reply, cmd, notApplied, hooks)) return
   }
   if (isRoamerEnabled() && !data.startsWith('model:') && !data.startsWith('effort:')) {
     if (!await handleRoamerCallback(data, reply, notApplied)) notApplied?.()
   } else if (data.startsWith('resume:') || data.startsWith('model:') || data.startsWith('effort:')) {
-    await handleCallbackData(data, httpPort, reply)
+    await handleCallbackData(data, httpPort, reply, hooks)
   }
 }
 
@@ -5197,10 +5207,11 @@ async function routeInboxItem(row: InboxItem, change?: 'edited' | 'version'): Pr
     const receiver = itemReceiver
     if (!receiver || !(await receiver.receive([item])).given.has(row.id)) return
     let applied = false
+    const hooks = watchItemSwitch(item)
     try {
       const c = Onsen.actionControlOf(payload)
-      if (c && c.action_id === row.action_id) applied = await applyActionControl(c, true, item.destination)
-    } finally { receiver.report([item], applied ? 'completed' : 'not_applied') }
+      if (c && c.action_id === row.action_id) applied = await applyActionControl(c, true, item.destination, hooks)
+    } finally { if (!hooks.pending) receiver.report([item], applied ? 'completed' : 'not_applied') }
     return
   }
   const kinds: Record<string, string> = { call: 'peer_call', mail: 'peer_mail', schedule: 'scheduled', keepwarm: 'wd_keepwarm' }

@@ -3,7 +3,7 @@ import type { InboxItem, ItemRef } from './onsen-items.ts'
 import type { TakeMode } from './onsen-take.ts'
 import type { Journal } from './lanes-state.ts'
 
-export type Outcome = 'in_session' | 'not_taken' | 'completed' | 'owed' | 'background' | 'not_applied'
+export type Outcome = 'in_session' | 'not_taken' | 'completed' | 'owed' | 'background' | 'not_applied' | 'deferred'
   | 'usage_limit' | 'usage_limit_probe' | 'error' | 'cut' | 'cut_person' | 'stopped' | 'stuck' | 'reassigned' | 'superseded'
 export type ReportFields = { response_message_ids?: string[]; retry_after?: string | null
   half_done?: boolean; command_message_id?: string; note?: string }
