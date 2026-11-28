@@ -45,7 +45,8 @@ function writtenItem(row: Row, now: number, online: boolean, history = true) {
 export function fakeItems() {
   let now = Date.now(), seq = 0, claimSeq = 0, owner = '', seen = 0
   const rows = new Map<string, Row>(), writes = new Map<string, Response>(), terminal = new Map<string, string>()
-  const creates = new Map<string, { body: unknown; result: Response }>()
+  const creates = new Map<string, { id: string; body: unknown; result: Response }>()
+  const takes = new Map<string, { claim: string; body: unknown; result: Response }>()
   const overdue = new Set<string>()
   const givenByPull = new Set<Row>()
   let pullAcked = 0
@@ -119,12 +120,12 @@ export function fakeItems() {
       if (path !== base) return error(403, 'not_authorized')
       if (!key || !validCreate(b)) return error(400, 'invalid_request')
       const old = creates.get(key)
-      if (old) return Bun.deepEquals(old.body, b) ? old.result.clone() : error(409, 'version_conflict')
+      if (old && rows.has(old.id)) return Bun.deepEquals(old.body, b) ? old.result.clone() : error(409, 'version_conflict')
       const row = add(crypto.randomUUID(), b.kind, { from: 'adam', waiter: b.waiter ?? 'adam', session_id: b.session_id ?? null,
         refs: b.refs, not_before: b.not_before ?? null, deadline: b.deadline ?? null, expires_at: b.expires_at ?? null,
         payload: { text: b.body?.text ?? '' }, created_at: iso(now), completed_at: null, cancelled_at: null })
       const result = detail(view(row))
-      creates.set(key, { body: b, result: result.clone() })
+      creates.set(key, { id: row.id, body: b, result: result.clone() })
       return result
     }
     if (req.method === 'DELETE' && /^\/v1\/items\/[^/]+$/.test(path)) {
@@ -170,6 +171,11 @@ export function fakeItems() {
     let answer: Response
     if (path === base + '/take' && req.method === 'POST') {
       if (!b.connector || b.wait !== 0 || !Array.isArray(b.item_ids) || b.limit !== b.item_ids.length || b.limit > 100 || b.session_id !== undefined) return error(400, 'invalid_request')
+      const prior = takes.get(idem)
+      if (prior && [...rows.values()].some(r => r.claim?.id === prior.claim)) {
+        return Bun.deepEquals(prior.body, b) ? prior.result.clone() : error(409, 'version_conflict')
+      }
+      takes.delete(idem)
       const asked: Row[] = b.item_ids.map((id: string) => rows.get(id)).filter(eligible).filter((r: Row) => r.member === 'adam')
       const given = asked.filter(r => r.reason !== 'cut_person' || asked.some(o => o !== r && o.from === r.from && o.kind === 'message' && o.reason !== 'cut_person'))
       const claim_id = given.length ? 'claim-' + ++claimSeq : null
@@ -180,6 +186,9 @@ export function fakeItems() {
       }
       const waiting = [...rows.values()].filter(r => r.member === 'adam' && r.state === 'waiting')
       answer = detail({ claim_id, items: given.map(r => view(r, false)), waiting: waiting.length, next_not_before: waiting.map(r => r.not_before).filter(Boolean).sort()[0] ?? null })
+      if (claim_id) takes.set(idem, { claim: claim_id, body: b, result: answer.clone() })
+      if (delayTake) await Bun.sleep(delayTake)
+      return answer
     } else if (path === '/v1/members/adam/observation' && req.method === 'PUT') {
       if (!Array.isArray(b.held_item_ids)) return error(400, 'invalid_request')
       observedAt = now
@@ -219,7 +228,6 @@ export function fakeItems() {
       change(row, b.outcome, b.note); answer = detail(view(row))
     }
     writes.set(idem, answer.clone())
-    if (delayTake && path === base + '/take') await Bun.sleep(delayTake)
     return answer
   } })
   return { base: 'http://127.0.0.1:' + server.port, rows, calls, history, add, change, now: () => now,

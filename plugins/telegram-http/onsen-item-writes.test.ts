@@ -61,6 +61,31 @@ test('S2 DELETE checks writer, version, claim and outcome', async () => {
   expect((await close(claimed.id, fake.rows.get(claimed.id)!.version, 'completed')).status).toBe(409)
 })
 
+test('a creation key follows its row, and a take key follows its live claim', async () => {
+  fake = fakeItems()
+  const item = ownItem('self', 'main', '回報', null)
+  const create = async () => (await (await request('POST', base, item, 'row-key')).json()).data
+  const original = await create()
+  const args = { connector: 'bench/adam', item_ids: [original.id], limit: 1, wait: 0 }
+  const take = async () => (await (await request('POST', base + '/take', args, 'take-key')).json()).data
+  const a = await take()
+  expect(a.items.map((r: { id: string }) => r.id)).toEqual([original.id])
+  expect((await take()).claim_id).toBe(a.claim_id)
+  expect((await request('POST', base + '/take', { ...args, item_ids: ['something-else'] }, 'take-key')).status).toBe(409)
+  fake.advance(45_001)
+  const b = await take()
+  expect(b.claim_id).toBeTruthy()
+  expect(b.claim_id).not.toBe(a.claim_id)
+  const report = await request('PUT', '/v1/items/' + original.id + '/report',
+    { claim_id: b.claim_id, outcome: 'completed', at: new Date(fake.now()).toISOString() }, 'report')
+  expect(report.status).toBe(200)
+  expect((await take()).claim_id).toBeNull()
+  fake.advance(30 * 86400_000)
+  expect(await create()).toEqual(original)
+  expect((await request('POST', base, { ...item, waiter: 'eve' }, 'row-key')).status).toBe(409)
+  expect(fake.rows.size).toBe(1)
+})
+
 test('self writes survive a disconnected connector and close the same Item on restart', async () => {
   fake = fakeItems()
   const dir = mkdtempSync(join(tmpdir(), 'self-spool-'))
@@ -88,6 +113,7 @@ test('self writes survive a disconnected connector and close the same Item on re
     c = client()
     expect(c.writtenItemId(write.key)).toBe(row.id)
     const posted = fake.calls.filter(call => call.key === write.key).length
+    fake.advance(30 * 86400_000)
     c.recordItemWrite({ ...write, complete: true })
     c.recordItemWrite({ ...write, complete: true })
     await c.syncNow(true)
