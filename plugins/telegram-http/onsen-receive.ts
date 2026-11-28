@@ -39,7 +39,7 @@ export class ItemReceiver {
 
   async receive(refs: ItemRef[], hook = false, binding = false): Promise<ReceiveResult> {
     const result = empty()
-    if (!this.mode.active || this.claims.blocked()) return result
+    if (!this.mode.canReceive || this.claims.blocked()) return result
     const byId = new Map(refs.map(r => [r.onsen_item_id, r]))
     const ids = [...byId.keys()]
     if (ids.some(id => this.requesting.has(id))) return result
@@ -57,10 +57,10 @@ export class ItemReceiver {
       let r = await take().catch(() => null)
       // The first write may have committed before the response was lost. Recover its exact result.
       let retry = 0
-      while ((!r || r.status >= 500 || expired && retry === 0) && this.mode.active) {
+      while ((!r || r.status >= 500 || expired && retry === 0) && this.mode.canReceive) {
         expired = true
         if (retry) await new Promise(resolve => setTimeout(resolve, Math.min(30_000, 1000 * retry)).unref())
-        if (!this.mode.active) return empty()
+        if (!this.mode.canReceive) return empty()
         retry++
         if (!this.claims.blocked()) r = await take().catch(() => null)
       }
@@ -82,7 +82,7 @@ export class ItemReceiver {
         if (single?.status === 404 || (single?.status === 200 && single.json.data.state !== 'waiting')) result.gone.add(id)
         if (single?.json?.data?.not_before) this.dueAt(single.json.data.not_before)
       }))
-      if (expired || !this.mode.active) {
+      if (expired || !this.mode.canReceive) {
         for (const id of need) if (result.given.has(id)) this.claims.report(id, 'not_taken')
         return empty()
       }

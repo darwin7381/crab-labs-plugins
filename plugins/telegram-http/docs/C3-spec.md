@@ -8,7 +8,7 @@
 
 ## d503fc6 審查修訂
 
-本次重讀 §4b，契約 MD5 為 `fbee7e7295a1e0e90e1b64ee753af7d9`。以下依 review-c3 的行號與裁定驗收。
+審查修正開始時重讀 §4b，契約 MD5 為 `fbee7e7295a1e0e90e1b64ee753af7d9`。04:25Z 的裁決發布後複核，契約 MD5 為 `b95c0bb6a6fca963ec8af825ada122af`。以下行號對應 review-c3。
 
 1. `lanes.ts:3956,4219` 各車道保存自己的拒絕時間。keeper 未顯示該車道的牆時，60 秒後放一筆真實工作探測。成功清除，再拒就從該次重算。主線的牆只適用於相符模型。
 2. `lanes-main.ts:211` 自動重開以舊 PID 退出為準。舊 PID 過數秒仍活著就解除 hook 封鎖，交給後續 tick 重試。同一次卡住只報一次。
@@ -16,9 +16,9 @@
 4. `main-hook.py:190` 保留逐則漏答與工具結果未送出的內容判斷，同一次 Stop 合併提醒，對應的 claim 報 `owed`。本機及切換前的列也保留內容檢查。
 5. `onsen-claims.ts` 每筆 `completed` 附上屬於該 claim 的回覆訊息 ID，涵蓋車道直接完成與提醒後完成。
 6. `lanes.ts:3623,5281` 車道的工具等待依主線 hook 的工具 timeout 來源計時，涵蓋 MCP、WebFetch 與 Bash；工具結果進來後從最後活動重新計算沉默時間。
-7. `onsen-take.ts` 以 C1 的 `TakeMode.active` 統一判斷成員的模式。收件 409 暫停領件，等模式探測確認 pull 才啟動舊計時器。測試包含暫停期間已到期的列。
+7. `onsen-take.ts` 的 `takeModeActive(mode)` 讀 C1 的 `TakeMode.active`，供 `followupTick` 與 `dueTick` 共用。收件 409 暫停領件，等模式探測確認 pull 才啟動舊計時器。測試包含暫停期間已到期的列。
 
-測試台另驗 relayed TUI alert 交值班員、main-menu 的 choose Action。已定 37 的寄件人模式由 Chiron 裁定。
+測試台另驗 relayed TUI alert 交值班員、main-menu 的 choose Action。Chiron 的 `RULINGS-20261128T0425Z.md` 第 2、3 題確認車道的 60 秒探測與收工漏答檢查。
 
 ## 逐項盤點
 
@@ -57,6 +57,6 @@ settled49-table 的 26 行中，A3–A5 是本步的靜默通知，A6 的 stall 
 | handoff-due、card-due、peer-flood 開始／結束、一般 TUI 警告 | 第四表取消這些直推。交接與到期由原列表示，畫面警告歸值班員 |
 | fleet-block-detector | S4 `fleet_same_cause`。舊 sender 在外部 W20 |
 
-## 待定
+## 已定 37 的寄件人模式
 
-「一般 connector 要從哪個已授權來源辨認原寄件人是 take 還是 pull？」S2 r2 設計第 67、77 行限定 delivery 讀權與 connector 探測身分，普通 Item 讀取對兩種成員都可成功。這會影響混合模式下三個原寄件人的回覆。待確認的行為須由負責人決定。
+Chiron 04:25Z 裁決第 4 題確認由 Onsen 在寫入時按已定 49 收掉給 take 成員的靜默通知。這三條路徑共用伺服器的判斷。

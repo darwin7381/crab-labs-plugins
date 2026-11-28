@@ -3,6 +3,8 @@ import { randomUUID } from 'crypto'
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { createEvents } from './lanes-events.ts'
+import { Journal } from './lanes-state.ts'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
 import { startBotApiMock } from './test-fixtures/tg-bot-api-mock.ts'
 import { freePort, until } from './test-fixtures/tg-daemon.ts'
@@ -701,6 +703,28 @@ for (const [reason, outcome, code] of [
   expect(d.f.history.filter(h => h.item_id === row.id).slice(0,2).map(h => h.body.outcome)).toEqual(['in_session', outcome])
   expect(d.journal().some(r => r.rec === 'run' && r.state === 'exited' && r.reason === reason)).toBe(true)
 })
+
+test('a runtime 409 cannot start due notices; a confirmed pull probe starts them', async () => {
+  const id = 'review-c3-due'
+  const d = await daemon({}, 200, root => {
+    const journal = new Journal(join(root, 'tg', 'lanes', 'state.jsonl'))
+    createEvents(journal, () => {}).open(id, { class: 'critical', owner: 'router', from: 'alert-dispatcher', text: id,
+      fields: { onsen_items: [{ onsen_item_id: id, onsen_version: 1, kind: 'alert', from: 'alert-dispatcher' }] },
+      obligations: [{ kind: 'joey', level: 'line', ring: true, due_at: Date.now() - 1000 }] })
+    return {}
+  })
+  await waitFor(() => d.f.calls.some(c => c.query.has('wait')))
+  d.f.mode(409)
+  d.f.add('wake-peek', 'alert', { from: 'alert-dispatcher', payload: { text: '[P2] wake', line: 'call' } })
+  await waitFor(() => d.log().includes('onsen take: not_take_member'))
+  const rings = () => d.journal().filter(r => r.id === id && r.obligations?.some((o: any) => o.rang))
+  const notices = () => d.f.calls.filter(c => c.path === '/v1/messages' && JSON.stringify(c.body).includes(id))
+  await Bun.sleep(1500)
+  expect(rings()).toHaveLength(0); expect(notices()).toHaveLength(0)
+  await d.restart()
+  await waitFor(() => d.log().includes('mode probe did not return 200') && notices().length > 0)
+  expect(rings()).toHaveLength(1); expect(notices()).toHaveLength(1)
+}, 10000)
 
 for (const code of [404, 409, 0]) test('daemon stays on pull after probe ' + (code || 'network error'), async () => {
   const cfg: Record<string, string> = {}

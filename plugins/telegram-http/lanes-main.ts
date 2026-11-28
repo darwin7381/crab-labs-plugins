@@ -39,6 +39,7 @@ export type EndReason = 'asked' | 'killed' | 'exited' | 'replaced'
 type CutTurn = { at: number; why: string; retry_at?: number; background_agents?: number }
 
 import { callSenders, hasCallFrom, type ItemRef } from './onsen-items.ts'
+import { takeModeActive } from './onsen-take.ts'
 import type { ItemReceiver, Outcome, ReportFields } from './onsen-receive.ts'
 
 export type MainEnv = {
@@ -214,9 +215,8 @@ export function createMain(E: MainEnv) {
   let restoredThrough = 0
 
   const J = (): Journal => E.journal
-  const taking = (): boolean => E.itemReceiver?.()?.mode.active === true
   // S4 owns cannot_move/recovered, parked/cancelled and choose for take members.
-  const tellJoey: MainEnv['tellJoey'] = (...args) => { if (!taking()) E.tellJoey(...args) }
+  const tellJoey: MainEnv['tellJoey'] = (...args) => { if (!takeModeActive(E.itemReceiver?.()?.mode)) E.tellJoey(...args) }
   function retryRestart(g: Row, error: unknown): void {
     E.log('warn', `lanes: main ${g.id} restart after ${g.item_restart}: ${error}; will retry`)
     setMain(g, g.state as MainPhase, { item_restart_retry: g.item_restart, item_restart: null, item_restart_at: null })
@@ -789,7 +789,7 @@ export function createMain(E: MainEnv) {
   /** WO-201: the line Joey gets about items closed after a second cut (or a parked item that failed again): what they were, and that they are not
    *  given to the main again. It is the line about each (it meets their Joey line, as the asked-restart notice) */
   function tellClosed(rs: Row[], what: (r: Row) => string): void {
-    if (taking()) return
+    if (takeModeActive(E.itemReceiver?.()?.mode)) return
     const told = rs.filter(r => r.kind !== 'digest')
     if (!told.length) return
     const lines = Array.from(Map.groupBy(told, what), ([sentence, group]) =>
@@ -972,7 +972,7 @@ export function createMain(E: MainEnv) {
         beginTurn(g, p); setMain(J().get('main', g.id)!, 'in_turn', { tool_open: String(b.tool_name ?? 'tool') })
         // WO-148 (item 3; lab: the hook sent tool_input only for a btcc-receipt Bash): the hook's tool_brief, the field the call is about (lanes.ts masks it)
         openTools.set(g.id, { name: String(b.tool_name ?? 'tool'), input: b.tool_brief ?? b.tool_input ?? null, at: new Date().toISOString() })
-        toolBound.set(g.id, toolSilenceMs(b.tool_timeout_ms, taking() ? b.tool_name : undefined))   // the tool's own bound, with a margin
+        toolBound.set(g.id, toolSilenceMs(b.tool_timeout_ms, takeModeActive(E.itemReceiver?.()?.mode) ? b.tool_name : undefined))   // the tool's own bound, with a margin
         { const deny = E.toolGate?.(String(b.tool_name ?? ''), b.tool_input ?? {}); if (deny) return { deny } }     // 002w (D): refused before it runs
         const send = /__send_to_agent$/.test(String(b.tool_name ?? ''))
         let mark: string | undefined, markReplyTo: string | null = null
@@ -1006,7 +1006,7 @@ export function createMain(E: MainEnv) {
       case 'Stop': {
         if (!p) return {}
         if (b.phase === 'owed') {
-          if (!taking() || g.state !== 'in_turn' || g.prompt_id !== p) return {}
+          if (!takeModeActive(E.itemReceiver?.()?.mode) || g.state !== 'in_turn' || g.prompt_id !== p) return {}
           const holding = g.owed_hold === p
           const prior: string[] = holding ? g.owed_events ?? [] : []
           const rows = unsettled(g, p).filter(r => r.state === 'bound' && !prior.includes(r.event) && b.owed_mids?.includes(aidItem(r).mid))
@@ -1025,7 +1025,7 @@ export function createMain(E: MainEnv) {
           // (a turn that took in nothing is asked about the work it carries on). One hold per turn (owed_hold on the gen), naming each: the next Stop of
           // the same turn ends it, and what is still owed stays open on its event.
           const gen = J().get('main', g.id)!
-          const take = taking()
+          const take = takeModeActive(E.itemReceiver?.()?.mode)
           let block: string | undefined
           if (E.mainOwed && gen.owed_hold !== p && !(take && t.carried)) {
             const owed = E.mainOwed(t.events)
@@ -1071,7 +1071,7 @@ export function createMain(E: MainEnv) {
         const reason = `stop_failure:${err}`
         const back = unsettled(g, p)
         const wall = E.usageWall?.(Date.parse(String(g.wall_since ?? '')) || 0)
-        const refusedProbe = taking() && back.some(r => r.onsen_items && r.keeper_probe)
+        const refusedProbe = takeModeActive(E.itemReceiver?.()?.mode) && back.some(r => r.onsen_items && r.keeper_probe)
         for (const r of back) {
           if (r.onsen_items) {
             if (r.state === 'bound' && r.kind === 'joey') E.blocked?.(r, wall?.resets_at ?? null)
@@ -1142,7 +1142,7 @@ export function createMain(E: MainEnv) {
     // ends it with the one wall-down notice (2a936a7: the episode ended with the gen, and Joey heard main-wall-up and never the recovery)
     const ended = J().rows('main', r => r.state === 'gone' && !!r.wall_since && r.id !== id)
     const since = ended.map(r => String(r.wall_since)).sort()[0]
-    const refusal = taking() && ended.filter(r => r.wall_refused_at).sort((a, b) => b.wall_refused_at - a.wall_refused_at)[0]
+    const refusal = takeModeActive(E.itemReceiver?.()?.mode) && ended.filter(r => r.wall_refused_at).sort((a, b) => b.wall_refused_at - a.wall_refused_at)[0]
     const carry = since ? { wall_since: since, wall_menu: ended.map(r => r.wall_menu).filter(Boolean).pop() ?? null } : {}
     const previous = latestMain()
     for (const r of ended) J().write('main', r.id, 'gone', { wall_since: null, wall_menu: null })
@@ -1243,8 +1243,8 @@ export function createMain(E: MainEnv) {
     const m = member()
     const wall = wallDelivery(g)
     const held = m === 'waiting' || wall.active
-    const silenceLimit = g?.tool_open ? Math.max(MAIN_STUCK_MS, toolBound.get(g.id) ?? toolSilenceMs(undefined, taking() ? g.tool_open : undefined)) : MAIN_STUCK_MS
-    if (taking()) {
+    const silenceLimit = g?.tool_open ? Math.max(MAIN_STUCK_MS, toolBound.get(g.id) ?? toolSilenceMs(undefined, takeModeActive(E.itemReceiver?.()?.mode) ? g.tool_open : undefined)) : MAIN_STUCK_MS
+    if (takeModeActive(E.itemReceiver?.()?.mode)) {
       // The wrapper can be healthy while the old TUI is still alive. tick already checked its pid above.
       if (g?.item_restart) {
         if (now - (g.item_restart_at ?? 0) >= 5_000) retryRestart(g, 'old pid is still alive')

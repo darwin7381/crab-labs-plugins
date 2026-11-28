@@ -5,7 +5,7 @@ import { join } from 'path'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
 import { OnsenClient } from './onsen-client.ts'
 import { OnsenInbox, OnsenPuller, switchOn } from './onsen-inbox.ts'
-import { deliveryMode, machineName, takeRefusal, TakeMode } from './onsen-take.ts'
+import { deliveryMode, machineName, takeRefusal, TakeMode, takeModeActive } from './onsen-take.ts'
 import { ItemPeek, itemRef, type InboxItem } from './onsen-items.ts'
 import { Claims } from './onsen-claims.ts'
 import { ItemReceiver } from './onsen-receive.ts'
@@ -481,14 +481,33 @@ test('a foreign connector pauses all receives for 45 s and keeps the observation
   await deliveryMode(mode.req, mode.path, 'other/adam')
   const receiver = new ItemReceiver(mode, r.claims, () => {}), row = r.f.add('ownership')
   await receiver.receive([itemRef(row)])
-  expect(interval).toBe(45_000); expect(mode.active).toBe(false); expect(mode.observationRequired).toBe(true)
+  expect(interval).toBe(45_000); expect(takeModeActive(mode)).toBe(true); expect(mode.canReceive).toBe(false); expect(mode.observationRequired).toBe(true)
   const calls = r.f.calls.length
   await receiver.receive([itemRef(row)])
   const peek = new ItemPeek(mode, () => new Map(), async () => {}, () => true)
   await peek.poll(); expect(r.f.calls.length).toBe(calls)
   expect(r.logs.filter(s => s.includes('not_current_connector'))).toHaveLength(1)
-  r.f.advance(45_001); retry!(); await until(() => mode.active)
+  await mode.probe()  // the other connector still owns the take member
+  expect(takeModeActive(mode)).toBe(true); expect(mode.canReceive).toBe(false)
+  r.f.advance(45_001); retry!(); await until(() => mode.canReceive)
   expect([...(await receiver.receive([itemRef(row)])).given]).toEqual(['ownership'])
+})
+
+test('a 409 pause keeps the take gate until the probe confirms pull', async () => {
+  const r = rig(), transitions: Array<[boolean, boolean]> = []
+  const mode = new TakeMode('adam', r.mode.req, ready => transitions.push([takeModeActive(mode), ready]), () => {}, 'mac-mini')
+  clean.push(() => mode.stop())
+  await mode.probe()
+  r.f.mode(409)
+  await new ItemReceiver(mode, r.claims, () => {}).receive([itemRef(r.f.add('changed-mode'))])
+  expect(transitions).toEqual([[true, true], [true, false]])
+  r.f.down(true); await mode.probe()
+  expect(takeModeActive(mode)).toBe(true)
+  expect(mode.canReceive).toBe(false)
+  r.f.down(false); await mode.probe()
+  expect(transitions.at(-1)).toEqual([false, false])
+  r.f.mode(200); await mode.probe()
+  expect(transitions.at(-1)).toEqual([true, true])
 })
 
 test('take tools respect declared timeouts and open remote calls remain active until their result', () => {

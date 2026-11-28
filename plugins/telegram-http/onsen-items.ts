@@ -53,7 +53,7 @@ export class ItemPeek {
     this.previous.clear()
     this.seen.clear()
     clearTimeout(this.timer)
-    if (this.mode.active && !this.reading) this.schedule(0)
+    if (this.mode.canReceive && !this.reading) this.schedule(0)
   }
 
   stop(): void {
@@ -78,7 +78,7 @@ export class ItemPeek {
   }
 
   async poll(): Promise<void> {
-    if (!this.mode.active || this.reading) return
+    if (!this.mode.canReceive || this.reading) return
     this.reading = true
     const g = this.generation
     let delay = 0
@@ -89,7 +89,7 @@ export class ItemPeek {
       if (this.page) q.set('cursor', this.page)
       this.request = new AbortController()
       const r = await this.mode.req('GET', this.mode.path + '?' + q, undefined, 35_000, undefined, this.request.signal)
-      if (g !== this.generation || !this.mode.active) return
+      if (g !== this.generation || !this.mode.canReceive) return
       if (r?.status === 409) {
         const why = r.json?.error?.code
         if (why === 'not_take_member' || why === 'not_current_connector') {
@@ -125,7 +125,7 @@ export class ItemPeek {
     } catch (err) { if (g === this.generation) this.mode.log('onsen take: peek failed: ' + err); delay = 2000 }
     finally {
       this.reading = false
-      if (this.mode.active) this.schedule(g === this.generation ? delay : 0)
+      if (this.mode.canReceive) this.schedule(g === this.generation ? delay : 0)
     }
   }
 }
