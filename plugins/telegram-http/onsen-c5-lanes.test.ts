@@ -29,7 +29,7 @@ const client = new OnsenClient({ dir, agent: 'adam', record: true, base: f.base,
 const mode = new TakeMode('adam', client.request.bind(client), () => {}, () => {})
 const claims = new Claims(join(dir, 'claims.json'), client, () => {}, () => {}, f.now)
 const receiver = new ItemReceiver(mode, claims, () => {})
-L.useItemReceiver(receiver, write => client.recordSelfWrite(write))
+L.useItemReceiver(receiver, write => client.recordItemWrite(write))
 await mode.probe()
 afterAll(() => {
   mode.stop(); claims.stop(); client.stop(); f.stop(); jev.stop(true)

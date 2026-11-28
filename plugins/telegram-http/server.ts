@@ -377,7 +377,7 @@ if (ONSEN_TAKE_ON) {
     itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, Lanes.offerMissed, () => registryStatusChanged?.())
     onsen.watchItemReports(line => itemClaims!.replay(line), (line, ok) => itemClaims!.acknowledged(line, ok))
     itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at), () => itemPeek!.reset(), due => !!takeKeepwarm?.matchesWindow(due))
-    Lanes.useItemReceiver(itemReceiver, write => onsen.recordSelfWrite(write))
+    Lanes.useItemReceiver(itemReceiver, write => onsen.recordItemWrite(write))
     itemPeek = new ItemPeek(takeMode, Lanes.itemIndex, routeInboxItem, () => !itemClaims!.blocked())
     Lanes.observeItemGates(() => itemPeek!.reset())
   }
@@ -3007,7 +3007,7 @@ if (takeMode || INBOX_ONLY && keepwarmMode() !== 'off') {
   const keepwarm = new LocalKeepwarm({
     name: takeMode?.member ?? INBOX_SELF,
     stateDir: STATE_DIR,
-    take: takeMode,
+    take: takeMode && onsen ? { mode: takeMode, write: write => onsen.recordItemWrite(write) } : undefined,
     mode: () => takeMode?.active ? 'live' : takeMode || onsenPuller?.onTake ? 'off' : keepwarmMode(),
     projectsDir: () => (process.env.KEEPWARM_PROJECTS_DIR || '').trim() || TRANSCRIPT_DIR,
     // lanes-golive (C4): with lanes on the main's transcript by its session id (lane transcripts share the dir); lanes off: the newest, as before

@@ -4,7 +4,7 @@
 
 ## 寫入與收取
 
-- 只在該成員的 C1 take 模式運作。沿用成員的 Onsen client、S2 的 `POST /v1/members/<name>/items`、markdown body、RFC 3339 時間、`Ref[]` 與穩定的 `Idempotency-Key`。Onsen 從認證決定 `from`。提早完成等待中的承諾走 `DELETE /v1/items/<id>`，帶實際版本與 `outcome:"completed"`。已領的列依 C1 的 claim 回報。
+- 只在該成員的 C1 take 模式運作。self、keepwarm、resume 共用 OnsenClient.recordItemWrite 與 spool 的 item 記錄。永久 4xx 記錄一次並前進。沿用成員的 Onsen client、S2 的 `POST /v1/members/<name>/items`、markdown body、RFC 3339 時間、`Ref[]` 與穩定的 `Idempotency-Key`。Onsen 從認證決定 `from`。提早完成等待中的承諾走 `DELETE /v1/items/<id>`，帶實際版本與 `outcome:"completed"`。已領的列依 C1 的 claim 回報。
 - `lanes.ts:4219,6748,6881` 的 followup 在原 thread／lane 留下 `self`，最早時間沿用工具算出的 due。一般「再看」沒有回覆期限。有明確承諾時，M3 的對象就是 waiter。寫入方保留原事件、鏈長、結果指紋與每串三筆上限，讓同一個結果停止下一筆，一條鏈預設最多四趟。`ItemPeek` 到點分流，既有接收器在交入時才領。既有 pull 的本機 followup 和已保存的排程仍須能處理。
 - `lanes.ts:5810,6160,6740,6898,8045` 的主線／分身工具、已送出的承諾和收尾回執沿用 M3 的記錄與去重。實際收件人來自那次回覆或承諾，包含測試帳號與 peer。沒有約定時間的承諾只記在 M3。答應的時間寫在 `not_before`。主線 commitment 工具可憑識別碼提早結案，因此可帶 deadline。主線回覆、分身通知與分身 commitment 沒有這條結案路徑，deadline 留 null。提早做完的承諾要能按工具給的識別碼收掉。M3 本機到期掃描（`lanes.ts:6023`）對由 Item 處理的等待不再另推一次。
 - 第四表與 §4b「agent 答應人的事」在仍未履約且 deadline 已過時，由 S4 產生一筆 `notice`，`reason=promise_due`、`about_item_id` 指承諾、收件人為 waiter。C5 只寫承諾與完成事實。C3 處理其他 M3 通知與舊催促。

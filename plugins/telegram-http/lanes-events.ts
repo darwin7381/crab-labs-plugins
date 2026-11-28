@@ -23,7 +23,7 @@ export type ObKind = 'joey' | 'main' | 'peer' | 'receipt'
 export type Outcome = 'normal' | 'changed' | 'failed'
 export type ObState = 'open' | 'requested' | 'met' | 'handed' | 'dropped' | 'merged' | 'waived'
 export type Ob = { id: string; kind: ObKind; level: string; state: ObState; by?: string; owner?: string
-  self?: import('./onsen-self.ts').SelfWrite
+  self?: import('./onsen-item-writes.ts').ItemWrite
   /** WO-128: a hand-over that can wait (a decision card): the main's, but no M1 item and no due time until it is woken (`woke`: urgent | due); `card`: the
    *  hand-over is a decision card's (not listed in open-handoffs.md: the mailbox is the list) */
   defer?: boolean; woke?: 'urgent' | 'due' | 'batch'; woke_at?: string; card?: boolean      // WO-137 甲: `batch` = the batch wake's own obligation

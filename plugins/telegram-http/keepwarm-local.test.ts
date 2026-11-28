@@ -66,21 +66,25 @@ describe('scan', () => {
 test('take keepwarm uses the member credential, replaces a stale warm window and survives loss of its POST reply', async () => {
   const f = fakeItems(), dir = mkdtempSync(join(tmpdir(), 'kw-take-')), file = join(dir, 'main.jsonl')
   const at = Math.floor(f.now() / 1000)
-  const client = new OnsenClient({ dir, agent: 'adam', base: f.base, record: false, credential: () => 'test-member', log: () => {} })
   let lost = true, clock = at + 10, mail = 0, delivered = 0
-  const mode = new TakeMode('adam', async (m, p, b, t, h) => {
-    const r = await client.request(m, p, b, t, h)
-    if (m === 'POST' && lost) { lost = false; throw Error('lost response') }
-    return r
-  }, () => {}, () => {})
-  const monitor = () => new LocalKeepwarm({ name: 'adam', take: mode, stateDir: dir, projectsDir: () => dir, transcript: () => file,
+  const client = new OnsenClient({ dir, agent: 'adam', base: f.base, record: true, credential: () => 'test-member', log: () => {},
+    fetch: (async (url, init) => {
+      const response = await fetch(url, init)
+      if (init?.method === 'POST' && lost) { lost = false; throw Error('lost response') }
+      return response
+    }) as typeof fetch })
+  const mode = new TakeMode('adam', client.request.bind(client), () => {}, () => {})
+  const monitor = () => new LocalKeepwarm({ name: 'adam', take: { mode, write: w => client.recordItemWrite(w) }, stateDir: dir, projectsDir: () => dir, transcript: () => file,
     mode: () => 'live', mail: async () => { mail++; return null }, deliver: async () => { delivered++; return true }, log: () => {}, now: () => clock })
   const check = monitor()
   try {
     await mode.probe()
     writeFileSync(file, lines(...turnAt(at)))
     await check.run()
+    expect(f.rows.size).toBe(0)
+    await client.syncNow(true) // the POST lands but the spool loses its reply
     await monitor().run()
+    await client.syncNow(true)
     expect(f.rows.size).toBe(1)
     const first = [...f.rows.values()][0]!
     expect(first).toMatchObject({ kind: 'keepwarm', from: 'adam', session_id: 'main', deadline: null,
@@ -104,6 +108,7 @@ test('take keepwarm uses the member credential, replaces a stale warm window and
     expect([...stale.gone]).toEqual([first.id])
     expect(f.calls.some(c => c.path.endsWith('/take'))).toBe(false)
     await check.run()
+    await client.syncNow(true)
     const second = [...f.rows.values()].at(-1)!
     expect(first).toMatchObject({ state: 'cancelled', reason: 'withdrawn' })
     expect(second.not_before).toBe(iso(later + 1 + 50 * 60))

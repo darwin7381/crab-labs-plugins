@@ -3,7 +3,7 @@ import { MEMBER_CHAT } from './onsen-connector.ts'
 import { promiseSentences } from './lanes-followup.ts'
 import { parseLocal } from './lanes-digest.ts'
 import type { Ob } from './lanes-events.ts'
-import { ownItem, type SelfWriter } from './onsen-self.ts'
+import { ownItem, type ItemWriter } from './onsen-item-writes.ts'
 import type { ItemRef } from './onsen-items.ts'
 
 export function memberWaiter(value: unknown): string | undefined {
@@ -69,7 +69,7 @@ export function resumablePromise(o: Ob, now: number): boolean {
 }
 
 /** Called at the M3 journal transition. The same saved creation request identifies early completion after restart. */
-export function projectPromises(eventId: string, obs: Ob[], writer: SelfWriter, refs: ItemRef[] = [], previous: Ob[] = []): void {
+export function projectPromises(eventId: string, obs: Ob[], writer: ItemWriter, refs: ItemRef[] = [], previous: Ob[] = []): void {
   for (const o of obs) {
     if (o.self) {
       if (o.state === 'met' && !o.self.complete) {

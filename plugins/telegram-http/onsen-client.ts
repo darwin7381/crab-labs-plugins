@@ -83,7 +83,7 @@ export type StatusFact = { idem_key: string; agent: string; state: StatusState; 
 export type FormAck = { ids: number[]; at: string }
 /** fw (WO-190, local only, never posted): this message's files are being stored in Onsen; the sync joins their ids when it sends the line */
 import type { ItemReport } from './onsen-receive.ts'
-import { syncSelfWrite, type SelfWrite } from './onsen-self.ts'
+import { syncItemWrite, type ItemWrite } from './onsen-item-writes.ts'
 export type SpoolLine = { k: 'm'; r: OnsenItem; fw?: 1 } | { k: 'e'; r: OnsenEvent } | { k: 'l'; r: RestartLineDraw } | { k: 'u'; r: RestartLineLift }
   | { k: 'd'; r: DeliveryFact } | { k: 's'; r: StatusFact } | { k: 'a'; r: FormAck } | { k: 'w'; r: WakeItem }
   /** WO-164: one thread event (lanes-threads.ts OnsenThreadEvent), POST /threads/events */
@@ -91,12 +91,12 @@ export type SpoolLine = { k: 'm'; r: OnsenItem; fw?: 1 } | { k: 'e'; r: OnsenEve
   /** WO-175: one moment of a Call this agent received (onsen-status.ts CallFacts), PUT /v1/calls/<id>/state */
   | { k: 'c'; r: CallStateLine }
   | { k: 'ir'; r: ItemReport }
-  | { k: 'self'; r: SelfWrite }
+  | { k: 'item' | 'self'; r: ItemWrite } // self = spool entries written before the shared Item writer
   | { k: 'blocked'; r: BlockedReceipt }
   /** WO-192: what Telegram did with a reply written into Onsen first (onsen-first.ts), POST /messages/<message_id>/delivery */
   | { k: 'r'; r: DeliveryReportLine }
 type BlockedReceipt = ({ message_id: string } | { chat: string; client_msg_id: string }) & { retry_after: string | null }
-const SPOOL_KINDS = new Set(['self', 'ir', 'blocked', 'm', 'e', 'l', 'u', 'd', 's', 'a', 'w', 't', 'c', 'r'])
+const SPOOL_KINDS = new Set(['item', 'self', 'ir', 'blocked', 'm', 'e', 'l', 'u', 'd', 's', 'a', 'w', 't', 'c', 'r'])
 /** WO-192 (Onsen 0.31.0, WO-191 B): one delivery report: the Onsen message A wrote, and the body Onsen takes */
 export type DeliveryReportLine = { message_id: number
   body: { client: 'telegram'; state: 'sent' | 'failed'; client_msg_ids: string[]; at: string; error?: string } }
@@ -410,7 +410,7 @@ const headerName = (name: string): string => encodeURIComponent(name.replace(/[\
 /** a spool line's key for a log line: its record's idem_key (a Call state's `idem`; a delivery report's Onsen message), never its content */
 function lineKey(line: unknown): string {
   const l = line as any
-  return String(l?.r?.idem_key ?? l?.r?.idem ?? (l?.r?.message_id != null ? `delivery:${l.r.message_id}` : '?')).slice(0, 200)
+  return String(l?.r?.idem_key ?? l?.r?.idem ?? l?.r?.key ?? (l?.r?.message_id != null ? `delivery:${l.r.message_id}` : '?')).slice(0, 200)
 }
 /** what Onsen said in an error answer ({error: {code, message}}, or older shapes) */
 function callSaid(j: any): string {
@@ -456,8 +456,8 @@ export class OnsenClient {
     }
   }
   hasItemReports(): boolean { return this.itemReports > 0 }
-  recordSelfWrite(write: SelfWrite): void {
-    if (!this.append({ k: 'self', r: write })) throw new Error('could not record the Onsen self Item')
+  recordItemWrite(write: ItemWrite): void {
+    if (!this.append({ k: 'item', r: write })) throw new Error('could not record the Onsen Item')
   }
   recordItemReport(line: ItemReport): boolean {
     if (!this.append({ k: 'ir', r: line })) return false
@@ -957,12 +957,12 @@ export class OnsenClient {
         this.writeCursor(t.end); this.ok(); i++
         continue
       }
-      if (t.line.k === 'self') {
+      if (t.line.k === 'item' || t.line.k === 'self') {
         const path = '/v1/members/' + encodeURIComponent(this.cfg.agent) + '/items'
-        const r = await syncSelfWrite(this.request.bind(this), path, t.line.r).catch(e => ({ status: 0, json: { error: errText(e) } }))
+        const r = await syncItemWrite(this.request.bind(this), path, t.line.r).catch(e => ({ status: 0, json: { error: errText(e) } }))
         if (!r) return
         if (r.status >= 200 && r.status < 300) this.stats.posted++
-        else if (refusedForGood(r)) this.reject(t.line, `self Item: HTTP ${r.status} ${callSaid(r.json)}`, { kind: 'self', path, status: r.status })
+        else if (refusedForGood(r)) this.reject(t.line, `${t.line.r.item.kind} Item: HTTP ${r.status} ${callSaid(r.json)}`, { kind: 'item', path, status: r.status, code: errCode(r.json) })
         else return this.failStatus(r, path)
         this.writeCursor(t.end); this.ok(); i++; continue
       }

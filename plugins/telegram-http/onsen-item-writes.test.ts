@@ -1,10 +1,10 @@
 import { afterEach, expect, test } from 'bun:test'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { appendFileSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { OnsenClient } from './onsen-client.ts'
-import { ownItem } from './onsen-self.ts'
+import { ownItem } from './onsen-item-writes.ts'
 
 let fake: ReturnType<typeof fakeItems>
 afterEach(() => fake?.stop())
@@ -69,21 +69,40 @@ test('self writes survive a disconnected connector and close the same Item on re
   let c = client()
   try {
     fake.down(true)
-    c.recordSelfWrite(write)
+    c.recordItemWrite(write)
     await c.syncNow(true)
     expect(fake.rows.size).toBe(0)
     c.stop()
     fake.down(false)
     c = client()
-    c.recordSelfWrite(write)
+    c.recordItemWrite(write)
     await c.syncNow(true)
     expect(fake.rows.size).toBe(1)
     const row = [...fake.rows.values()][0]!
     expect(row).toMatchObject({ state: 'waiting', from: 'adam', waiter: 'eve' })
-    c.recordSelfWrite({ ...write, complete: true })
-    c.recordSelfWrite({ ...write, complete: true })
+    c.recordItemWrite({ ...write, complete: true })
+    c.recordItemWrite({ ...write, complete: true })
     await c.syncNow(true)
     expect(row.state).toBe('completed')
     expect(fake.calls.filter(call => call.body.outcome === 'completed')).toHaveLength(1)
   } finally { c.stop(); rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('one ordered spool reads legacy self lines, drops a permanent refusal once and continues to resume and keepwarm', async () => {
+  fake = fakeItems()
+  const dir = mkdtempSync(join(tmpdir(), 'item-spool-')), logs: string[] = []
+  const client = new OnsenClient({ dir, agent: 'adam', base: fake.base, record: true, credential: () => 'test-member',
+    log: (_, line) => logs.push(line) })
+  try {
+    const legacy = { key: 'old-self', item: ownItem('self', 'main', 'old', fake.now()) }
+    appendFileSync(client.spool, JSON.stringify({ k: 'self', r: legacy }) + '\n')
+    client.recordItemWrite({ key: 'invalid-waiter', item: ownItem('self', 'main', 'bad', null, 'invalid!') })
+    client.recordItemWrite({ key: 'resume', item: { kind: 'resume', refs: [] } })
+    client.recordItemWrite({ key: 'keepwarm', item: ownItem('keepwarm', 'main', 'keepwarm', null) })
+    await client.syncNow(true); await client.syncNow(true)
+    expect([...fake.rows.values()].map(r => r.kind)).toEqual(['self', 'resume', 'keepwarm'])
+    expect(fake.calls.map(c => c.key)).toEqual(['old-self', 'invalid-waiter', 'resume', 'keepwarm'])
+    expect(logs.filter(l => l.includes('invalid-waiter') && l.includes('HTTP 400'))).toHaveLength(1)
+    expect(client.stats.rejected).toBe(1)
+  } finally { client.stop(); rmSync(dir, { recursive: true, force: true }) }
 })

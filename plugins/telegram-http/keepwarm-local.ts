@@ -22,7 +22,7 @@
 
 import { appendFileSync, closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { ownItem, postOwnItem } from './onsen-self.ts'
+import { ownItem, type ItemWriter } from './onsen-item-writes.ts'
 import type { TakeMode } from './onsen-take.ts'
 import type { InboxItem } from './onsen-items.ts'
 
@@ -213,7 +213,7 @@ export function decideMail(s: KScan | null, st: KState, now: number, n: number, 
 /** This agent's unread mail: on = its mailbox is open; null = the query failed (wake no one). */
 export type MailCount = { on: boolean; n: number; oldestS: number | null } | null
 export interface LocalKeepwarmDeps {
-  take?: TakeMode
+  take?: { mode: TakeMode; write: ItemWriter }
   mode(): 'live' | 'dry' | 'off'
   projectsDir(): string | null
   mail(): Promise<MailCount>
@@ -284,7 +284,7 @@ export class LocalKeepwarm {
   }
 
   /** Reconcile the warm window with waiting Items. A new model action moves the window, including across restarts. */
-  private async schedule(mode: TakeMode, s: KScan | null, st: KState, now: number): Promise<void> {
+  private async schedule({ mode, write }: NonNullable<LocalKeepwarmDeps['take']>, s: KScan | null, st: KState, now: number): Promise<void> {
     if (s?.turn_open) return
     const due = ((s?.last_req ?? 0) + KEEPWARM_AFTER_S) * 1000
     const expires = Math.min((s?.last_req ?? 0) + CACHE_TTL_S, (st.last_real ?? 0) + STOP_AFTER_S) * 1000
@@ -319,8 +319,7 @@ export class LocalKeepwarm {
     if (!wanted || exists || st.poked_for === s!.last_req || !stillIdle()) return
     const item = ownItem('keepwarm', 'main', POKE_TEXT, due)
     item.expires_at = new Date(expires).toISOString()
-    const r = await postOwnItem(mode.req, mode.path, { key: 'keepwarm:main:' + due, item })
-    if (!r || r.status < 200 || r.status >= 300 || !r.json?.data?.id) throw new Error('could not write keepwarm Item')
+    write({ key: 'keepwarm:main:' + due, item })
     st.poked_for = s!.last_req
   }
 
@@ -350,7 +349,7 @@ export class LocalKeepwarm {
         }
       }
       if (this.d.take) {
-        if (this.d.take.active) await this.schedule(this.d.take, s, st, now)
+        if (this.d.take.mode.active) await this.schedule(this.d.take, s, st, now)
         return lines
       }
       const send = async (text: string, why: string, tag: string): Promise<boolean> => {

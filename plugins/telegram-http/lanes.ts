@@ -260,7 +260,7 @@ let D: LanesDeps
 /** lanes-golive (C2): what a lane's send carries besides to / text (the three lines of send_to_agent) */
 import type { InboxItem, ItemRef } from './onsen-items.ts'
 import { resumablePromise, chatWaiter, memberWaiter, projectPromises, promiseTime } from './onsen-promises.ts'
-import { ownItem, type SelfWriter } from './onsen-self.ts'
+import { ownItem, type ItemWriter } from './onsen-item-writes.ts'
 
 export type LaneSendFields = { line: Line; title?: string; ask?: string; because?: string; deadline?: string; touches?: string[]; ref?: string }
 let LANES_DIR = ''
@@ -3517,9 +3517,9 @@ function threadSummary(thread: string): string {
 
 // ================================================================== lane queue + runner
 let itemReceiver: import('./onsen-receive.ts').ItemReceiver | undefined
-let selfWriter: SelfWriter | undefined
+let selfWriter: ItemWriter | undefined
 const activeSelfWriter = () => itemReceiver?.mode.active ? selfWriter : undefined
-export function useItemReceiver(receiver: typeof itemReceiver, writer?: SelfWriter): void {
+export function useItemReceiver(receiver: typeof itemReceiver, writer?: ItemWriter): void {
   itemReceiver = receiver
   selfWriter = writer
 }
@@ -4257,7 +4257,7 @@ function fireFollowup(f: Followup, now: number, item?: ItemRef): void {
   D.log('info', `lanes: follow-up ${f.id} due ${f.due_iso} → ${d.target} ${d.lane ?? ''} (${d.note ?? ''})`)
 }
 
-function submitCheck(f: Followup, writer: SelfWriter): void {
+function submitCheck(f: Followup, writer: ItemWriter): void {
   const event = events.get(f.event)
   const origin: ItemRef | undefined = event?.onsen_items?.[0]
   const waiter = memberWaiter(event?.promised?.at(-1)?.to) ?? origin?.waiter ?? origin?.from ?? S.threads[f.thread]?.peer ?? undefined
