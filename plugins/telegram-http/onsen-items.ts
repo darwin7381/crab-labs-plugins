@@ -15,9 +15,8 @@ export type ItemRef = {
   onsen_item_id: string; onsen_version: number; kind: string; from: string; deadline?: string; main?: true
   note?: string; reason?: string; half_done?: true; conversation?: string; from_kind?: MemberKind | null
 }
-export function itemRef(it: InboxItem): ItemRef {
+export function itemRef(it: InboxItem, kind = it.from_kind): ItemRef {
   const note = it.events?.findLast(e => e.kind === 'reassigned')?.note
-  const kind = it.from_kind
   return { onsen_item_id: it.id, onsen_version: it.version, kind: it.kind, from: it.from,
     ...(it.kind === 'message' ? { from_kind: kind === 'human' || kind === 'guest' || kind === 'agent' || kind === 'system' ? kind : null } : {}),
     ...(it.session_id === 'main' ? { main: true, note } : {}), ...(it.deadline ? { deadline: it.deadline } : {}),

@@ -6,6 +6,7 @@ import { join } from 'path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
+import { mayTakeItem } from './onsen-items.ts'
 import { startBotApiMock } from './test-fixtures/tg-bot-api-mock.ts'
 import { freePort, until } from './test-fixtures/tg-daemon.ts'
 
@@ -152,6 +153,31 @@ test('a missing sender is logged once and the following Joey DM reaches the jour
   expect(d.f.calls.filter(c => c.path === '/v1/members/missing-member')).toHaveLength(0)
 })
 
+test('Items without from_kind resolve once per sender and an unknown sender cannot block Joey', async () => {
+  const d = await daemon()
+  for (const [id, from] of [['a', 'missing-member'], ['b', 'joey'], ['c', 'missing-member'], ['d', 'joey']] as const) {
+    d.f.add(id, 'message', { from, from_kind: undefined })
+  }
+  const refs = () => d.journal().filter(r => r.rec === 'msg' && r.notif && r.onsen_items).map(r => r.onsen_items[0])
+  await waitFor(() => refs().length === 4)
+  expect(refs().map(r => [r.onsen_item_id, r.from_kind])).toEqual([['a', null], ['b', 'human'], ['c', null], ['d', 'human']])
+  expect(refs().map(r => mayTakeItem(r, 'usage_limit'))).toEqual([false, true, false, true])
+  for (const from of ['missing-member', 'joey']) expect(d.f.calls.filter(c => c.path === '/v1/members/' + from)).toHaveLength(1)
+  expect(d.log().split('\n').filter(line => line.includes('unknown member kind for missing-member'))).toHaveLength(1)
+})
+
+test("Joey's DM /stop without from_kind interrupts the session once", async () => {
+  const d = await daemon({ CHANNEL_BOT_TMUX_SESSION: 'test-pane' }, 200, root => {
+    writeFileSync(join(root, 'tmux'), '#!/bin/sh\necho "$*" >> "$TMPDIR/tmux-calls"\n', { mode: 0o700 })
+    return { PATH: root + ':' + process.env.PATH }
+  })
+  const row = d.f.add('/stop', 'message', { from: 'joey', from_kind: undefined })
+  await waitFor(() => row.state === 'completed')
+  expect(d.f.calls.filter(c => c.path === '/v1/members/joey')).toHaveLength(1)
+  expect(readFileSync(join(d.root, 'tmux-calls'), 'utf8').split('\n').filter(l => l.endsWith(' C-c'))).toEqual(['send-keys -t test-pane C-c'])
+  expect(d.journal().filter(r => r.notif?.params?.content === '/stop')).toHaveLength(0)
+})
+
 test('daemon handles a control at dispatch and immediately completes a re-served done id', async () => {
   const d = await daemon({ C1_COMMAND_FAILURE: '1' })
   const cmd = d.f.add('help', 'control', { message_id: 'm-help', payload: { message_id: 'm-help', conversation_id: 'conv', from: 'joey',
@@ -287,7 +313,7 @@ async function runningWorker(chat = '1') {
     }))
     return scriptedLane(root)
   })
-  const person = (id: string, tg: string, from = 'joey') => d.f.add(id, 'message', { message_id: id, from, payload: {
+  const person = (id: string, tg: string, from = 'joey') => d.f.add(id, 'message', { message_id: id, from, from_kind: undefined, payload: {
     message_id: id, from, conversation_id: 'conv', kind: 'text', thread: 555, text: id,
     client: { name: 'telegram', chat, msg_id: tg, user_id: '1', user: from, thread: '555' },
   } })
@@ -304,6 +330,7 @@ async function runningWorker(chat = '1') {
 
 for (const event of ['PostToolUse', 'Stop']) test('the running worker takes a person at its ' + event + ' steer hook', async () => {
   const { d, row, input, hook, reports, takes } = await runningWorker()
+  expect(d.f.calls.filter(c => c.path === '/v1/members/joey')).toHaveLength(1)
   const stub = JSON.parse(readFileSync(input, 'utf8').trim())
   expect(stub).toEqual({ id: 'item-' + row.id + '-v1', run: worker + '.r1', take: true })
   const refused = await fetch(d.base + '/lane-steer', { method: 'POST', body: JSON.stringify({ ids: [stub.id] }) })

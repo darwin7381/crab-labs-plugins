@@ -39,6 +39,28 @@ test('the person: the account\'s Onsen member by its display name, asked once; e
   expect(changed).toBe(3)
 })
 
+test('a failed member lookup is shared with DM titles, warns once and retries after 30 seconds', async () => {
+  const logs: string[] = []
+  let now = 0, calls = 0
+  const m = new MemberNames({ now: () => now, changed: () => {}, log: line => logs.push(line), get: async () => {
+    if (++calls === 1) throw new Error('directory offline')
+    return { status: 200, json: { data: { kind: 'human', display_name: 'Joey' } } }
+  } })
+  expect(m.personOf('1828173984')).toBeNull()
+  expect(await m.kindOf('joey')).toBeNull()
+  m.noteUnknownKind('joey')
+  expect(m.personOf('1828173984')).toBe('joey')
+  now = 29_999
+  expect(await m.kindOf('joey')).toBeNull()
+  expect(logs).toHaveLength(1)
+  expect(logs[0]).toContain('directory offline')
+  expect(calls).toBe(1)
+  now++
+  expect(await m.kindOf('joey')).toBe('human')
+  expect(m.personOf('1828173984')).toBe('Joey')
+  expect(calls).toBe(2)
+})
+
 test('the start retitles the open DM threads once their person is known (refreshDmTitles), the topic\'s name kept; no other thread changes', async () => {
   const d = mkdtempSync(join(tmpdir(), 'lanes-dm-title-'))
   mkdirSync(d, { recursive: true })

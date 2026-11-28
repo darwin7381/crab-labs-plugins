@@ -1182,6 +1182,7 @@ export function modelChoices(): Array<{ label: string; value: string }> {
 }
 const SHARED_TUI_CTRL_KEY: Record<string, string> = {
   '/sigint': 'C-c',
+  '/stop': 'C-c',
   '/cancel': 'C-c',
 }
 
