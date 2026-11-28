@@ -3095,7 +3095,7 @@ if (takeMode || INBOX_ONLY && keepwarmMode() !== 'off') {
     name: takeMode?.member ?? INBOX_SELF,
     stateDir: STATE_DIR,
     take: takeMode && onsen ? { mode: takeMode, write: write => onsen.recordItemWrite(write) } : undefined,
-    mode: () => takeMode?.active ? 'live' : takeMode || onsenPuller?.mode.active ? 'off' : keepwarmMode(),
+    mode: () => takeMode?.canReceive ? 'live' : takeMode || onsenPuller?.mode.active ? 'off' : keepwarmMode(),
     projectsDir: () => (process.env.KEEPWARM_PROJECTS_DIR || '').trim() || TRANSCRIPT_DIR,
     // lanes-golive (C4): with lanes on the main's transcript by its session id (lane transcripts share the dir); lanes off: the newest, as before
     ...(Lanes.LANES_ON ? { transcript: () => Lanes.mainTranscriptFile((process.env.KEEPWARM_PROJECTS_DIR || '').trim() || TRANSCRIPT_DIR) } : {}),

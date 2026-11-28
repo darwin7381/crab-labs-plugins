@@ -27,7 +27,7 @@
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
 import { dirname } from 'path'
-import { MemberDelivery } from './onsen-take.ts'
+import { MemberDelivery, reportedDelivery } from './onsen-take.ts'
 import { stamp } from './lanes-digest.ts'
 
 type Log = (level: 'info' | 'warn' | 'error', msg: string) => void
@@ -260,7 +260,7 @@ export class OnsenPuller {
 
   private pullPaused({ status, json }: NonNullable<Answer>): boolean {
     const before = this.mode.active
-    const observed = this.mode.observe('inbox', status, json?.detail?.code ?? json?.error?.code)
+    const observed = this.mode.observe(reportedDelivery('inbox', status, json?.detail?.code ?? json?.error?.code))
     if (observed === true && !before) this.o.log('info', 'onsen inbox: member is on take; checking again in 60 s')
     if (observed === false && before) this.o.log('info', 'onsen inbox: member is on pull again')
     return observed === true

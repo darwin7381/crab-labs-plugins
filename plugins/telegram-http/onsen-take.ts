@@ -13,24 +13,34 @@ export function takeRefusal(o: { inbox: boolean; roamer: boolean; targetRouting?
   if (!o.observation) return 'ONSEN_OBSERVATION is off'
 }
 
-// The tg daemon observes the connector probe; the inbox daemon observes its own legacy GET.
+type DeliveryObservation = 'take' | 'foreign' | 'pull' | undefined
+
+// Only a member-mode response can switch an established member back to pull.
+export function reportedDelivery(source: 'items' | 'inbox', status?: number, code?: string): DeliveryObservation {
+  if (source === 'inbox') {
+    if (status === 200) return 'pull'
+    if (status === 409 && code === 'take_member') return 'take'
+  } else {
+    if (status === 200) return 'take'
+    if (status === 409 && code === 'not_take_member') return 'pull'
+    if (status === 409 && code === 'not_current_connector') return 'foreign'
+  }
+}
+
 export class MemberDelivery {
   active = false
 
-  observe(source: 'items' | 'inbox', status?: number, code?: string): boolean | undefined {
-    if (source === 'inbox') {
-      if (status !== 200 && !(status === 409 && code === 'take_member')) return
-      return this.active = status === 409
-    }
-    if (!status || status >= 500) return
-    return this.active = status === 200 || (status === 409 && code === 'not_current_connector')
+  observe(observation: DeliveryObservation): boolean | undefined {
+    if (observation === undefined) return
+    return this.active = observation !== 'pull'
   }
 }
 
 /** The connector parameter distinguishes this probe from a normal member inbox read. */
 export async function deliveryMode(req: ActionReq, path: string, connector: string) {
   const r = await req('GET', path + '?' + new URLSearchParams({ limit: '1', connector }), undefined, 5000).catch(() => null)
-  return { status: r?.status, code: r?.json?.error?.code, asOf: Date.parse(r?.json?.as_of) }
+  const observation = reportedDelivery('items', r?.status, r?.json?.error?.code ?? r?.json?.detail?.code)
+  return { take: observation === 'take', observation, status: r?.status, asOf: Date.parse(r?.json?.as_of) }
 }
 
 export type ItemRequest = OnsenClient['request']
@@ -60,9 +70,9 @@ export class TakeMode extends MemberDelivery {
     const mode = await deliveryMode(this.req, this.path, this.connector)
     if (this.stopped) return
     this.checking = false
-    const observed = this.observe('items', mode.status, mode.code)
-    if (mode.status === 409 && mode.code === 'not_current_connector') {
-      this.pause(mode.code, 45_000)
+    const observed = this.observe(mode.observation)
+    if (mode.observation === 'foreign') {
+      this.pause('not_current_connector', 45_000)
       return
     }
     if (observed === undefined && this.active) { this.pause('mode probe unavailable', 60_000); return }

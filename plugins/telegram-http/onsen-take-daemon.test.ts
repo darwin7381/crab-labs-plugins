@@ -1896,7 +1896,7 @@ test('a runtime 409 cannot start due notices; a confirmed pull probe starts them
   await Bun.sleep(1500)
   expect(rings()).toHaveLength(0); expect(notices()).toHaveLength(0)
   await d.restart()
-  await waitFor(() => d.log().includes('mode probe did not return 200') && notices().length > 0)
+  await waitFor(() => d.log().includes('mode probe: HTTP 409') && notices().length > 0)
   expect(rings()).toHaveLength(1); expect(notices()).toHaveLength(1)
 }, 10000)
 

@@ -289,7 +289,7 @@ export class LocalKeepwarm {
   /** A queued withdrawal may drain in a later turn or after another idle window has begun. */
   mayWithdraw(row: InboxItem): boolean {
     const take = this.d.take
-    if (!take?.mode.active || row.kind !== 'keepwarm' || row.from !== take.mode.member || row.session_id !== 'main') return false
+    if (!take?.mode.canReceive || row.kind !== 'keepwarm' || row.from !== take.mode.member || row.session_id !== 'main') return false
     const st = this.state(), { s } = this.transcript(st)
     if (s?.turn_open) return false
     const due = ((s?.last_req ?? 0) + KEEPWARM_AFTER_S) * 1000
@@ -307,7 +307,7 @@ export class LocalKeepwarm {
     const obsolete: InboxItem[] = []
     do {
       const page = await mode.req('GET', mode.path + '?' + q)
-      if (!mode.active) return
+      if (!mode.canReceive) return
       if (page?.status !== 200 || !Array.isArray(page.json?.items)) throw new Error('could not read waiting keepwarm Items')
       for (const row of page.json.items as InboxItem[]) {
         if (row.kind !== 'keepwarm' || row.from !== mode.member || row.session_id !== 'main') continue
@@ -316,10 +316,10 @@ export class LocalKeepwarm {
       }
       if (!page.json.next_cursor) break
       q.set('cursor', page.json.next_cursor)
-    } while (mode.active)
+    } while (mode.canReceive)
     // The transcript can change while the member listing or a withdrawal is in flight.
     const stillIdle = () => {
-      if (!mode.active) return false
+      if (!mode.canReceive) return false
       const current = this.transcript(st).s
       return !current?.turn_open && current?.last_req === s?.last_req
     }
@@ -361,7 +361,7 @@ export class LocalKeepwarm {
         }
       }
       if (this.d.take) {
-        if (this.d.take.mode.active) await this.schedule(this.d.take, s, st, now)
+        if (this.d.take.mode.canReceive) await this.schedule(this.d.take, s, st, now)
         return lines
       }
       const send = async (text: string, why: string, tag: string): Promise<boolean> => {

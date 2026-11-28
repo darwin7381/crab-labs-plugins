@@ -914,8 +914,8 @@ test('switch, prerequisites, stable machine/member and all probe refusals', asyn
   expect(takeRefusal(valid)).toBeUndefined()
   expect(machineName('  --Mac_Mini  ')).toBe('mac-mini')
   const { path, connector, req } = r.mode
-  for (const status of [400, 404, 409]) { r.f.mode(status); expect(await deliveryMode(req, path, connector)).toMatchObject({ status }) }
-  expect((await deliveryMode(async () => { throw Error('offline') }, path, connector)).status).toBeUndefined()
+  for (const status of [400, 404, 409]) { r.f.mode(status); expect(await deliveryMode(req, path, connector)).toMatchObject({ status, take: false }) }
+  expect(await deliveryMode(async () => { throw Error('offline') }, path, connector)).toMatchObject({ status: undefined, take: false })
   r.f.mode(200); await r.mode.probe()
   expect(r.mode.active).toBe(true)
   expect(r.f.calls.every(c => c.query.get('connector') === 'mac-mini/adam' && c.query.get('limit') === '1')).toBe(true)
@@ -1579,7 +1579,12 @@ test('a 409 pause keeps the take gate until the probe confirms pull', async () =
   r.f.down(true); await mode.probe()
   expect(mode.active).toBe(true)
   expect(mode.canReceive).toBe(false)
-  r.f.down(false); await mode.probe()
+  r.f.down(false)
+  for (const status of [401, 403, 404, 429]) {
+    r.f.mode(status); await mode.probe()
+    expect(mode.active).toBe(true); expect(mode.canReceive).toBe(false)
+  }
+  r.f.mode(409); await mode.probe()
   expect(transitions.at(-1)).toEqual([false, false])
   r.f.mode(200); await mode.probe()
   expect(transitions.at(-1)).toEqual([true, true])
