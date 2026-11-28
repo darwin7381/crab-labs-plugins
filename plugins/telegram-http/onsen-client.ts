@@ -912,8 +912,9 @@ export class OnsenClient {
   /** WO-175: a JSON PUT with this agent's credential (a Call's state) */
   private async put(path: string, body: unknown, cred: string, timeoutMs?: number, headers?: Record<string, string>): Promise<{ status: number; json: any }> {
     const r = await this.f(`${this.cfg.base}${path}`, { method: 'PUT', headers: this.headers(cred, headers), body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs ?? this.cfg.postTimeoutMs ?? 15_000) })
+    const raw = await r.text()
     let json: any = null
-    try { json = await r.json() } catch {}
+    try { json = JSON.parse(raw) } catch { if (!r.ok) json = { error: raw } }
     return { status: r.status, json }
   }
   private async post(path: string, body: unknown, cred: string, timeoutMs?: number, headers?: Record<string, string>): Promise<{ status: number; json: any }> {

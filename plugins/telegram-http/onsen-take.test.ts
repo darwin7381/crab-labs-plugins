@@ -1581,6 +1581,17 @@ test('late conflicting report is logged, a permanent 4xx is rejected and the spo
   expect(readFileSync(r.client.rejected, 'utf8').trim().split('\n').map(l => JSON.parse(l).line.r.item_id)).toEqual(['settled', 'missing', 'settled'])
 })
 
+test('a plain-text report refusal keeps the server explanation on one error line', async () => {
+  const r = rig()
+  const client = new OnsenClient({ ...r.client.cfg, fetch: async () => new Response('invalid claim\nfor this item', { status: 422 }) })
+  client.recordItemReport({ item_id: 'gone', body: { claim_id: 'old', outcome: 'cut', at: new Date().toISOString() } })
+  await client.syncNow(true); await client.syncNow(true)
+  const errors = r.logs.filter(s => s.startsWith('[error]'))
+  expect(errors).toHaveLength(1)
+  expect(errors[0]).toMatch(/Item gone cut .*HTTP 422 invalid claim for this item/)
+  expect(errors[0]).not.toContain('\n')
+})
+
 test('a foreign connector pauses all receives for 45 s and keeps the observation latched', async () => {
   const r = rig()
   let retry: (() => void) | undefined, interval = 0
