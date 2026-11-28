@@ -1,7 +1,7 @@
 import type { TakeMode } from './onsen-take.ts'
 
 export type InboxItem = {
-  id: string; number: number; member: string; session_id: string | null; kind: string; from: string
+  id: string; number: number; member: string; session_id: string | null; kind: string; from: string; waiter?: string
   state: string; reason: string | null; version: number; updated_at: string; not_before?: string | null
   deadline?: string | null; half_done?: boolean; relay?: string | null; refs: Array<{ kind: string; value: string }>
   message_id?: string | null; action_id?: string | null; call_id?: string | null; mail_id?: string | null
@@ -12,11 +12,12 @@ export type InboxItem = {
 /** Only references travel in the M1 and lane journals. A waiting reference owns no claim. */
 export type ItemRef = {
   onsen_item_id: string; onsen_version: number; kind: string; from: string; deadline?: string; main?: true
-  note?: string; reason?: string; half_done?: true; conversation?: string
+  note?: string; reason?: string; half_done?: true; conversation?: string; waiter?: string
 }
 export function itemRef(it: InboxItem): ItemRef {
   const note = it.events?.findLast(e => e.kind === 'reassigned')?.note
   return { onsen_item_id: it.id, onsen_version: it.version, kind: it.kind, from: it.from,
+    ...(it.waiter ? { waiter: it.waiter } : {}),
     ...(it.session_id === 'main' ? { main: true, note } : {}), ...(it.deadline ? { deadline: it.deadline } : {}),
     ...(it.reason ? { reason: it.reason } : {}), ...(it.half_done ? { half_done: true } : {}),
     ...(it.payload.conversation_id != null ? { conversation: String(it.payload.conversation_id) } : {}) }

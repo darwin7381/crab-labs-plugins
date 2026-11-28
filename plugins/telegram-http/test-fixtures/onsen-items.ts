@@ -4,7 +4,7 @@ import type { ItemReport, Outcome } from '../onsen-receive.ts'
 const intermediate = new Set<Outcome>(['in_session', 'background', 'owed', 'stuck'])
 const failures = new Set<Outcome>(['cut', 'cut_person', 'not_taken', 'error', 'stuck'])
 type Row = InboxItem & { failures: number; released: boolean; expires_at: string | null; in_session_at: string | null
-  response_message_ids: string[]; answered: boolean | null; waiter?: string; created_at?: string; completed_at?: string | null; cancelled_at?: string | null }
+  response_message_ids: string[]; answered: boolean | null; about_item_id?: string; created_at?: string; completed_at?: string | null; cancelled_at?: string | null }
 const iso = (ms: number) => new Date(ms).toISOString()
 const memberName = /^[a-z0-9][a-z0-9_.-]{0,63}$/
 const refKinds = new Set('ticket schedule run incident alert op mail call message form telegram item'.split(' '))
@@ -23,6 +23,7 @@ export function fakeItems() {
   let now = Date.now(), seq = 0, claimSeq = 0, owner = '', seen = 0
   const rows = new Map<string, Row>(), writes = new Map<string, Response>(), terminal = new Map<string, string>()
   const creates = new Map<string, { body: unknown; id: string }>()
+  const overdue = new Set<string>()
   const givenByPull = new Set<Row>()
   let pullAcked = 0
   const calls: Array<{ path: string; query: URLSearchParams; body: any; key: string | null }> = []
@@ -122,7 +123,7 @@ export function fakeItems() {
     if (path === base && req.method === 'GET') {
       const after = q.get('changed_after')
       const since = after === null ? -Infinity : Date.parse(after)
-      const select = () => [...rows.values()].filter(r => r.state === (q.get('state') ?? 'waiting') && Date.parse(r.updated_at) >= since)
+      const select = () => [...rows.values()].filter(r => r.member === 'adam' && r.state === (q.get('state') ?? 'waiting') && Date.parse(r.updated_at) >= since)
       const wait = Number(q.get('wait'))
       const until = Date.now() + wait * 1000
       while (!select().length && Date.now() < until && !req.signal.aborted) await new Promise<void>(resolve => {
@@ -141,7 +142,7 @@ export function fakeItems() {
     let answer: Response
     if (path === base + '/take' && req.method === 'POST') {
       if (!b.connector || b.wait !== 0 || !Array.isArray(b.item_ids) || b.limit !== b.item_ids.length || b.limit > 100 || b.session_id !== undefined) return error(400, 'invalid_request')
-      const asked: Row[] = b.item_ids.map((id: string) => rows.get(id)).filter(eligible)
+      const asked: Row[] = b.item_ids.map((id: string) => rows.get(id)).filter(eligible).filter((r: Row) => r.member === 'adam')
       const given = asked.filter(r => r.reason !== 'cut_person' || asked.some(o => o !== r && o.from === r.from && o.kind === 'message' && o.reason !== 'cut_person'))
       const claim_id = given.length ? 'claim-' + ++claimSeq : null
       for (const row of given) {
@@ -149,7 +150,7 @@ export function fakeItems() {
         issued.add(row.id + '/' + claim_id)
         change(row, 'taken')
       }
-      const waiting = [...rows.values()].filter(r => r.state === 'waiting')
+      const waiting = [...rows.values()].filter(r => r.member === 'adam' && r.state === 'waiting')
       answer = detail({ claim_id, items: given, waiting: waiting.length, next_not_before: waiting.map(r => r.not_before).filter(Boolean).sort()[0] ?? null })
     } else if (path === '/v1/members/adam/observation' && req.method === 'PUT') {
       if (!Array.isArray(b.held_item_ids)) return error(400, 'invalid_request')
@@ -191,6 +192,14 @@ export function fakeItems() {
     return answer
   } })
   return { base: 'http://127.0.0.1:' + server.port, rows, calls, history, add, change, now: () => now,
-    advance(ms: number) { now += ms; expire() }, mode(status: number) { mode = status }, down(on: boolean) { unavailable = on },
+    advance(ms: number) {
+      now += ms; expire()
+      for (const row of rows.values()) {
+        if (row.kind !== 'self' || !row.deadline || Date.parse(row.deadline) >= now || overdue.has(row.id)
+          || (row.state !== 'waiting' && row.state !== 'claimed')) continue
+        overdue.add(row.id)
+        add(crypto.randomUUID(), 'notice', { member: row.waiter ?? row.from, from: 'system', about_item_id: row.id, reason: 'promise_due' })
+      }
+    }, mode(status: number) { mode = status }, down(on: boolean) { unavailable = on },
     holdReports(on: boolean) { holdReports = on }, delayTake(ms: number) { delayTake = ms }, stop() { for (const wake of waiters) wake(); return server.stop(true) } }
 }

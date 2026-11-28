@@ -259,6 +259,8 @@ export type MainPicker = {
 let D: LanesDeps
 /** lanes-golive (C2): what a lane's send carries besides to / text (the three lines of send_to_agent) */
 import type { ItemRef } from './onsen-items.ts'
+import { chatWaiter, projectPromises, promiseTime } from './onsen-promises.ts'
+import type { SelfWriter } from './onsen-self.ts'
 
 export type LaneSendFields = { line: Line; title?: string; ask?: string; because?: string; deadline?: string; touches?: string[]; ref?: string }
 let LANES_DIR = ''
@@ -312,7 +314,10 @@ export function lanesInit(deps: LanesDeps): void {
     journal.observeLines(l => { if (wakeTap && l.rec === 'wake') tapWake(l) })   // WO-147: the hand-over decisions' wake lines (read only; nothing without a tap)
     main = createMain(mainEnv())
     main.initMain()
-    events = createEvents(journal, writeOpenHandoffs)
+    events = createEvents(journal, writeOpenHandoffs, (id, obs, refs) => {
+      const writer = activeSelfWriter()
+      if (writer) projectPromises(id, obs, writer, refs)
+    })
     restoreReceipts()                               // 1.41.1 (Metis mail #11280): a receipt recorded met on a scheduler refusal is owed again
     writeOpenHandoffs()
     writeLaneSettings()
@@ -3512,7 +3517,12 @@ function threadSummary(thread: string): string {
 
 // ================================================================== lane queue + runner
 let itemReceiver: import('./onsen-receive.ts').ItemReceiver | undefined
-export function useItemReceiver(receiver: typeof itemReceiver): void { itemReceiver = receiver }
+let selfWriter: SelfWriter | undefined
+const activeSelfWriter = () => itemReceiver?.mode.active ? selfWriter : undefined
+export function useItemReceiver(receiver: typeof itemReceiver, writer?: SelfWriter): void {
+  itemReceiver = receiver
+  selfWriter = writer
+}
 export function offerMissed(id: string): void { main.offerMissed(id) }
 let onGateOpen: (() => void) | undefined
 export function observeItemGates(open?: () => void): void { onGateOpen = open }
@@ -5813,7 +5823,9 @@ export function mainReplied(t: MainTier | null, messageId: number | string | nul
   if (messageId != null && text?.trim() && (chat == null || !D.joeyChatId || String(chat) === String(D.joeyChatId()))) S.main_reply = { text: clip(text.trim(), 300), at: nowIso() }
   const x = replyTargets(replyTo, chat)
   // 002w (F, gap 16): what the main tells Joey it will do goes through the one promise check, onto the event the line is about
-  if (messageId != null && text?.trim()) void promiseCheck({ who: 'main', to: 'joey', text, ev: (x?.events[0] ?? x?.turn.events[0])?.id, thread: null, ref: messageId })
+  const about = x?.events[0] ?? x?.turn.events[0]
+  const to = activeSelfWriter() ? chatWaiter(chat ?? D.joeyChatId?.(), about?.onsen_items?.[0]) : 'joey'
+  if (messageId != null && text?.trim() && to) void promiseCheck({ who: 'main', to, text, ev: (about ?? x?.turn.events[0])?.id, thread: null, ref: messageId })
   for (const e of x?.events ?? []) {
     if (messageId == null) continue
     for (const o of (e.obligations ?? []) as Ob[]) {
@@ -6024,6 +6036,7 @@ export function dueTick(now = Date.now()): void {
   try { batchTick(now) } catch (e) { D.log('warn', `lanes: batch wake sweep: ${e}`) }   // WO-137 甲: the batch wake of cards that can wait
   const down = noteMainDown(now)                                         // WO-201 (point 5)
   for (const { e, o } of events.due(now)) {
+    if (o.self || (activeSelfWriter() && o.level === 'answer' && e.onsen_items?.length)) continue
     if (o.kind === 'main') {                                             // 1.38.2: the main is on it (mainOnIt): no push now
       const why = mainOnIt(e, o)
       if (why) { if (!heldDue.has(o.id)) { heldDue.add(o.id); if (heldDue.size > 1000) heldDue.clear(); logos('lane.handoff_due_held', { event: e.id, handoff: o.handoff ?? o.id, why }) } continue }
@@ -6157,13 +6170,26 @@ const byJoeyRun = (tok: RunTok): boolean => {
  *  it, to whom and on which conversation, on the event of that conversation. 002w wrote the main's promise to Eve on the turn's event (Joey's message, no
  *  thread) as a bare text: nothing could find it by the conversation it belongs to, and the digest called it the lane's. */
 export type Promise_ = { text: string; by: string; to: string | null; thread: string | null; at: string; ref?: string }
-function recordPromise(evId: string, p: { by: string; to?: string | null; text: string; thread?: string | null; ref?: unknown }): void {
+function recordPromise(evId: string, p: { by: string; to?: string | null; text: string; thread?: string | null; ref?: unknown; at?: number }): void {
+  if (activeSelfWriter()) {
+    const e = events.get(evId)
+    const recipient = p.to || e?.onsen_items?.[0]?.waiter || e?.onsen_items?.[0]?.from || S.threads[p.thread ?? '']?.peer
+    if (recipient) {
+      const to = String(recipient).toLowerCase(), due = promiseTime(p.text, p.at ?? Date.now())
+      const key = JSON.stringify([p.by, to, p.ref ?? evId, p.text])
+      const id = 'cm-' + createHash('sha256').update(key).digest('hex').slice(0, 24)
+      events.open(id, { class: to === 'joey' ? 'joey' : 'peer', owner: p.by, thread: p.thread, text: p.text,
+        fields: { onsen_items: e?.onsen_items }, obligations: [{ kind: to === 'joey' ? 'joey' : 'peer', level: 'commitment',
+          owner: p.by, by: 'promise-check', to, what: p.text, ...(due != null ? { due_at: due } : {}) }] })
+    }
+  }
   events.push(evId, 'promised', { text: p.text.slice(0, 500), by: p.by, to: p.to ? String(p.to).toLowerCase() : null, thread: p.thread ?? events.get(evId)?.thread ?? null,
     at: nowIso(), ...(p.ref != null ? { ref: String(p.ref) } : {}) } as Promise_)
 }
 /** an entry of `promised` as its record (journals before 002x hold bare texts: the lane's, on the event's own thread) */
 export const promiseOf = (x: unknown, e?: Row): Promise_ => typeof x === 'string' ? { text: x, by: String(e?.lane ?? e?.owner ?? 'lane'), to: null, thread: (e?.thread as string) ?? null, at: '' } : x as Promise_
 export async function promiseCheck(o: { who: string; to: string; text: string; ev?: string; thread: string | null; ref?: unknown; tok?: RunTok; relay?: boolean; thread_from?: string; detail?: string }): Promise<'written' | 'no' | 'error' | 'off' | 'dup'> {
+  const saidAt = Date.now()
   const to = String(o.to ?? '').toLowerCase(), byMain = o.who === 'main'
   if (o.tok && (o.tok.commitments ?? 0) > 0) return 'dup'
   let ask: { p?: number; deadline?: number; error?: string; ms?: number } | null = null
@@ -6201,7 +6227,7 @@ export async function promiseCheck(o: { who: string; to: string; text: string; e
   // (a thread the send named, quoted, or kept a promise on; the peer's newest live thread is a guess, peerThread's `peer-thread`, and is not used: 002l D4)
   const conv = o.thread && o.thread_from !== 'peer-thread' && o.thread_from !== 'none' ? o.thread : null
   const pev = (byMain && conv ? threadEvent(S.threads[conv])?.id : undefined) ?? o.ev
-  if (pev) recordPromise(pev, { by: o.who, to, text: commitmentText(cm), thread: byMain ? conv : o.thread, ref: o.ref })
+  if (pev || activeSelfWriter()) recordPromise(pev ?? '', { by: o.who, to, text: commitmentText(cm), thread: byMain ? conv : o.thread, ref: o.ref, at: saidAt })
   else if (byMain) events.open(`cm-${shortId()}`, { class: to === 'joey' ? 'joey' : 'peer', owner: 'main', thread: o.thread, text: cm.what,
     obligations: [{ kind: to === 'joey' ? 'joey' : 'peer', level: 'commitment', owner: 'main', to, what: cm.what, by: 'promise-check' }] })
   ledger({ lane: byMain ? 'main' : o.who, thread: o.thread, event: o.ev ?? (byMain ? `main-send-${o.ref}` : undefined), kind: 'commitment', text: commitmentText(cm),
@@ -6465,7 +6491,8 @@ async function sendLine(tok: RunTok, lane: Lane, h: HeldLine): Promise<string> {
   note({ message_id: id, delivered: id != null || said, ...(said ? { onsen_first: 'telegram-pending' } : {}) })
   if (id == null && !said) throw new Error(`send failed: Joey did not get it; the ${decision ? 'question' : 'line'} is still owed (${decision ? 'ask' : 'send it'} again)`)
   tok.reported = true; if (decision) tok.askedJoey = true                   // WO-148 (item 2): what a held refusal waits for (stepsHeld's report step, owner_claim's ask)
-  void promiseCheck({ who: lane.id, to: 'joey', text, ev: evId, thread: lane.thread, ref: said ? 'onsen' : id, tok, detail: lane.transcript })   // 002w (F, gap 16): what a lane tells Joey it will do
+  const recipient = activeSelfWriter() ? chatWaiter(D.joeyChatId?.(), events.get(evId)?.onsen_items?.[0]) : 'joey'
+  if (recipient) void promiseCheck({ who: lane.id, to: recipient, text, ev: evId, thread: lane.thread, ref: said ? 'onsen' : id, tok, detail: lane.transcript })
   if (r.tier === 'push') S.pushes[lane.thread] = [...(S.pushes[lane.thread] ?? []).filter(t => Date.now() - t < 3600_000), Date.now()]
   saveState()
   logos('lane.notify', { ...rec, tier: r.tier, tier_rule: r.rule, message_id: id, ...(said ? { onsen_first: 'telegram-pending' } : {}) })
@@ -8046,7 +8073,7 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
       const chk = checkCommitmentArgs(a)
       if (!chk.ok) return `commitment refused: ${chk.error}`
       const dueRaw = String(a.due ?? '').trim()
-      const dueMs = dueRaw ? parseLocal(dueRaw) : null
+      const dueMs = dueRaw ? parseLocal(dueRaw) : activeSelfWriter() ? promiseTime(chk.c.by, Date.now()) : null
       if (dueRaw && (dueMs == null || Number.isNaN(dueMs))) return `commitment refused: due must be an ISO time such as 2026-11-15T10:00:00+08:00 (without a zone it is the lab's local time); got "${dueRaw.slice(0, 40)}". Nothing was recorded.`
       if (dueMs != null && !a.by) chk.c.by = `${simTime(dueMs)} 前`
       const where = peerThread(chk.c.who)
@@ -8056,7 +8083,8 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
         obligations: [{ kind: /^joey$/i.test(chk.c.who) ? 'joey' : 'peer', level: 'commitment', owner: 'main', to: chk.c.who, what: chk.c.what, ...(dueMs != null ? { due_at: dueMs } : {}) }] })
       ledger({ lane: 'main', thread: where.thread, kind: 'commitment', text: commitmentText(chk.c),
         refs: { ...chk.c, id, from: 'main-tool', thread_from: where.from, ...(dueMs != null ? { due: new Date(dueMs).toISOString() } : {}) } })
-      return `ledger: commitment recorded (id ${id}; ${chk.c.who}: ${chk.c.what}; by ${chk.c.by})${dueMs != null ? `. Joey is rung once if it is past ${new Date(dueMs).toISOString()} and not marked done: mark it with commitment_done(${id}).` : ''}`
+      const waiter = activeSelfWriter() ? chk.c.who : 'Joey'
+      return `ledger: commitment recorded (id ${id}; ${chk.c.who}: ${chk.c.what}; by ${chk.c.by})${dueMs != null ? `. ${waiter} is rung once if it is past ${new Date(dueMs).toISOString()} and not marked done: mark it with commitment_done(${id}).` : ''}`
     }
     case 'commitment_done': {                                  // 002k (G10)
       const id = String(a.commitment_id ?? '').trim()
