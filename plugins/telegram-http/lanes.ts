@@ -212,7 +212,6 @@ export interface LanesDeps {
   schedulerCall?: (runId: string, action: 'ack' | 'complete', outcome?: string, note?: string) => Promise<string>
   /** inbox role, WO-205 (Chiron mesh-13475): M2's registry disagreement as a BTCC page alert (POST /api/fleet/main-registry, this daemon's mesh credential) */
   inboundLog?: (body: Record<string, unknown>) => Promise<number | undefined>
-  schedulerTaken?: (runId?: string) => void
   registryAlert?: (a: { state: 'open' | 'clear'; session?: string; pid?: number; why?: string }) => Promise<string>
   /** inbox role, WO-128 (item 4): the cards that wait on the main's decision (BTCC /due over its longest window, the past due included), for the context the
    *  main gets back after a /clear, a compaction or a restart */
@@ -503,7 +502,7 @@ export const __setAckHook = (f: ((runId: string) => void) | null): void => { __a
 function mainTookItems(items: Row[]): void {
   cardsTold(items.filter(r => r.kind !== 'digest'))                               // WO-137 甲 (item 2): a digest taken in with these items (pulled, or bound to a turn)
   // WO-175: with the Call moments on, a run bound into the main's turn is its Call's `running` (the tap): BTCC reads that as the start receipt
-  if (onsenTap?.calls) return
+  if (onsenTap?.calls || itemReceiver?.mode.active) return
   for (const it of items) {
     const e = it.event ? events?.get(String(it.event)) : undefined
     for (const o of ((e?.obligations ?? []) as Ob[])) if (o.kind === 'receipt' && o.run_id && !ackedRuns.has(String(o.run_id))) {
@@ -8701,10 +8700,6 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
     if (D.inboundLog && p === '/lanes/inbound-log' && req.method === 'POST') {
       const body = await readBody(req)
       sendJson(res, 200, { id: await D.inboundLog?.(body) }); return true
-    }
-    if (D.schedulerTaken && p === '/lanes/scheduler-taken' && req.method === 'POST') {
-      D.schedulerTaken?.((await readBody(req)).run_id)
-      sendJson(res, 200, { ok: true }); return true
     }
     if (p === '/lanes/registry-alert' && req.method === 'POST') {       // WO-205: M2's registry disagreement → BTCC (this daemon's credential)
       const b = await readBody(req)

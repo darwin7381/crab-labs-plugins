@@ -2048,7 +2048,7 @@ function fleetRunId(notif: { method: string; params: unknown }): string | undefi
   return typeof p.content === 'string' ? p.content.match(/^\[scheduled\]\[[^\]]*\]\[run:(\d+)\]/)?.[1] : undefined
 }
 function maybeAutoAckScheduled(runId: string | undefined): void {
-  if (!INBOX_ONLY) return
+  if (!INBOX_ONLY || onsenPuller?.pausedForTake) return
   try {
     if (!runId || !/^\d+$/.test(runId)) return
     const rid = runId
@@ -2353,10 +2353,7 @@ async function laneDeliverMesh(n: { method: string; params: unknown }, verified?
   // a router failure inside the tg daemon is the main's there (002w D: /lanes/route answers target main); null = the tg daemon itself could not be
   // reached: there is no M1 to queue into, the fleet path (any open session of this agent) is what is left
   if (!d) { if (fallback) broadcastNotification(n) }
-  else if (d.target === 'lane' && !CALL_STATE) {
-    if (facts.onsen_items && ev.meta?.run_id) await Lanes.inboxPost('/lanes/scheduler-taken', { run_id: ev.meta.run_id })
-    else maybeAutoAckScheduled(ev.meta?.run_id)
-  }    // 開工回執: a lane took the scheduled run (WO-175: the Call's running, when on)
+  else if (d.target === 'lane' && !CALL_STATE) maybeAutoAckScheduled(ev.meta?.run_id)
   return d
 }
 
@@ -4265,7 +4262,7 @@ if (Lanes.LANES_ON) {
       },
       // WO-205 (Chiron mesh-13475): M2's registry disagreement (the tg daemon relays it here) as a BTCC page alert to the connector's maintainer;
       // BTCC names the agent from this daemon's mesh credential
-      ...(ONSEN_TAKE_ON ? { inboundLog: logPeerArrival, schedulerTaken: maybeAutoAckScheduled } : {}),
+      ...(ONSEN_TAKE_ON ? { inboundLog: logPeerArrival } : {}),
       registryAlert: async a => {
         if (!BTCC_API_BASE) return 'BTCC_API_BASE not set'
         const machine = machineName()

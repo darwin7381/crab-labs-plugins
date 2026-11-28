@@ -463,6 +463,25 @@ for (const take of [false, true]) test('C2 message, wall and wake reports on ' +
   }
 }, 12000)
 
+for (const take of [false, true]) test('C2 inbox scheduler start receipt on ' + (take ? 'take' : 'pull'), async () => {
+  const requests: string[] = []
+  const local = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(req) {
+    await req.text()
+    const path = new URL(req.url).pathname
+    requests.push(path)
+    return Response.json(path === '/lanes/route' ? { target: 'lane', rule: 'mesh-scheduled' } : { ok: true })
+  } })
+  clean.push(() => local.stop(true))
+  const d = await daemon({ CHANNEL_INBOX_ONLY: '1', AGENT_INBOX_SELF: 'adam', ONSEN_PULL: 'adam', ONSEN_CALL_STATE: '0',
+    LANES_TG_PORT: String(local.port), BTCC_API_BASE: 'http://127.0.0.1:' + local.port }, take ? 200 : 409)
+  await waitFor(() => d.log().includes(take ? 'member is on take' : 'first start of the pull'))
+  await daemonPost(d.base, '/inject', { from: 'scheduler', text: '[scheduled][c2][run:761] check', run_id: '761' })
+  expect(requests).toContain('/lanes/route')
+  const acks = () => requests.filter(p => p === '/api/scheduler/runs/761/ack')
+  if (!take) await waitFor(() => acks().length > 0)
+  expect(acks()).toHaveLength(take ? 0 : 1)
+})
+
 test('closing a queued mail lane releases the same waiting version to the next peek without a claim or handoff', async () => {
   const d = await daemon({ LANES_MAX: '1' }, 200, scriptedLane)
   const busy = d.f.add('busy', 'alert', { from: 'alert-dispatcher', payload: { text: '[P2] occupy slot', line: 'call' } })
