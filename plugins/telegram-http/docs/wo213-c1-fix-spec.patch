@@ -1,0 +1,7 @@
+--- a/C1-fix-spec.md
++++ b/C1-fix-spec.md
+@@ -113,3 +113,3 @@
+ - **Invariant script** (C1-spec §6 case 4): after every step of a busy, idle and walled sequence, check that no row is claimed unless a session holds it.
+-- **Lease expiry:** stop the observation for 45 s; the claim expires and the row goes back to waiting; the daemon then neither reports into a dead claim nor double-delivers.
++- **Lease expiry:** stop observations for 45 s and verify the row returns to `waiting` with reason `cut` and no current claim. The daemon delivers the row to the session exactly once in total and makes no further take of that row. When the still-running main finishes, it sends exactly one terminal report, `completed`, on the original `claim_id`. The fake accepts the late report under contract §4b and the row ends `completed`.
+ - **Acks after the switch** (44): item 4.

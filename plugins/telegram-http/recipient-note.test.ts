@@ -2,7 +2,7 @@
 //   7  after the original sentence of a send_to_agent call / mail (and a lane's reply_agent) the recipient's state as Onsen's /send answers it (0.12.2:
 //      results[].recipient {state, reporting, reported_s_ago, walled_until?, waiting_for?}): one sentence for a wall, an offline main, a main on a menu,
 //      a daemon that stopped reporting; nothing for any other state (idle, busy, stuck, none)
-//   8  the lane card's reply_agent line: after 「回一則呼叫時帶 reply_to＝它的 btcc_msg_id，不用 because，自動不用回」 the sentence on when to answer
+//   8  the lane card opens with when to answer. The connector fills the reference to the incoming call.
 // (the daemon end to end: onsen-pull-daemon.test.ts (g))
 import { test, expect } from 'bun:test'
 import { mkdtempSync } from 'fs'
@@ -38,11 +38,12 @@ test('point 7: every other state adds nothing (idle, busy, stuck, reporting unkn
     expect(recipientNote('eve', r)).toBe('')
 })
 // WO-177 (六, last point; Chiron 02:22Z): 「要不要送」 moved to the head of the reply_agent line, for all three lines; the call parenthesis lost its half-sentence
-test('point 8 (WO-177): the lane card\'s reply_agent line opens with 「先判要不要送」 (Chiron 02:22Z, verbatim); the call parenthesis ends at 「自動不用回。」', () => {
+test('point 8 (WO-177): the lane card\'s reply_agent line opens with 「先判要不要送」 (Chiron 02:22Z, verbatim); reply attribution belongs to the connector', () => {
   for (const kind of ['reflex', 'mail', 'worker', 'fork'] as const) {
     const card = L.identityCard({ kind })
     expect(card).toContain('  - reply_agent(line, to, text, …)：找別的 agent。**先判要不要送**。只有三種情況才送：有結果要交給它、你做不了、要它補東西。對方標了不用回（no_reply），或來件只是知會、測試，而你沒有要交給它的東西，就不送：「收到」「已讀」「依指示未處理」都不是一則要送的內容，它會被叫醒一個回合卻沒有東西可用。這一趟做了什麼，寫在 receipt 和給 Joey 的那一句裡。要送的時候，再判走哪一條線：三條線的規則跟艦隊的 send_to_agent 一樣，先判「要不要它動手、回答或決定？等一小時會不會壞？」。不需要誰動＝line=feed')
-    expect(card).toContain('回一則呼叫時帶 reply_to＝它的 btcc_msg_id，不用 because，自動不用回。）。呼叫會自動帶 thread 與 hop。')
+    expect(card).toContain('line=call（填 to、because、text）。呼叫會自動帶 thread 與 hop。')
+    expect(card).not.toContain('回一則呼叫時帶 reply_to')
     expect(card).not.toContain('只在有結果、做不了、或要對方補東西時回')                    // one place keeps the rule
     expect(card.split('先判要不要送').length).toBe(2)
   }

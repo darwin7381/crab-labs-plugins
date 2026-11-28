@@ -3,6 +3,8 @@
 // The lane process is a script; the mesh send is a stand-in. No network, no model.
 import { test, expect, afterAll } from 'bun:test'
 import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, chmodSync } from 'fs'
+import { ItemPeek, itemRef, type InboxItem } from './onsen-items.ts'
+import { TakeMode } from './onsen-take.ts'
 import { tmpdir } from 'os'
 import { join } from 'path'
 const L = await import('./lanes.ts?h14-test') as typeof import('./lanes.ts')
@@ -27,7 +29,7 @@ const restore = L.__setClaudeBin(bin)
 afterAll(() => { L.__setClaudeBin(restore); for (const k of ['LANES_PEER_NEW_PER_MIN', 'LANES_PEER_MAX_OPEN', 'LANES_PEER_BUDGET', 'LANES_FLOOD_REPLY_WINDOW_S']) delete process.env[k] })
 const sent: Array<{ text: string; silent: boolean }> = [], mesh: any[] = []
 L.__setMeshSend(async b => { mesh.push(b); return { text: 'sent', msgId: 90000 + mesh.length, delivered: true } })
-L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, httpPort: 0, log: () => {}, deliverToMain: () => {}, authOk: () => false, registryNames: () => ['eve', 'cain', 'dan', 'fay', 'gus'],
+L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, httpPort: 0, log: () => {}, deliverToMain: () => {}, authOk: () => false, registryNames: () => ['eve', 'cain', 'dan', 'fay', 'gus', 'item-peer'],
   sendBot: async (_c: string, text: string, o: any) => { sent.push({ text, silent: !!o?.silent }); return 9500 + sent.length }, joeyChatId: () => '1' } as any)
 L.__setMainConnected('mcp-main')
 const st = L.__lanesState()
@@ -189,6 +191,34 @@ test('H14: Joey\'s /lanes hold <peer> [minutes] and /lanes release <peer>', asyn
   expect(st.holds!.gus.until!).toBeGreaterThan(Date.now() + 14 * 60_000)
   expect(await L.lanesCommand('/lanes release gus', 'joey')).toContain('已解除')
   expect(await L.lanesCommand('/lanes nonsense', 'joey')).toContain('/lanes hold')
+})
+
+test('ending an Item flood performs a full peek and emits one end summary for its counted rows', async () => {
+  const peer = 'item-peer'
+  process.env.LANES_PEER_NEW_PER_MIN = '1'
+  const items = [1, 2, 3].map(n => ({ id: String(n), number: n, version: 1, kind: 'call', from: peer, payload: {} } as InboxItem))
+  const urls: string[] = [], admitted = new Map<string, number>()
+  const mode = new TakeMode('adam', async (_method, path) => {
+    urls.push(path)
+    return { status: 200, json: { items, changed_after: new Date().toISOString(), next_cursor: null } }
+  }, () => {}, () => {})
+  mode.active = true
+  const peek = new ItemPeek(mode, () => admitted, async row => {
+    const d = await L.routeEvent(ev(row.id, peer, 'question', { onsen_items: [itemRef(row)] }))
+    if (d.target !== 'ledger') admitted.set(row.id, row.version)
+  }, () => true)
+  L.observeItemGates(() => peek.reset())
+  try {
+    await peek.poll()
+    expect(st.flood![peer].episode?.count).toBe(2)
+    L.floodTick(Date.now() + 600_000)
+    expect(await until(() => admitted.size === items.length)).toBe(true)
+    expect(urls.filter(path => !path.includes('changed_after'))).toHaveLength(2)
+    L.floodTick(Date.now() + 700_000)
+    expect(sent.filter(s => s.text.includes('〔流量管制結束〕' + peer))).toHaveLength(1)
+  } finally {
+    mode.stop(); peek.stop(); L.observeItemGates(); delete process.env.LANES_PEER_NEW_PER_MIN
+  }
 })
 
 test('H14: LANES_FLOOD_CONTROL=0 switches the admission limits off; a hold still holds', async () => {

@@ -20,9 +20,11 @@ const CUT_NOTE = `標題超過 ${TITLE_MAX} 字，已截短，完整標題在內
 
 export type BtccCall = (method: 'GET' | 'POST', path: string, body?: unknown) => Promise<{ status: number; json: any }>
 export type CoreCall = (method: 'GET' | 'POST', path: string, body?: unknown, timeoutMs?: number) => Promise<{ status: number; json: any }>
-export type CallFn = (to: string, text: string, replyTo?: number, noReply?: boolean, op?: string) => Promise<string>
+export type CallFn = (to: string, text: string, replyTo?: number, noReply?: boolean, op?: string, call?: string) => Promise<string>
+export type CallReply = { reply_to: string; call: string }
 export interface FleetDeps {
   call: CallFn; btcc: BtccCall; core: CoreCall
+  callReply?: (to: string, replyTo: unknown) => Promise<CallReply | null>
   /** WO-124: who opens mail through these tools. 'lane' = the agent's mail lane (lanes mode): its open is 車道讀過, not 主線已讀 */
   openBy?: 'lane'
   /** WO-126: the lane (lane.id) calling, when openBy is 'lane': a lane item or a card names it */
@@ -256,7 +258,7 @@ function intId(v: unknown): number | null {
 /** WO-175 item 2 (Chiron 10:27Z): a call's reply_to names what it answers in any of the three forms an agent sees: a BTCC number, an event id (mesh-…),
  *  a delivery's did (m-…). Each is a reply alike: no `because`, marked no_reply; the router finds the Call from it (lanes.ts callAnswered) */
 export function isReplyRef(v: unknown): boolean {
-  return intId(v) != null || /^(mesh|m)-[A-Za-z0-9_-]{1,80}$/.test(String(v ?? '').trim())
+  return intId(v) != null || /^(mesh|m|item)-[A-Za-z0-9_-]{1,80}$/.test(String(v ?? '').trim())
 }
 
 function errText(r: { status: number; json: any }): string {
@@ -328,17 +330,21 @@ export function takeAfterSend(responses: any[]): AfterSend[] {
 
 /** a call's answer that is not an error: delivered, or (WO-158) queued in the recipient's Onsen inbox while its daemon is not polling (server.ts sendToAgent) */
 const SENT_RE = /^(delivered|queued in )/
+async function sendCall(args: Record<string, unknown>, deps: FleetDeps) {
+  const to = String(args.to ?? '').trim(), message = String(args.text ?? '').trim()
+  const match = to ? await deps.callReply?.(to, args.reply_to) : null
+  const ref = has(args.reply_to) ? args.reply_to : match?.reply_to
+  const answers = !!match || isReplyRef(ref)
+  if (args.line === 'call' && !has(args.because) && !answers) return text(BECAUSE_MISSING, true)
+  if (!to || !message) return text(args.line === 'call' ? 'line=call 要填 to、because、text。' : 'call: to 和 text 都要填', true)
+  const body = args.line === 'call' && has(args.because) ? `因為：${String(args.because).trim()}\n${message}` : message
+  const r = await deps.call(to, body, intId(ref) ?? undefined, answers || (args.line !== 'call' && args.no_reply === true), args.op ? String(args.op) : undefined, match?.call)
+  return text(r, !SENT_RE.test(r))
+}
+
 export async function callTool(name: string, args: Record<string, unknown>, deps: FleetDeps) {
   switch (name) {
-    case 'call': {
-      const to = String(args.to ?? '').trim()
-      const body = String(args.text ?? '').trim()
-      if (!to || !body) return text('call: to 和 text 都要填', true)
-      const replyTo = intId(args.reply_to) ?? undefined
-      // 回呼叫的那一則也是呼叫，而且到此為止（spec #t-call）；WO-175: reply_to as an event id or a did is a reply as well
-      const r = await deps.call(to, body, replyTo, isReplyRef(args.reply_to), args.op ? String(args.op) : undefined)
-      return text(r, !SENT_RE.test(r))
-    }
+    case 'call': return sendCall({ to: args.to, text: args.text, reply_to: args.reply_to, op: args.op }, deps)
     case 'send_mail': {
       const to = String(args.to ?? '').trim()
       const title = String(args.title ?? '').trim()
@@ -573,12 +579,7 @@ export async function sendToAgent(args: Record<string, unknown>, deps: FleetDeps
   const line = String(args.line ?? '').trim()
   if (!line) {
     // a session started before this version holds the old send_to_agent (to, text, no_reply): a call, as before
-    if (legacy && has(args.to) && has(args.text)) {
-      const replyTo = intId(args.reply_to) ?? undefined
-      const r = await deps.call(String(args.to).trim(), String(args.text).trim(), replyTo,
-        args.no_reply === true || replyTo != null, args.op ? String(args.op) : undefined)
-      return text(r, !SENT_RE.test(r))
-    }
+    if (legacy && has(args.to) && has(args.text)) return sendCall(args, deps)
     return text(LINE_MISSING, true)
   }
   if (line === 'feed') {
@@ -590,13 +591,7 @@ export async function sendToAgent(args: Record<string, unknown>, deps: FleetDeps
     if (!has(args.to) || !has(args.title) || !has(args.text)) return text('line=mail 要填 to、title、ask、text。', true)
     return callTool('send_mail', { to: args.to, title: args.title, body: args.text, ask: args.ask, deadline: args.deadline, no_reply: args.no_reply, op: args.op }, deps)
   }
-  if (line === 'call') {
-    if (!has(args.because) && !isReplyRef(args.reply_to)) return text(BECAUSE_MISSING, true)
-    if (!has(args.to) || !has(args.text)) return text('line=call 要填 to、because、text。', true)
-    // the receiver reads why it can't wait before anything else: one line ahead of the text
-    const body = has(args.because) ? `因為：${String(args.because).trim()}\n${String(args.text).trim()}` : String(args.text).trim()
-    return callTool('call', { to: args.to, text: body, reply_to: args.reply_to, op: args.op }, deps)
-  }
+  if (line === 'call') return sendCall({ ...args, line }, deps)
   return text(LINE_MISSING, true)
 }
 

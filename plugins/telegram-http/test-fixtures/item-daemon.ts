@@ -3,6 +3,13 @@ import { mock, spyOn } from 'bun:test'
 import * as identity from '../mesh-identity.ts'
 import * as mcpAuth from '../mcp-auth.ts'
 
+import { procFactsFor } from '../lanes-proc.ts'
+import { __setProcFacts } from '../lanes.ts'
+
+// The test process is the MCP client in place of a Claude TUI.
+const proc = procFactsFor()
+__setProcFacts({ ...proc, peerPid: () => process.ppid, argv: pid => pid === process.ppid ? ['claude'] : proc.argv(pid) })
+
 const mesh = { ...identity, readOwnCredential: () => 'test-member', readCredentialFile: () => 'test-member' }
 const auth = { ...mcpAuth, ensureToken: () => 'test-loopback' }
 mock.module('../mesh-identity.ts', () => mesh)

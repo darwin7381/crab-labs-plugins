@@ -104,13 +104,18 @@ test('WO-140 (3c): an explicit line=mail on a call event is honoured (a mail); a
   const c = run({ line: 'call', btcc: null })
   await L.callLaneTool(c.tok, 'reply_agent', { to: 'chiron', title: 't', ask: 'a', text: ANSWER })
   expect(meshed.at(-1)).toMatchObject({ to: 'chiron', line: 'mail' })
-  // the rule itself (answerToCallArgs): a feed post and an explicit call are left alone
+  // An explicit feed stays a feed. An explicit call to this run's caller gets the same reply reference.
   const ev = { ...a.ev }
   expect(L.answerToCallArgs({ line: 'feed', title: 't', text: 'x' }, ev)).toEqual({ line: 'feed', title: 't', text: 'x' })
-  expect(L.answerToCallArgs({ line: 'call', to: 'chiron', because: 'b', text: 'x' }, ev)).toEqual({ line: 'call', to: 'chiron', because: 'b', text: 'x' })
+  expect(L.answerToCallArgs({ line: 'call', to: 'chiron', because: 'b', text: 'x' }, ev)).toEqual({ line: 'call', to: 'chiron', because: 'b', text: 'x', reply_to: ev.btcc_msg_id })
   expect(L.answerToCallArgs({ to: 'chiron', text: 'x' }, undefined)).toEqual({ to: 'chiron', text: 'x' })
   expect(L.answerToCallArgs({ to: 'chiron', text: 'x' }, { ...ev, source: 'telegram' })).toEqual({ to: 'chiron', text: 'x' })
   expect(L.answerToCallArgs({ to: 'chiron', text: 'x' }, { ...ev, no_reply: true })).toEqual({ to: 'chiron', text: 'x' })   // a no_reply call owes no answer: stays a mail
+  const other = { ...ev, id: 'mesh-8842', btcc_msg_id: '8842' }
+  const outgoing = { line: 'call', to: 'chiron', text: 'answer' }
+  expect(L.answerToCallArgs(outgoing, ev, other).reply_to).toBe('8842')
+  expect(L.answerToCallArgs({ ...outgoing, reply_to: ev.btcc_msg_id }, ev, other).reply_to).toBe(ev.btcc_msg_id)
+  expect(L.answerToCallArgs(outgoing, { ...ev, reply_to_id: '111' })).toEqual(outgoing)
 })
 
 test('WO-140 (3d): a credential value is still refused (gives_credential >= 0.8) with the new rule text; the corrected resend is checked again and goes out, back on the call line (WO-148: no free pass)', async () => {

@@ -466,17 +466,18 @@ export function createMain(E: MainEnv) {
     const refs: ItemRef[] = rows.flatMap(r => r.onsen_items ?? [])
     if (!receiver) return rows.filter(r => !r.onsen_items)
     if (!ready()) return []
-    const { given, gone } = await receiver.receive(refs, hook, binding)
+    const { given } = await receiver.receive(refs, hook, binding, gone => {
+      for (const r of rows) if (r.state === 'queued' && r.onsen_items?.some((ref: ItemRef) => gone.has(ref.onsen_item_id))) {
+        closeItem(r, { reason: 'onsen_no_longer_waiting' })
+        if (r.onsen_items.length > 1) receiver.revisit?.()
+      }
+    })
     const valid = ready()
     return rows.filter(r => {
       const own: ItemRef[] | undefined = r.onsen_items
       if (!own) return valid
       if (valid && r.state === 'queued' && own.every(ref => given.has(ref.onsen_item_id))) return true
       receiver.report(own.filter(ref => given.has(ref.onsen_item_id)), 'not_taken')
-      if (own.some(ref => gone.has(ref.onsen_item_id))) {
-        closeItem(r, { reason: 'onsen_no_longer_waiting' })
-        if (own.length > 1) receiver.revisit?.()
-      }
       return false
     })
   }
@@ -1296,14 +1297,15 @@ export function createMain(E: MainEnv) {
    *  the edit as a new message) */
   /** ids of items whose offer is on its way to the main right now (pump): never rewritten by an edit (Sonn #11516 point 1) */
   const inFlight = new Set<string>()
-  function replaceQueued(chat: string, messageId: string, rewrite: (p: { content: string; meta: Record<string, string> }) => { content: string; meta: Record<string, string> }, item?: import('./onsen-items.ts').ItemRef): string[] {
+  function replaceQueued(chat: string, messageId: string, rewrite: ((p: { content: string; meta: Record<string, string> }) => { content: string; meta: Record<string, string> }) | undefined, item?: import('./onsen-items.ts').ItemRef): string[] {
     const matches = (r: Row) => item ? r.onsen_items?.some((ref: import('./onsen-items.ts').ItemRef) => ref.onsen_item_id === item.onsen_item_id)
       : metaOf(r.notif).chat_id === chat && String(metaOf(r.notif).message_id ?? '') === messageId
-    const rs = items(r => r.state === 'queued' && (item || !r.reason) && !inFlight.has(r.id) && r.kind !== 'digest' && matches(r))
+    const rs = items(r => matches(r) && (item ? ['queued', 'offered', 'bound'].includes(r.state)
+      : r.state === 'queued' && !r.reason && !inFlight.has(r.id) && r.kind !== 'digest'))
     for (const r of rs) {
       const p = { ...((r.notif?.params ?? {}) as Record<string, any>) }
-      const nw = rewrite({ content: String(p.content ?? ''), meta: { ...(p.meta ?? {}) } })
-      J().write('msg', r.id, 'queued', { notif: { method: r.notif.method, params: { ...p, content: nw.content, meta: nw.meta } }, edited_in_queue: true,
+      const nw = r.state === 'queued' && !inFlight.has(r.id) && rewrite?.({ content: String(p.content ?? ''), meta: { ...(p.meta ?? {}) } })
+      J().write('msg', r.id, r.state, { ...(nw ? { notif: { ...r.notif, params: { ...p, ...nw } }, edited_in_queue: true } : {}),
         ...(item ? { onsen_items: r.onsen_items.map((ref: import('./onsen-items.ts').ItemRef) => ref.onsen_item_id === item.onsen_item_id ? item : ref) } : {}) })
     }
     return rs.map(r => r.id)

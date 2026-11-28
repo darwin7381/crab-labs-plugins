@@ -369,7 +369,7 @@ if (ONSEN_TAKE_ON) {
   else if (onsen) {
     takeMode = new TakeMode(ONSEN_AGENT, (m, p, b, t, h, signal) => onsen.request(m, p, b, t, h, signal),
       active => { if (active) { itemClaims!.start(); itemPeek!.reset() } else itemPeek!.stop(); registryStatusChanged?.() }, line => log('info', line))
-    itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, Lanes.offerMissed, () => registryStatusChanged?.())
+    itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, Lanes.offerMissed, () => registryStatusChanged?.(), takeMode.now)
     onsen.watchItemReports(line => itemClaims!.replay(line), (line, ok) => itemClaims!.acknowledged(line, ok))
     itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at), () => itemPeek!.reset())
     Lanes.useItemReceiver(itemReceiver)
@@ -445,7 +445,8 @@ async function connectorReply(o: { chat: string; sender: string; text: string; r
   const kind = body.trim() || !o.files.length ? (o.rich ? 'rich' : 'text') : PHOTO_EXTS.has(extname(o.files[0]!).toLowerCase()) ? 'photo' : 'document'
   const said = await connectorSay.say({ chat: o.chat, sender: o.sender, text: body, kind, turn_id: o.turn_id, replyTo: o.replyTo != null ? String(o.replyTo) : null,
     silent: o.silent, ...(o.topic != null ? { thread: String(o.topic) } : {}), ...(ids.length ? { fileIds: ids, attachments: rows } : {}) })
-  if (o.turn_id && said.onsenId) itemClaims?.reply(o.turn_id, said.conversationId, said.onsenId, mainTurnNow?.() === o.turn_id ? Lanes.mainSessionId() : undefined)
+  if (said.onsenId && (o.turn_id || said.replyToMessageId)) itemClaims?.reply(o.turn_id, said.conversationId, said.onsenId,
+    o.turn_id && mainTurnNow?.() === o.turn_id ? Lanes.mainSessionId() : undefined, said.replyToMessageId)
   return said
 }
 // ---- WO-197 segment 2 (Chiron; CONTRACT §7d 「連接器這一頭」, the rulings of mesh 12869): what the daemon still said on Telegram goes through Onsen ----
@@ -2097,7 +2098,7 @@ const onsenReq = ONSEN_PULL_ON || ONSEN_SEND_ON ? (() => {
   const c = new Onsen.OnsenClient({ dir: join(STATE_DIR, 'onsen'), base: ONSEN_INBOX_BASE, agent: INBOX_SELF, record: false, credential: inboxCred, log })
   return (m: 'GET' | 'POST', path: string, b?: unknown, t?: number) => c.request(m, path, b, t)
 })() : null
-const onsenPuller: OnsenPuller | null = ONSEN_PULL_ON && onsenReq && onsenInbox ? new OnsenPuller({ takeEnabled: ONSEN_TAKE_ON, req: onsenReq, base: ONSEN_INBOX_BASE, inbox: onsenInbox,
+const onsenPuller: OnsenPuller | null = ONSEN_PULL_ON && onsenReq && onsenInbox ? new OnsenPuller({ req: onsenReq, base: ONSEN_INBOX_BASE, inbox: onsenInbox,
   deliver: (it, again) => deliverPulled(it, again), log, host: (process.env.ONSEN_HOST ?? '').trim() || hostname().replace(/\.local$/, ''),
   ...(Number(process.env.ONSEN_PERSON_RETRY_MS) > 0 ? { laterMs: Number(process.env.ONSEN_PERSON_RETRY_MS) } : {}),   // WO-194 A.2: tests only
   ...(process.env.ONSEN_PULL_WAIT_S ? { waitS: Number(process.env.ONSEN_PULL_WAIT_S) } : {}),
@@ -2266,8 +2267,9 @@ function laneMainDeps(args: Record<string, unknown>): FleetDeps {
     ...fleetDeps,
     btcc: laneMailBtcc,
     core: laneMainCore,
+    callReply: Lanes.resolveMainCall,
     ...(mailEvents ? { mailEvent: (decided: any) => mailEvents.emit(decisionEvent(decided)) } : {}),
-    call: async (to: string, text: string, replyTo?: number, noReply?: boolean, op?: string) => {
+    call: async (to: string, text: string, replyTo?: number, noReply?: boolean, op?: string, call?: string) => {
       // 002: the main's sends carry thread/hop; a quote-reply continues the thread it answers
       let thread = typeof args.thread === 'string' && args.thread.trim() ? args.thread.trim() : undefined
       let hop = args.hop != null && Number(args.hop) > 0 ? Number(args.hop) : undefined
@@ -2279,11 +2281,9 @@ function laneMainDeps(args: Record<string, unknown>): FleetDeps {
       }
       // 002k (K2): disclosure check before anything is sent, as for a lane's reply_agent; a refusal is an isError result (callInboxTool: not "delivered").
       // 1.34.2: a call that carries reply_to answers that call
-      { const refused = await Lanes.checkPeerSend('main', to, text, replyTo != null || isReplyRef(args.reply_to)); if (refused) return refused }   // WO-175: a reply named by event id / did too
+      { const refused = await Lanes.checkPeerSend('main', to, text, !!call || replyTo != null || isReplyRef(args.reply_to)); if (refused) return refused }   // WO-175: a reply named by event id / did too
       let minted: number | undefined, delivered = false
       const turnId = await Lanes.mainTurnId()                                // WO-172: the main's turn, as the tg daemon has it
-      // WO-175 item 2: the Call it answers, from the reply_to the main gave as it gave it (a BTCC number, an event id, its delivery's did), asked of the router
-      const call = await Lanes.callForReply(to, args.reply_to ?? replyTo)
       const result = await sendToAgent(to, text, replyTo, noReply, op, 'call',
         { thread, hop, lane: `${INBOX_SELF}.main`, turn_id: turnId, ...(call ? { call } : {}), minted: (id, ok) => { minted = id; delivered = ok } })
       await Lanes.noteMainOutbound(minted, thread, hop, to, text, replyTo, delivered)   // PL2: met on the delivery
@@ -4332,7 +4332,7 @@ if (Lanes.LANES_ON) {
       },
       // WO-205 (Chiron mesh-13475): M2's registry disagreement (the tg daemon relays it here) as a BTCC page alert to the connector's maintainer;
       // BTCC names the agent from this daemon's mesh credential
-      ...(ONSEN_TAKE_ON ? { inboundLog: logPeerArrival, schedulerTaken: maybeAutoAckScheduled } : {}),
+      inboundLog: logPeerArrival, schedulerTaken: maybeAutoAckScheduled,
       registryAlert: async a => {
         if (!BTCC_API_BASE) return 'BTCC_API_BASE not set'
         const machine = machineName()
@@ -4773,8 +4773,9 @@ async function personArrived(it: { item?: ItemRef; kind?: string; seq?: number; 
     if (edit) {
       log('info', `onsen inbound: person_edit of ${shown} received from the inbox`)
       const at = Math.floor(Date.parse(String(p.edited_at ?? '')) / 1000)
+      const date = editIndex.sentAt(chat, ref) || inboundStore.get(key)?.date || Date.parse(onsen?.findInbound(chat, ref)?.sent_at ?? '') / 1000
       // the edited message as the bridge wrote it (1.59.0: no Telegram edit reaches this daemon itself any more)
-      const m = { message_id: Number(ref), chat: { id: Number(chat), type: chat.startsWith('-') ? 'supergroup' : 'private' },
+      const m = { message_id: Number(ref), ...(Number.isFinite(date) ? { date } : {}), chat: { id: Number(chat), type: chat.startsWith('-') ? 'supergroup' : 'private' },
         from: { id: Number(c.user_id) || 0, is_bot: false, ...(c.user ? { username: String(c.user) } : {}) }, text: String(p.text ?? ''), ...(Number.isFinite(at) ? { edit_date: at } : {}),
         ...(c.thread != null ? { is_topic_message: true, message_thread_id: Number(c.thread) } : {}) }
       if (/^\d+$/.test(ref)) await deliverEditedMessage(m, [String(p.message_id)])
@@ -5042,16 +5043,12 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
  *  WO-158: an item Onsen 0.9.4 marks `unverified: true` (only a relay can: a name it passes on without vouching for it, e.g. a BTCC console release) gets
  *  the verdict the same message pushed through BTCC unverified gets today (mesh-identity.ts resolveInbound, a forwarder without verified_from):
  *  verified=false, and forged when the name is an identity that signs (dropped and filed, as on /inject). */
-async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
-  // A page may omit the event history. Resolve the hand-over note before putting the row into M1.
-  if (row.session_id === 'main' && !row.events) {
-    const r = await onsen!.request('GET', '/v1/items/' + encodeURIComponent(row.id))
-    if (r?.status === 404) return
-    if (r?.status !== 200) throw new Error('could not read item history for ' + row.id)
-    if (r.json.data.state !== 'waiting') return
-    row = r.json.data
-  }
+async function routeInboxItem(row: InboxItem, change?: 'edited' | 'version'): Promise<void> {
   const item = itemRef(row)
+  if (change) {
+    Lanes.updateWaitingItem(item, change === 'edited' ? { content: String(row.payload.text ?? ''), at: row.updated_at } : undefined)
+    return
+  }
   if (itemClaims?.completed(row.id)) {
     const result = await itemReceiver!.receive([item])
     if (result.given.has(row.id)) itemReceiver!.report([item], 'completed')
@@ -5061,9 +5058,13 @@ async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
   const prefix = [item.note, item.half_done ? '上一回合被打斷，接著做。' : ''].filter(Boolean).join('\n')
   if (prefix) payload.text = prefix + '\n' + (payload.text ?? '')
   if (row.kind === 'message' || row.message_id) {
-    if (edit && row.reason !== 'reassigned') { Lanes.editWaitingItem(item, String(payload.text ?? ''), row.updated_at); return }
     const arrived = await personArrived({ item, kind: 'person_message', seq: row.number, dedupe: 'item:' + row.id, payload })
     if (arrived.code !== 200) throw new Error('person delivery: HTTP ' + arrived.code)
+    if (arrived.json.dropped) {
+      const { given, gone } = await itemReceiver!.receive([item], false, true)
+      if (given.has(row.id)) itemReceiver!.report([item], 'completed', { response_message_ids: [] })
+      else if (!gone.has(row.id)) throw new Error('dropped person item not available: ' + row.id)
+    }
     return
   }
   if (row.kind === 'control') {

@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto'
 import type { InboxItem, ItemRef } from './onsen-items.ts'
 import type { TakeMode } from './onsen-take.ts'
+import type { Journal } from './lanes-state.ts'
 
 export type Outcome = 'in_session' | 'not_taken' | 'completed' | 'owed' | 'background' | 'not_applied'
   | 'usage_limit' | 'usage_limit_probe' | 'error' | 'cut' | 'cut_person' | 'stopped' | 'stuck' | 'reassigned'
@@ -12,6 +13,7 @@ const empty = (): ReceiveResult => ({ given: new Set(), gone: new Set() })
 export const itemIds = (refs: ItemRef[]) => refs.map(r => r.onsen_item_id)
 
 export type ClaimStore = {
+  restoreMessageIds(journal: Journal): void
   blocked(): boolean
   owns(id: string): boolean
   taken(row: InboxItem, ref: ItemRef): void
@@ -22,6 +24,7 @@ export type ClaimStore = {
 }
 
 export class ItemReceiver {
+  private refused = new Map<string, { version: number; rides: boolean }>()
   private requesting = new Set<string>()
   constructor(readonly mode: TakeMode, readonly claims: ClaimStore, readonly dueAt: (time: string) => void, readonly revisit?: () => void) {}
 
@@ -33,14 +36,21 @@ export class ItemReceiver {
     for (const ref of refs ?? []) this.claims.bind(ref.onsen_item_id, session, turn, registrySession)
   }
 
-  async receive(refs: ItemRef[], hook = false, binding = false): Promise<ReceiveResult> {
+  async receive(refs: ItemRef[], hook = false, binding = false, onGone?: (ids: Set<string>) => void): Promise<ReceiveResult> {
     const result = empty()
     if (!this.mode.active || this.claims.blocked()) return result
     const byId = new Map(refs.map(r => [r.onsen_item_id, r]))
     const ids = [...byId.keys()]
     if (ids.some(id => this.requesting.has(id))) return result
     if (binding) for (const id of ids) if (this.claims.owns(id)) result.given.add(id)
-    const need = ids.filter(id => !this.claims.owns(id)).slice(0, 100)
+    const leads = new Set(refs.filter(r => r.kind === 'message' && r.reason !== 'cut_person' && r.reason !== 'parked'
+      && !this.claims.owns(r.onsen_item_id) && r.onsen_version > (this.refused.get(r.onsen_item_id)?.version ?? -1)).map(r => r.from))
+    const need = ids.filter(id => {
+      const ref = byId.get(id)!, refusal = this.refused.get(id)
+      if (refusal && ref.onsen_version <= refusal.version && !(refusal.rides && leads.has(ref.from))) return false
+      this.refused.delete(id)
+      return !this.claims.owns(id)
+    }).slice(0, 100)
     if (!need.length) return result
     for (const id of need) this.requesting.add(id)
     const key = randomUUID()
@@ -54,12 +64,12 @@ export class ItemReceiver {
       // The first write may have committed before the response was lost. Recover its exact result.
       let retry = 0
       while ((!r || r.status >= 500 || expired && retry === 0) && this.mode.active) {
-        expired = true
         if (retry) await new Promise(resolve => setTimeout(resolve, Math.min(30_000, 1000 * retry)).unref())
         if (!this.mode.active) return empty()
         retry++
         if (!this.claims.blocked()) r = await take().catch(() => null)
       }
+      clearTimeout(timer)
       if (r?.status === 409) {
         const why = r.json?.error?.code
         if (why === 'not_current_connector' || why === 'not_take_member') this.mode.pause(why, why === 'not_current_connector' ? 45_000 : 60_000)
@@ -73,14 +83,26 @@ export class ItemReceiver {
         this.claims.taken(row, ref)
         result.given.add(row.id)
       }
-      if (!expired) await Promise.all(need.filter(id => !result.given.has(id)).map(async id => {
-        const single = await this.mode.req('GET', '/v1/items/' + encodeURIComponent(id), undefined, 3000).catch(() => null)
-        if (single?.status === 404 || (single?.status === 200 && single.json.data.state !== 'waiting')) result.gone.add(id)
-        if (single?.json?.data?.not_before) this.dueAt(single.json.data.not_before)
-      }))
+      const refused = need.filter(id => !result.given.has(id))
+      const inspect = async () => {
+        await Promise.all(refused.map(async id => {
+          const single = await this.mode.req('GET', '/v1/items/' + encodeURIComponent(id), undefined, 3000).catch(() => null)
+          if (single?.status === 404 || (single?.status === 200 && single.json.data.state !== 'waiting')) result.gone.add(id)
+          const row: InboxItem | undefined = single?.json?.data
+          if (row?.state === 'waiting' && (row.reason === 'parked' && !row.released || row.reason === 'cut_person')) {
+            this.refused.set(id, { version: row.version, rides: row.reason === 'cut_person' })
+          }
+          if (row?.not_before) this.dueAt(row.not_before)
+        }))
+        if (result.gone.size) onGone?.(result.gone)
+      }
       if (expired || !this.mode.active) {
         for (const id of need) if (result.given.has(id)) this.claims.report(id, 'not_taken')
         return empty()
+      }
+      if (refused.length) {
+        if (hook) setTimeout(() => void inspect(), 0)
+        else await inspect()
       }
       return result
     }

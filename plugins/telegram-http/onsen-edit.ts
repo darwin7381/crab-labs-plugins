@@ -26,7 +26,7 @@ const p2 = (n: number): string => String(n).padStart(2, '0')
 /** the original's time, UTC: HH:MMZ; MM-DD HH:MMZ when it is from an earlier UTC day than the edit */
 export function originalTime(dateS: unknown, editS?: unknown): string {
   const d = new Date(Number(dateS) * 1000)
-  if (!Number.isFinite(d.getTime()) || !Number(dateS)) return '??:??Z'
+  if (!Number.isFinite(d.getTime()) || !Number(dateS)) return ''
   const hm = `${p2(d.getUTCHours())}:${p2(d.getUTCMinutes())}Z`
   const e = new Date(Number(editS ?? dateS) * 1000)
   const sameDay = Number.isFinite(e.getTime()) && e.toISOString().slice(0, 10) === d.toISOString().slice(0, 10)
@@ -35,7 +35,8 @@ export function originalTime(dateS: unknown, editS?: unknown): string {
 
 /** the one line in front of the new text. Telegram's edited_message keeps the original send time in `date`; `edit_date` is the edit's */
 export function editHeader(m: any): string {
-  return `〔${editorName(m?.from)} 改了他 ${originalTime(m?.date, m?.edit_date)} 那一則（tg:${m?.message_id ?? '?'}）〕`
+  const time = originalTime(m?.date, m?.edit_date)
+  return `〔${editorName(m?.from)} 改了${time ? '他 ' + time + ' ' : ''}那一則（tg:${m?.message_id ?? '?'}）〕`
 }
 export const editedAt = (m: any): string => new Date((Number(m?.edit_date) || Math.floor(Date.now() / 1000)) * 1000).toISOString()
 
@@ -70,6 +71,7 @@ export class DeliveredIndex {
     this.m.set(k, Number(dateS) || 0)
     if (this.m.size > this.max) this.m.delete(this.m.keys().next().value!)
   }
+  sentAt(chat: string, id: unknown): number | undefined { return this.m.get(`${chat}:${id}`) }
   has(chat: string, id: unknown): boolean { return this.m.has(`${chat}:${id}`) }
 }
 

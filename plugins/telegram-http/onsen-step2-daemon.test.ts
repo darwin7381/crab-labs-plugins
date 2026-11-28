@@ -101,14 +101,15 @@ test('an edit of a message no session has seen yet (parked): the parked copy tak
 
 test('an edit of a message the session already has: a new inbound under one line naming the original time; edit_delivered (not replaced)', async () => {
   const m = dm(JOEY, 4400, '原本的字')
+  m.message.date = Date.UTC(2020, 0, 12, 3, 17) / 1000
   api.push(m)
   expect(await until(() => received.some(r => r.content === '原本的字'), 15000)).toBe(true)
   await Bun.sleep(300)
   api.push(editOf(4400, m.message.date, '改過的字\n第二行'))
   expect(await until(() => received.some(r => r.meta.message_id === '4400' && r.meta.edited === 'true'), 15000)).toBe(true)
   const e = received.find(r => r.meta.message_id === '4400' && r.meta.edited === 'true')!
-  // the person_edit carries the person's username (not Telegram's first name) and not the original's time (Onsen's payload has edited_at only)
-  expect(e.content).toBe(`〔@joey 改了他 ??:??Z 那一則（tg:4400）〕\n改過的字\n第二行`)
+  // The original arrival carries the send time. The edit payload only supplies edited_at.
+  expect(e.content).toBe(`〔@joey 改了他 01-12 03:17Z 那一則（tg:4400）〕\n改過的字\n第二行`)
   expect(e.meta).toMatchObject({ chat_id: String(JOEY), user: 'joey', user_id: String(JOEY) })
   expect(Date.parse(e.meta.ts)).toBeGreaterThanOrEqual(m.message.date * 1000)
   expect(await until(() => evs().some(x => x.kind === 'edit_delivered' && x.target_client_msg_id === '4400'), 10000)).toBe(true)
