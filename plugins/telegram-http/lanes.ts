@@ -25,8 +25,8 @@ import { Journal, type Row } from './lanes-state.ts'
 import { procFactsFor, type ProcFacts } from './lanes-proc.ts'
 import { createMain, mainContext, type MainApi, type MainEnv, type MainWall, type ItemKind, type Via } from './lanes-main.ts'
 import { pidAlive, type CallFacts, type TurnTrigger } from './onsen-status.ts'
-import type { CallCheck, CallRef, CallWait } from './onsen-client.ts'
-import { createEvents, matterKey, type EventsApi, type EvClass, type Ob, type Outcome } from './lanes-events.ts'
+import type { CallCheck, CallRef, CallWait, ScheduledResultLine } from './onsen-client.ts'
+import { createEvents, matterKey, owed, type EventsApi, type EvClass, type Ob, type Outcome } from './lanes-events.ts'
 import { anchorSlug, plainTopicName, topicLink, topicMode, type TopicVerdict } from './lanes-topics.ts'
 import { APPEND_MAX, APPENDABLE_FILE, appendText, declaredFor, readDeclared } from './lanes-append.ts'
 import {
@@ -212,7 +212,6 @@ export interface LanesDeps {
   schedulerCall?: (runId: string, action: 'ack' | 'complete', outcome?: string, note?: string) => Promise<string>
   /** inbox role, WO-205 (Chiron mesh-13475): M2's registry disagreement as a BTCC page alert (POST /api/fleet/main-registry, this daemon's mesh credential) */
   inboundLog?: (body: Record<string, unknown>) => Promise<number | undefined>
-  schedulerTaken?: (runId?: string) => void
   registryAlert?: (a: { state: 'open' | 'clear'; session?: string; pid?: number; why?: string }) => Promise<string>
   /** inbox role, WO-128 (item 4): the cards that wait on the main's decision (BTCC /due over its longest window, the past due included), for the context the
    *  main gets back after a /clear, a compaction or a restart */
@@ -232,6 +231,7 @@ export interface LanesDeps {
    *  probe_retry) */
   usageWall?: (wallSinceMs: number) => (MainWall & { by?: string | null }) | null
   checkWaitingCall?: (id: string, why: CallWait, thread?: string) => Promise<CallCheck>
+  recordScheduleResult?: (line: ScheduledResultLine) => boolean
   blocked?: (item: Row, retryAfter: string | null) => void
   /** WO-181 (server.ts onsen-mentions.ts MentionCards): the block of this agent's unread mentions for a delivery to the main (resolves null: none, no answer);
    *  null at once: switched off */
@@ -504,7 +504,7 @@ export const __setAckHook = (f: ((runId: string) => void) | null): void => { __a
 function mainTookItems(items: Row[]): void {
   cardsTold(items.filter(r => r.kind !== 'digest'))                               // WO-137 甲 (item 2): a digest taken in with these items (pulled, or bound to a turn)
   // WO-175: with the Call moments on, a run bound into the main's turn is its Call's `running` (the tap): BTCC reads that as the start receipt
-  if (onsenTap?.calls) return
+  if (onsenTap?.calls || itemReceiver?.mode.active) return
   for (const it of items) {
     const e = it.event ? events?.get(String(it.event)) : undefined
     for (const o of ((e?.obligations ?? []) as Ob[])) if (o.kind === 'receipt' && o.run_id && !ackedRuns.has(String(o.run_id))) {
@@ -3544,6 +3544,13 @@ function threadSummary(thread: string): string {
 // ================================================================== lane queue + runner
 let itemReceiver: import('./onsen-receive.ts').ItemReceiver | undefined
 export function useItemReceiver(receiver: typeof itemReceiver): void { itemReceiver = receiver }
+/** C1 journaled receipt obligations alongside taken Items. S3 now supplies those receipts. */
+export function retireItemReceipts(): void {
+  const pending = (o: Ob) => o.kind === 'receipt' && owed(o)
+  for (const e of events.rows(e => e.onsen_items?.length)) {
+    events.set(e.id, pending, { state: 'waived', by: 'Onsen Item' })
+  }
+}
 export function offerMissed(id: string): void { main.offerMissed(id) }
 let onGateOpen: (() => void) | undefined
 export function observeItemGates(open?: () => void): void { onGateOpen = open }
@@ -4467,7 +4474,9 @@ export function identityCard(lane: Pick<Lane, 'kind'>, _it?: unknown): string {
     receiptStepsOn()
       ? `  - receipt(run_id, outcome, steps)：例行排程的執行回執（outcome=nothing-to-do｜done｜failed）。steps 必填：指示裡的每一步照順序列一項（step＝那一步是什麼，done＝true｜false，note＝發生了什麼或為什麼沒做）。條件沒成立所以不用做的步驟算做了（done=true，note 寫條件沒成立）。指示只有一件事就列一項。`
       : `  - receipt(run_id, outcome)：例行排程的執行回執（outcome=nothing-to-do｜done｜failed）。`,
-    `- 人格檔裡「用 reply 回報 Joey」（或「在 Telegram 回報 Joey」）對你來說就是 notify_joey；「升級給 Joey」就是 ask_joey；找別隻 agent 用 reply_agent（上面那三條線）；${receiptStepsOn()
+    `- 人格檔裡「用 reply 回報 Joey」（或「在 Telegram 回報 Joey」）對你來說就是 notify_joey；「升級給 Joey」就是 ask_joey；找別隻 agent 用 reply_agent（上面那三條線）；${itemReceiver?.mode.active
+      ? '排程的開始與結束由 Onsen 依 Item 回報。用 receipt 記錄這次執行的結果，無須另用 btcc-receipt ack 或 complete'
+      : receiptStepsOn()
       ? '排程回執用 receipt(run_id, outcome, steps)；人格檔或排程訊息裡寫的 btcc-receipt complete，對你來說就是 receipt 工具（開工的 btcc-receipt ack 照舊）'
       : '排程回執用 receipt(run_id, outcome)（~/.claude/tools/btcc-receipt complete 也會經由分流器完成同一個回執，一個 run 只會完成一次）'}。人格檔中標示「主線專用」的規則不適用於你。`,
     `- 工具：用你自己的 Bash、Read（和人格檔寫的工具、指令）。這個 agent 的 daemon 介面（127.0.0.1 上的 MCP、/lanes、/inject）不是給你直接打的；對外只走上面的車道工具。`,
@@ -5646,7 +5655,7 @@ function eventObligations(ev: InEvent, cls: EvClass, task = false): any[] {
       && (D.registryNames?.() ?? []).map(n => n.toLowerCase()).includes(ev.from.toLowerCase())) obs.push({ kind: 'peer', level: 'answer', to: ev.from.toLowerCase(),
       ...(ev.btcc_msg_id ? { req: String(ev.btcc_msg_id) } : {}) })        // 002w (B): the request it answers (a later send quoting it meets it, mainSentTo)
   const run = cls === 'scheduled' && ev.meta?.run_id ? String(ev.meta.run_id) : null
-  if (run) obs.push({ kind: 'receipt', level: 'run', run_id: run })
+  if (run && !itemReceiver?.mode.active) obs.push({ kind: 'receipt', level: 'run', run_id: run })
   return obs
 }
 function openLaneEvent(ev: InEvent, lane: Lane): void {
@@ -6896,11 +6905,12 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       return 'handed to the main: it gets your text, takes over and reports to Joey. Do not notify Joey about this yourself; close with receipt.' + told
     }
     case 'receipt': {
-      const runIdArg = String(a.run_id ?? '').replace(/\D/g, '')
+      const scheduledRun = itemReceiver?.mode.active && schedRun(tok) ? queue.get(tok.evId)?.ev.meta?.run_id : undefined
+      const runIdArg = String(a.run_id ?? scheduledRun ?? '').replace(/\D/g, '')
       const outcome = String(a.outcome ?? 'done')
       // WO-125 (C, B): checked before anything is recorded; a refused receipt records nothing. C: a step marked not done and a success outcome, in a
       // run that handed nothing to the main. B: a scheduled run's receipt filed as a success while a refused write or command still counts.
-      const parsed = receiptStepsOn() ? parseSteps(a.steps) : null
+      const parsed = receiptStepsOn() || (itemReceiver?.mode.active && runIdArg) ? parseSteps(a.steps) : null
       if (parsed && !Array.isArray(parsed)) return `沒有記錄：${parsed.why}`
       // WO-132 (item 6): this run's notify_joey was dropped by the de-duplication (Joey has that line): a report step marked not done is done, as recorded
       const steps = parsed && tok.notifyDeduped ? dedupedSteps(parsed).steps : parsed
@@ -6958,7 +6968,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       if (!runIdArg) return `receipt recorded${chainNote}. ${events.openText(tok.evId)}${held}`
       // receipt note (btcc-ack-auth): the scheduler gets the receipt's one line as the ledger keeps it (its summary, else what happened) in BTCC's field `note`
       if (left) { await completeRun(tok, runIdArg, outcome, note, 'receipt'); return `receipt recorded; ${leftForMainText(runIdArg)}${chainNote}${held}` }   // 1.38.2: logged there, not sent
-      return `receipt recorded; scheduler: ${(await completeRun(tok, runIdArg, outcome, note, 'receipt')).text}${chainNote}${held}`
+      return `receipt recorded; scheduler: ${(await completeRun(tok, runIdArg, outcome, note, 'receipt', steps)).text}${chainNote}${held}`
     }
     case 'ledger_query': return ledgerQueryTool(a)          // 002k (B20): read only
     case 'append_file': {                                                // WO-123
@@ -7595,10 +7605,20 @@ function receiptNotRecorded(why: string, fate: 'refused' | 'pending' | 'nocred' 
   if (fate === 'nocred') return `${why}: this daemon cannot reach Onsen (a broken setup); not sent to BTCC`
   return fate === 'refused' ? `${why}; not sent to BTCC` : why
 }
-export async function completeRun(tok: RunTok, runId: string, outcome: string, note: unknown, via: 'receipt' | 'btcc-receipt'): Promise<{ ok: boolean; text: string; leftForMain?: boolean }> {
+export async function completeRun(tok: RunTok, runId: string, outcome: string, note: unknown, via: 'receipt' | 'btcc-receipt', steps?: Step[] | null): Promise<{ ok: boolean; text: string; leftForMain?: boolean }> {
   if (receiptLeftForMain(runId)) {                                       // 1.38.2: the main's to complete (receiptLeftForMain)
     logos('lane.receipt_left_for_main', { lane: tok.lane, run: tok.runId, run_id: runId, via, outcome })
     return { ok: false, leftForMain: true, text: leftForMainText(runId) }
+  }
+  if (itemReceiver?.mode.active) {
+    const event = runEvents(queue.get(tok.evId)).find(ev => ev.item_kind === 'scheduled' && String(ev.meta?.run_id) === runId)
+    const text = stripMarkup((via === 'receipt' && tok.receipt?.text) || String(note ?? ''))
+    const normalized = btccOutcome(outcome)
+    const result = { outcome: normalized === 'nothing-to-do' ? 'nothing_to_do' : normalized,
+      ...(steps ? { steps } : {}), ...(text ? { body: { format: 'markdown' as const, text: text.slice(0, 4000) } } : {}) }
+    const ok = D.recordScheduleResult?.({ event: event?.id ?? tok.evId, call_id: event?.call_id ?? null, run_id: runId,
+      idem: `call:run:${runId}:result`, body: { result } }) ?? false
+    return { ok, text: ok ? `Call result queued for scheduler run ${runId}.` : `Could not queue the Call result for scheduler run ${runId}.` }
   }
   // 1.41.1 (Metis mail #11280): the scheduler takes ok | nothing-to-do | failed; the receipt's `done` went as it was and BTCC answered 422
   // receipt note (btcc-ack-auth): the line goes as `note`, the field BTCC reads (it was sent as `summary`, which BTCC never read: the result sentence was dropped)
@@ -7704,7 +7724,7 @@ function receiptFiled(run: string): boolean {
  *  leaves the receipt owed; a 409 「run is completed」 meets it). The run's receipt still owed on any event (the main's, or one no lane holds any more) is
  *  met: the run is completed at the scheduler. */
 function mainToolDone(name: string, input: any, response: string, error: boolean): void {
-  if (name !== 'Bash' || error || !events) return
+  if (name !== 'Bash' || error || !events || itemReceiver?.mode.active) return
   const runs = [...new Set(receiptCliRuns(String(input?.command ?? '')))]
   if (!runs.length) return
   const ans = receiptCliAnswer(response)
@@ -7727,7 +7747,7 @@ function laneHolds(evId: string): boolean {
 export function mainToolGate(name: string, input: any): string | null {
   if (name !== 'Bash' || !events) return null
   for (const run of new Set(receiptCliRuns(String(input?.command ?? '')))) {       // 1.41.1: a mention is not a call (Chiron mail #11236)
-    const held = events.rows(() => true).flatMap(e => ((e.obligations ?? []) as Ob[]).filter(o => o.kind === 'receipt' && String(o.run_id) === run).map(o => ({ e, o })))
+    const held = events.rows(() => true).flatMap(e => ((e.obligations ?? []) as Ob[]).filter(o => o.kind === 'receipt' && String(o.run_id) === run && o.state !== 'waived').map(o => ({ e, o })))
     if (!held.length) continue
     const done = held.find(x => x.o.state === 'met' || x.o.state === 'requested')
     if (done) return `排程 run ${run} 已經回執過了（${done.o.by ?? done.e.owner ?? '車道'} 送的），排程器每個 run 只收一次回執。不要再執行這個指令；其餘的事照常做。`
@@ -8426,7 +8446,7 @@ function digestLine(e: Row, whole = false): DigestLine {
   for (const o of obs.filter(o => o.kind === 'peer')) st.push(unrun(o) ?? (o.owner === 'main' ? `你答應回 ${o.to}${o.due_at ? `（${simTime(o.due_at)} 前）` : ''}${o.state === 'met' ? '：已回' : ''}`
     : o.level === 'interim' ? `分流器已告訴 ${o.to} 由主線決定` : o.state === 'handed' ? `交給主線回 ${o.to}` : o.state === 'met' ? `已${o.by === 'main' ? '由你' : ''}${o.level === 'message' ? '告訴' : '回'} ${o.to}${e.answered && o.by !== 'main' ? `：「${clip(String(e.answered), 80)}」` : ''}`
     : o.state === 'requested' ? `正在送給 ${o.to}` : o.state === 'waived' ? `沒回 ${o.to}（車道結帳時判這件不用回）` : `還沒回 ${o.to}${failed(o)}`))   // WO-177: waived
-  for (const o of obs.filter(o => o.kind === 'receipt')) st.push(unrun(o) ?? (o.state === 'met' ? `run ${o.run_id} 回執已送` : o.state === 'handed' ? `run ${o.run_id} 的回執交給主線${o.failed ? `（排程器沒收下：${clip(String(o.failed), 100)}）` : ''}` : `run ${o.run_id} 還沒回執${failed(o)}`))   // 1.41.1: why it is still owed
+  for (const o of obs.filter(o => o.kind === 'receipt' && o.state !== 'waived')) st.push(unrun(o) ?? (o.state === 'met' ? `run ${o.run_id} 回執已送` : o.state === 'handed' ? `run ${o.run_id} 的回執交給主線${o.failed ? `（排程器沒收下：${clip(String(o.failed), 100)}）` : ''}` : `run ${o.run_id} 還沒回執${failed(o)}`))   // 1.41.1: why it is still owed
   if (e.blocked && blockFactsOn()) st.push(String(e.blocked))                    // WO-125 (B): what the guard refused in the run, as the system counted it
   for (const f of (e.forms_closed ?? []) as Array<{ id?: number | null; url?: string | null; reason?: string | null; lane?: string }>)   // WO-148 review of WO-153
     st.push(`${laneLabelOf(String(f.lane ?? ''))}關了你發給 Joey 的表單 ${f.id != null ? `#${f.id}` : f.url ?? ''}${f.reason ? `（${fit(String(f.reason), 80)}）` : ''}`)
@@ -8752,10 +8772,6 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
     if (D.inboundLog && p === '/lanes/inbound-log' && req.method === 'POST') {
       const body = await readBody(req)
       sendJson(res, 200, { id: await D.inboundLog?.(body) }); return true
-    }
-    if (D.schedulerTaken && p === '/lanes/scheduler-taken' && req.method === 'POST') {
-      D.schedulerTaken?.((await readBody(req)).run_id)
-      sendJson(res, 200, { ok: true }); return true
     }
     if (p === '/lanes/registry-alert' && req.method === 'POST') {       // WO-205: M2's registry disagreement → BTCC (this daemon's credential)
       const b = await readBody(req)

@@ -19,6 +19,33 @@ function facts(t = { ms: Date.parse('2026-11-26T04:00:00.000Z') }) {
 }
 
 describe('CallFacts: the moments, only forward', () => {
+  test('C2 checks the current mode even for a scheduled end queued before activation', async () => {
+    const lines: CallStateLine[] = [], takeMode = { active: false }
+    const waits: string[] = []
+    const f = new CallFacts({ takeMode, sink: line => lines.push(line), client: {
+      callFate: async idem => { waits.push(idem); return { fate: 'took', state: 'completed' } },
+      findRunCall: async () => ({ none: true }), getCall: async () => null,
+    } })
+    f.ended('prior-receipt', SCHED, 'main', 'completed', undefined, { outcome: 'ok' })
+    f.running('old', SCHED, 'main')
+    f.completeLater('old', SCHED, 'main', new Date().toISOString())
+    takeMode.active = true
+    expect(await f.receipt('prior-receipt', SCHED, 'main', 'completed', { outcome: 'ok' })).toMatchObject({ ok: false, fate: 'over' })
+    expect(waits).toEqual([])
+    f.flushLater()
+    f.routed('new', PEER, 'lane')
+    f.running('new', PEER, 'lane')
+    f.handedOver('new', PEER)
+    f.putBack('new', PEER, 'main')
+    f.ended('new', PEER, 'main', 'completed')
+    f.completeLater('take-late', SCHED, 'main', new Date().toISOString())
+    takeMode.active = false
+    f.flushLater()
+    expect(lines.map(l => [l.event, l.body.state])).toEqual([['prior-receipt', 'completed'], ['old', 'accepted'], ['old', 'running']])
+    f.routed('pull-again', PEER, 'main')
+    expect(lines.at(-1)).toMatchObject({ event: 'pull-again', body: { state: 'accepted' } })
+  })
+
   test('a lane: routed → accepted (its full id), its run → running, its end → completed with its summary; nothing twice', () => {
     const { f, states } = facts()
     f.routed('mesh-9001', PEER, 'lab-relay.reflex.25')
@@ -198,6 +225,25 @@ describe('a receipt goes to Onsen only (Chiron 05:55Z): what Onsen said to the l
   const client = (f: typeof fetch, cred: string | null = CRED) => new OnsenClient({ dir: mkdtempSync(join(tmpdir(), 'onsen-calls-r-')), base: 'https://onsen.test/api/onsen',
     agent: 'lab-relay', record: true, credential: () => cred, log: () => {}, fetch: f, intervalMs: 3_600_000 })
   const said = { error: { code: 'invalid_transition', message: '呼叫已經是 failed，不能改成 completed' } }
+  test('a take result survives an unavailable run lookup and replays after restart without a progress write', async () => {
+    let available = false
+    const o = onsen({ list: () => available ? { status: 200, json: { items: [{ id: '350' }] } } : { status: 503 } })
+    const c = client(o.f)
+    const body = { result: { outcome: 'failed', steps: [{ step: 'Verify snapshot', done: false }],
+      body: { format: 'markdown' as const, text: 'No checksum.' } } }
+    expect(c.recordCall({ run_id: '762', call_id: null, event: 'schedule', idem: 'call:run:762:result', body })).toBe(true)
+    await c.syncNow(true)
+    expect(c.pendingBytes()).toBeGreaterThan(0)
+    expect(o.log.filter(r => r.m === 'PUT')).toHaveLength(0)
+
+    available = true
+    const restarted = new OnsenClient(c.cfg)
+    await restarted.syncNow(true)
+    await restarted.syncNow(true)
+    expect(o.log.filter(r => r.m === 'PUT').map(r => [r.path, r.body])).toEqual([['/v1/calls/350/state', body]])
+    expect(restarted.pendingBytes()).toBe(0)
+  })
+
   test('took: the PUT answered 2xx (Onsen\'s state); refused: a 4xx with Onsen\'s sentence; a fate is kept for a line asked about again', async () => {
     let put = (id: string, b: any) => ({ status: 200, json: { data: { id, state: b.state } } }) as { status: number; json: any }
     const o = onsen({ put: (id, b) => put(id, b) }), c = client(o.f)
