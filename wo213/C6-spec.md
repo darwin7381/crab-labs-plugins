@@ -51,3 +51,10 @@ Mac mini 的對照來自 `tg-dialogue/roamer-facts.md` §2。MBP 的兩組對照
 | 交給 C1 的 `Claims.bind`，登記同一個實際 UUID 與 turn，最後觸發 `finalStop` 並回報 idle、背景數 0 | 對外編號傳 `main` 時得到 `in_session → completed`。傳 UUID 時只有 `in_session`。 |
 
 這兩個編號在 C1 已經分開存。呼叫點 `lanes-main.ts:627` 傳 `main` 和 registry 的 session UUID；`onsen-claims.ts:114` 用兩者比對收工。驗收須核對 A 的 Stop 只能結束 A 收下的列。
+
+## 實作與驗收對照
+
+- 首次切換由 tg daemon 的 C1 probe 決定。收到 200 後，把已交給哪個 connector 記在既有 claims 帳本，排完本機 poll 和更新處理，再在 `/healthz` 宣告 connector。切換過的 daemon 重啟時，以帳本維持橋接所有權，等 Onsen 回線；首次探測失敗的成員仍走本機路徑。
+- `roamer-items.ts` 使用與主線相同的 receiver、報告與帳本。只接到由 takeover 認領或可用 PID 證明的開啟中 stream；take 返回後再核對一次。送出時把該次 claim ID 放入本機通知，讀取確切 UUID 的 transcript 時才登記 `in_session`。已切離的 target 仍有自己的回合與登錄檔，直到原列結束。台架覆蓋 transcript Stop，以及同一回合確實觀察到的 busy → idle。
+- 主線與當前 target 的狀態觀測都以實際 UUID 呼叫 `Claims.statusRecord`。升級時若舊主線帳本已有 `registry_session`，同一 UUID 也用於重送 spool 中尚未送出的 `in_session`。測試分別檢查預填 `main` 及原為 null 的 Item。
+- 選單台架透過 `/roam` 指令與一件 `source:menu` Action 選到已連線的測試 session。`roam:`、`resume:`、`model:` 和 `effort:` 四種選項均經 `kind:control` 回派；過期選項回報 `not_applied`。現場只有 S4 負責等待通知。
