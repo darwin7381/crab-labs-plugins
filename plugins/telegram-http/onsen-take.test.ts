@@ -515,6 +515,24 @@ test('the surviving main can make progress after the failed restart', async () =
   expect(r.restarts).toHaveLength(1)
 })
 
+for (const source of ['typed', 'pull', 'returned'] as const) test('a silent main with no claim to report stays alive: ' + source, async () => {
+  const r = await mainRig(), row = r.f.add('unowned')
+  if (source === 'returned') {
+    await r.bind(row)
+    r.receiver.report([itemRef(row)], 'reassigned')
+    await r.sync()
+  } else {
+    const dids = source === 'pull' ? [r.enqueue(row, true)] : []
+    if (dids.length) await until(() => r.m.items(x => x.id === dids[0])[0]?.state === 'offered')
+    await r.hook('UserPromptSubmit', { dids })
+  }
+  expect(r.m.currentGen()?.state).toBe('in_turn')
+  await r.m.tick(Date.now() + MAIN_STUCK_MS + 1_000); await r.sync()
+  expect(r.restarts).toHaveLength(0)
+  expect(r.outcomes(row.id)).not.toContain('stuck')
+  expect(r.m.currentGen()?.item_restart).toBeUndefined()
+})
+
 test('Onsen parks on the third error and releases once after another Item completes', async () => {
   const r = await mainRig(), row = r.f.add('failing')
   for (let i = 1; i <= 3; i++) {

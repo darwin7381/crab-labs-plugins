@@ -17,7 +17,7 @@ export type ClaimStore = {
   wasOwed(id: string): boolean
   taken(row: InboxItem, ref: ItemRef): void
   bind(id: string, session: string, turn: string, registrySession?: string): void
-  report(id: string, outcome: Outcome, fields?: ReportFields): void
+  report(id: string, outcome: Outcome, fields?: ReportFields): boolean
   finalStop(session: string, turn: string): void
   continued(turn: string): void
 }
@@ -26,8 +26,11 @@ export class ItemReceiver {
   private requesting = new Set<string>()
   constructor(readonly mode: TakeMode, readonly claims: ClaimStore, readonly dueAt: (time: string) => void, readonly revisit?: () => void) {}
 
-  report(refs: ItemRef[], outcome: Outcome, fields?: ReportFields): void {
-    for (const ref of refs) this.claims.report(ref.onsen_item_id, outcome, fields)
+  /** Number of owned claims with this outcome durably recorded. */
+  report(refs: ItemRef[], outcome: Outcome, fields?: ReportFields): number {
+    let reported = 0
+    for (const ref of refs) if (this.claims.report(ref.onsen_item_id, outcome, fields)) reported++
+    return reported
   }
 
   bind(refs: ItemRef[] | undefined, session: string, turn: string, registrySession?: string): void {

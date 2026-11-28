@@ -1236,13 +1236,15 @@ export function createMain(E: MainEnv) {
         if (now - (g.item_restart_at ?? 0) >= 5_000) retryRestart(g, 'old pid is still alive')
         return
       }
-      if (g?.item_restart_retry) { await restartForReport(g, g.item_restart_retry, now); return }
+      if (g?.item_restart_retry === 'usage_limit_probe') { await restartForReport(g, 'usage_limit_probe', now); return }
       // An unbound Item uses its 20 s claim deadline. Only a running turn can be stuck.
-      if (g?.state === 'in_turn' && (stuck?.gen !== g.id || stuck.undelivered) && !held && m !== 'compacting' && m !== 'starting'
+      if (g?.state === 'in_turn' && (g.item_restart_retry || stuck?.gen !== g.id || stuck.undelivered) && !held && m !== 'compacting' && m !== 'starting'
           && m !== 'offline' && now - (lastEventAt.get(g.id) ?? now) > silenceLimit) {
-        for (const r of unsettled(g, g.prompt_id)) if (r.state === 'bound' && r.onsen_items) E.itemReceiver?.()?.report(r.onsen_items, 'stuck')
-        stuck = { gen: g.id, prompt: g.prompt_id, at: now }
-        await restartForReport(g, 'stuck', now)
+        const refs = unsettled(g, g.prompt_id).filter(r => r.state === 'bound').flatMap(r => r.onsen_items ?? [])
+        if (E.itemReceiver?.()?.report(refs, 'stuck')) {
+          stuck = { gen: g.id, prompt: g.prompt_id, at: now }
+          await restartForReport(g, 'stuck', now)
+        }
       }
       await pump()
       return

@@ -76,13 +76,15 @@ export class Claims implements ClaimStore {
     Object.assign(row, { session_id: session, turn, registry_session: registrySession })
     if (!row.in_session_at) this.report(id, 'in_session', { session_id: session })
   }
-  report(id: string, outcome: Outcome, fields: ReportFields = {}): void {
+  report(id: string, outcome: Outcome, fields: ReportFields = {}): boolean {
     const row = this.rows[id]
-    if (!this.owns(id) || row.last_outcome === outcome) return
+    if (!this.owns(id)) return false
+    if (row.last_outcome === outcome) return true
     const body = { claim_id: row.claim_id, outcome, at: new Date(this.now()).toISOString(), ...fields }
     if (!this.spool.recordItemReport({ item_id: id, body })) throw new Error('could not spool item report for ' + id)
     this.replay({ item_id: id, body })
     this.save(); this.clock(id)
+    return true
   }
   /** Restore a line appended before a crash between the spool append and ledger rename. */
   replay({ item_id: id, body }: ItemReport): void {
