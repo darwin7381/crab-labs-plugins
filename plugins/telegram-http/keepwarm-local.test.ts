@@ -77,6 +77,7 @@ test('take keepwarm uses the member credential, replaces a stale warm window and
   const monitor = () => new LocalKeepwarm({ name: 'adam', take: { mode, write: w => client.recordItemWrite(w) }, stateDir: dir, projectsDir: () => dir, transcript: () => file,
     mode: () => 'live', mail: async () => { mail++; return null }, deliver: async () => { delivered++; return true }, log: () => {}, now: () => clock })
   const check = monitor()
+  client.mayWithdrawKeepwarm = row => check.mayWithdraw(row)
   try {
     await mode.probe()
     writeFileSync(file, lines(...turnAt(at)))
@@ -116,7 +117,14 @@ test('take keepwarm uses the member credential, replaces a stale warm window and
     expect([...stale.gone]).toEqual([first.id])
     expect(f.calls.some(c => c.path.endsWith('/take'))).toBe(false)
     await check.run()
+    expect(first.state).toBe('waiting')
+    const pending = client.pendingBytes()
+    await check.run()
+    expect(client.pendingBytes()).toBe(pending)
+    f.change(first, 'edited')
     await client.syncNow(true)
+    expect(first.state).toBe('waiting') // the queued withdrawal was for the version the scheduler listed
+    await check.run(); await client.syncNow(true)
     const second = [...f.rows.values()].at(-1)!
     expect(first).toMatchObject({ state: 'cancelled', reason: 'withdrawn' })
     expect(second.not_before).toBe(iso(later + 1 + 50 * 60))
@@ -124,6 +132,19 @@ test('take keepwarm uses the member credential, replaces a stale warm window and
     expect(f.rows.size).toBe(2)
     clock = later + 1 + 60 * 60
     await check.run()
+    expect(second.state).toBe('waiting')
+    writeFileSync(file, lines(...turnAt(later), joey(clock), req(clock + 1)))
+    await client.syncNow(true)
+    expect(second.state).toBe('waiting')
+    writeFileSync(file, lines(...turnAt(later)))
+    await check.run()
+    f.down(true)
+    await client.syncNow(true)
+    expect(second.state).toBe('waiting')
+    f.down(false)
+    const restarted = new OnsenClient(client.cfg)
+    restarted.mayWithdrawKeepwarm = row => check.mayWithdraw(row)
+    try { await restarted.syncNow(true) } finally { restarted.stop() }
     expect([...f.rows.values()].filter(r => r.state === 'waiting')).toHaveLength(0)
     writeFileSync(file, lines(joey(later), req(later + 24 * 3600), answer(later + 24 * 3600 + 1), end(later + 24 * 3600 + 2)))
     clock = later + 24 * 3600 + 3

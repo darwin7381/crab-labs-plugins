@@ -10,7 +10,7 @@ export type OwnItem = {
   not_before?: string | null; deadline?: string | null; expires_at?: string | null
 }
 /** The original request stays identical when its response is lost, including across a spool replay. */
-export type ItemWrite = { key: string; item: OwnItem; complete?: true; outcome?: 'withdrawn' | 'completed' | 'superseded'; id?: string; pending_create?: true }
+export type ItemWrite = { key: string; item: OwnItem; complete?: true; outcome?: 'withdrawn' | 'completed' | 'superseded'; id?: string; expected_version?: number; pending_create?: true }
 export type ItemWriter = (write: ItemWrite) => void
 const epochSecond = (time?: string | null) => time ? Math.floor(Date.parse(time) / 1000) : null
 
@@ -95,7 +95,7 @@ export class ItemWrites {
     if (this.paths) this.indexPath(this.paths, id, path)
   }
 
-  async sync(path: string, write: ItemWrite) {
+  async sync(path: string, write: ItemWrite, mayWithdrawKeepwarm?: (row: InboxItem) => boolean) {
     const original = write.item
     const receipt = this.receipt(write.key)
     const outcome = write.outcome ?? (write.complete ? 'completed' : undefined)
@@ -143,7 +143,10 @@ export class ItemWrites {
     const current = await this.req('GET', detail)
     if (current?.status !== 200) return current
     if (current.json.data.state !== 'waiting') { this.observe(current.json.data); return current }
-    const result = await this.req('DELETE', detail, { expected_version: current.json.data.version, outcome })
+    const row: InboxItem = current.json.data
+    if (write.expected_version != null && write.expected_version !== row.version) return current
+    if (original.kind === 'keepwarm' && outcome === 'withdrawn' && mayWithdrawKeepwarm && !mayWithdrawKeepwarm(row)) return current
+    const result = await this.req('DELETE', detail, { expected_version: row.version, outcome })
     if (result?.status !== 409) {
       if (result?.status === 200) this.observe(result.json?.data)
       return result

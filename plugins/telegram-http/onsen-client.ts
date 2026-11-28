@@ -461,6 +461,7 @@ export class OnsenClient {
     }
   }
   hasItemReports(): boolean { return this.itemReports > 0 }
+  mayWithdrawKeepwarm?: (row: import('./onsen-items.ts').InboxItem) => boolean
   onItemCreateSettled?: (key: string, id?: string) => void
   hasPendingItemCreate(keys: Set<string>): boolean {
     for (const line of this.pendingLines()) {
@@ -485,6 +486,11 @@ export class OnsenClient {
       const id = this.writtenItemId(write.key)
       if (id) write = { ...write, id }
       else if (this.hasPendingItemCreate(new Set([write.key]))) write = { ...write, pending_create: true }
+    }
+    if (write.id && write.outcome === 'withdrawn' && write.item.kind === 'keepwarm') {
+      for (const line of this.pendingLines()) {
+        if (line.k === 'item' && line.r.id === write.id && line.r.outcome === write.outcome && line.r.expected_version === write.expected_version) return
+      }
     }
     if (!this.append({ k: 'item', r: write })) throw new Error('could not record the Onsen Item')
   }
@@ -993,7 +999,7 @@ export class OnsenClient {
       }
       if (t.line.k === 'item' || t.line.k === 'self') {
         const path = '/v1/members/' + encodeURIComponent(this.cfg.agent) + '/items'
-        const r = await this.itemWrites.sync(path, t.line.r).catch(e => ({ status: 0, json: { error: errText(e) } }))
+        const r = await this.itemWrites.sync(path, t.line.r, this.mayWithdrawKeepwarm).catch(e => ({ status: 0, json: { error: errText(e) } }))
         if (!r) return
         if (r.status >= 200 && r.status < 300) this.stats.posted++
         else if (refusedForGood(r)) this.reject(t.line, `${t.line.r.item.kind} Item: HTTP ${r.status} ${callSaid(r.json)}`, { kind: 'item', path, status: r.status, code: errCode(r.json) })

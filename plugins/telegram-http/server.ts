@@ -382,6 +382,7 @@ if (ONSEN_TAKE_ON) {
     Lanes.observeItemGates(() => itemPeek!.reset())
   }
 }
+if (onsen) onsen.mayWithdrawKeepwarm = row => takeKeepwarm?.mayWithdraw(row) === true
 if (onsen) { log('info', `onsen: agent=${ONSEN_AGENT} base=${onsen.cfg.base} record=${onsen.cfg.record ? 'on' : 'off'}`); onsen.start() }   // the sync loop (record on only)
 // 1.58.32 (Chiron): a roamer posts nothing to Onsen, so it adds nothing to the spool; what an older version left there stays as it is (not ours to delete)
 if (onsen && Onsen.isRoamerEnv(process.env)) log('info', `onsen: a roamer (ROAMER_MODE=1) records nothing into the Onsen spool; ${onsen.pendingBytes()} bytes an older version left in ${onsen.spool} are kept as they are, not sent`)

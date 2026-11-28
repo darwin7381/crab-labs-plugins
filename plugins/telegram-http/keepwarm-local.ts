@@ -286,6 +286,16 @@ export class LocalKeepwarm {
     } catch { return false }
   }
 
+  /** A queued withdrawal may drain in a later turn or after another idle window has begun. */
+  mayWithdraw(row: InboxItem): boolean {
+    const take = this.d.take
+    if (!take?.mode.active || row.kind !== 'keepwarm' || row.from !== take.mode.member || row.session_id !== 'main') return false
+    const st = this.state(), { s } = this.transcript(st)
+    if (s?.turn_open) return false
+    const due = ((s?.last_req ?? 0) + KEEPWARM_AFTER_S) * 1000
+    return decide(s, st, this.now(), true)[0] !== 'poke' || !sameKeepwarmTime(row.not_before, due)
+  }
+
   /** Reconcile the warm window with waiting Items. A new model action moves the window, including across restarts. */
   private async schedule({ mode, write }: NonNullable<LocalKeepwarmDeps['take']>, s: KScan | null, st: KState, now: number): Promise<void> {
     if (s?.turn_open) return
@@ -315,9 +325,8 @@ export class LocalKeepwarm {
     }
     for (const row of obsolete) {
       if (!stillIdle()) return
-      const r = await mode.req('DELETE', '/v1/items/' + encodeURIComponent(row.id), { expected_version: row.version, outcome: 'withdrawn' })
-      if (r?.status === 409) return // a claim or another version won; read the current row on the next pass
-      if (r?.status !== 200 && r?.status !== 404) throw new Error('could not withdraw stale keepwarm Item')
+      write({ key: 'keepwarm:withdraw:' + row.id, item: { kind: 'keepwarm', refs: [] }, id: row.id,
+        outcome: 'withdrawn', expected_version: row.version })
     }
     if (!wanted || exists || st.poked_for === s!.last_req || !stillIdle()) return
     const item = ownItem('keepwarm', 'main', POKE_TEXT, due)
