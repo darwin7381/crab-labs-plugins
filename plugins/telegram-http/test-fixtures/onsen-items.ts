@@ -134,5 +134,5 @@ export function fakeItems() {
   } })
   return { base: 'http://127.0.0.1:' + server.port, rows, calls, history, add, change, now: () => now,
     advance(ms: number) { now += ms; expire() }, mode(status: number) { mode = status }, down(on: boolean) { unavailable = on },
-    holdReports(on: boolean) { holdReports = on }, delayTake(ms: number) { delayTake = ms }, stop() { for (const wake of waiters) wake(); server.stop(true) } }
+    holdReports(on: boolean) { holdReports = on }, delayTake(ms: number) { delayTake = ms }, stop() { for (const wake of waiters) wake(); return server.stop(true) } }
 }

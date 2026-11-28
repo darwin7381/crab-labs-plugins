@@ -1,13 +1,39 @@
 import { afterEach, expect, test } from 'bun:test'
+import { randomUUID } from 'crypto'
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
 import { startBotApiMock } from './test-fixtures/tg-bot-api-mock.ts'
-import { freePort } from './test-fixtures/tg-daemon.ts'
+import { freePort, until } from './test-fixtures/tg-daemon.ts'
 
 const clean: Array<() => Promise<void> | void> = []
-afterEach(async () => { while (clean.length) await clean.pop()!() })
+afterEach(async () => {
+  const errors = []
+  while (clean.length) {
+    try { await clean.pop()!() } catch (e) { errors.push(e) }
+  }
+  if (errors.length) throw new AggregateError(errors, 'daemon fixture cleanup failed')
+})
+async function stopDaemonGroup(child: Bun.Subprocess) {
+  // Each daemon is its own POSIX process group, including its lane processes and their hooks.
+  const signal = (sig: NodeJS.Signals | 0) => {
+    try { process.kill(-child.pid, sig); return true } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code
+      if (code === 'ESRCH') return false
+      if (sig === 0 && code === 'EPERM') return true // the group still exists; poll until it disappears
+      throw e
+    }
+  }
+  const exited = child.exited
+  signal('SIGTERM')
+  const empty = () => !signal(0)
+  if (!await until(empty, 1000)) {
+    signal('SIGKILL')
+    if (!await until(empty, 3000)) throw new Error('fixture process group still alive: ' + child.pid)
+  }
+  await exited
+}
 async function waitFor(ok: () => boolean | Promise<boolean>, ms = 5000) {
   const end = Date.now() + ms
   while (!await ok() && Date.now() < end) await Bun.sleep(15)
@@ -15,7 +41,7 @@ async function waitFor(ok: () => boolean | Promise<boolean>, ms = 5000) {
 }
 async function daemon(env: Record<string, string> = {}, initialMode = 200, setup?: (root: string) => Record<string, string>) {
   const f = fakeItems(), root = mkdtempSync(join(tmpdir(), 'take-daemon-')), state = join(root, 'tg'), lanes = join(root, '.lanes')
-  clean.push(() => { f.stop(); rmSync(root, { recursive: true, force: true }) })
+  clean.push(async () => { try { await f.stop() } finally { rmSync(root, { recursive: true, force: true }) } })
   f.mode(initialMode)
   for (const dir of [state, lanes, join(root, 'home')]) mkdirSync(dir)
   writeFileSync(join(state, 'access.json'), JSON.stringify({ dmPolicy: 'allowlist', allowFrom: ['1'], groups: {}, pending: {}, ackReaction: '' }))
@@ -30,23 +56,37 @@ async function daemon(env: Record<string, string> = {}, initialMode = 200, setup
     ...env, ...settings,
   }
   if (!childEnv.ONSEN_TAKE) delete childEnv.ONSEN_TAKE
-  const spawn = () => Bun.spawn([process.execPath, '--no-env-file', '--preload', join(import.meta.dir, 'test-fixtures', 'item-daemon.ts'), join(import.meta.dir, 'server.ts')], {
-    cwd: import.meta.dir, stdout: 'ignore', stderr: 'pipe', env: childEnv,
-  })
-  let proc = spawn()
-  clean.push(async () => { if (proc.exitCode === null) proc.kill(); await proc.exited })
-  const base = 'http://127.0.0.1:' + port
-  const log = () => existsSync(join(state, 'server.log')) ? readFileSync(join(state, 'server.log'), 'utf8') : ''
-  const ready = () => waitFor(async () => {
-    if (proc.exitCode !== null) throw new Error('fixture daemon exited ' + proc.exitCode + ': ' + (await new Response(proc.stderr).text()).slice(-1500))
-    return (await fetch(base + '/healthz').catch(() => null))?.ok ?? false
-  })
-  await ready()
-  const restart = async () => { proc.kill('SIGKILL'); await proc.exited; proc = spawn(); await ready() }
   const journal = () => {
     const file = join(state, 'lanes', 'state.jsonl')
     return existsSync(file) ? readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) : []
   }
+  const spawn = () => {
+    const child = Bun.spawn([process.execPath, '--no-env-file', '--preload', join(import.meta.dir, 'test-fixtures', 'item-daemon.ts'), join(import.meta.dir, 'server.ts')], {
+      cwd: import.meta.dir, stdout: 'ignore', stderr: 'pipe', env: childEnv, detached: true,
+    })
+    clean.push(async () => {
+      try {
+        if (child.exitCode === null && existsSync(join(root, 'fixture-lane'))) {
+          writeFileSync(join(root, 'release-lane'), '')
+          await until(() => {
+            const runs = new Map(journal().filter(r => r.rec === 'run').map(r => [r.id, r.state]))
+            return ![...runs.values()].some(s => s === 'running' || s === 'leased')
+          }, 1000)
+        }
+      } finally { await stopDaemonGroup(child) }
+    })
+    return child
+  }
+  let proc = spawn()
+  const base = 'http://127.0.0.1:' + port
+  const log = () => existsSync(join(state, 'server.log')) ? readFileSync(join(state, 'server.log'), 'utf8') : ''
+  const ready = () => waitFor(async () => {
+    if (proc.exitCode !== null) throw new Error('fixture daemon exited ' + proc.exitCode + ': ' + (await new Response(proc.stderr).text()).slice(-1500))
+    const health = await fetch(base + '/healthz').then(r => r.ok ? r.json() : null).catch(() => null)
+    return health?.pid === proc.pid
+  })
+  await ready()
+  const restart = async () => { proc.kill('SIGKILL'); await proc.exited; proc = spawn(); await ready() }
   return { f, root, lanes, state, proc, base, journal, log, restart }
 }
 
@@ -146,7 +186,7 @@ async function runningWorker() {
   const d = await daemon({}, 200, root => {
     const thread = 'adam#worker', last = new Date().toISOString()
     writeFileSync(join(root, '.lanes', 'state.json'), JSON.stringify({
-      lanes: { [worker]: { id: worker, kind: 'worker', n: 1, session_id: '32b0d8cc-1a32-4fd9-abac-1662c9fe4b33',
+      lanes: { [worker]: { id: worker, kind: 'worker', n: 1, session_id: randomUUID(),
         thread, status: 'idle', created: last, last, transcript: join(root, 'worker.jsonl'), runs: 0, tokens_in: 0, tokens_out: 0, topic: 555 } },
       threads: { [thread]: { id: thread, lane: worker, peer: null, hops: 0, tokens: 0, created: last, last } }, topics: { '555': worker },
     }))
