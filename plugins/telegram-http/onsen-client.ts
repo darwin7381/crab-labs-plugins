@@ -102,6 +102,7 @@ export type DeliveryReportLine = { message_id: number
 export type CallRef = { kind: 'peer_call' | 'scheduled' | 'alert' | 'board'; id: string }
 export type CallWait = 'wall' | 'offline' | 'restart'
 export type CallCheck = { final: string } | 'open' | 'wait'
+type CallDetails = { state: string | null; result: unknown; thread_id?: string; conversation_id?: string; caller?: string }
 export type CallStateName = 'accepted' | 'running' | 'completed' | 'failed'
 /** one PUT /v1/calls/<id>/state, as spooled: the Call, the body Onsen takes (state, session_id, result, at), the event and an idem key (local only:
  *  what moment of which item this is) */
@@ -637,33 +638,39 @@ export class OnsenClient {
     const items = Array.isArray(r.json?.items) ? r.json.items.filter((c: any) => c && c.id != null) : []
     return items.length ? { found: { id: String(items[0].id), state: items[0].state ?? null, result: items[0].result ?? null } } : { none: true }
   }
-  /** WO-175: one Call as Onsen has it now (GET /v1/calls/<id>), or null */
-  async getCall(id: string, ms = 3_000): Promise<{ state: string | null; result: unknown; thread_id?: string; conversation_id?: string; caller?: string } | null> {
+  private async lookupCall(id: string, ms = 3_000): Promise<CallDetails | Extract<CallLineFate, { fate: 'refused' }> | null> {
     const r = await this.retried(`/v1/calls/${encodeURIComponent(id)}`, ms).catch(() => null)
-    if (!r || 'fate' in r) return null
+    if (!r) return null
+    if ('fate' in r) return r.fate === 'refused' ? r : null
     const c = r.json?.data ?? r.json
     return c && typeof c === 'object' ? { state: c.state ?? null, result: c.result ?? null,
       thread_id: c.thread_id, conversation_id: c.conversation_id, caller: c.caller } : null
   }
+  /** WO-175: one Call as Onsen has it now (GET /v1/calls/<id>), or null */
+  async getCall(id: string, ms?: number): Promise<CallDetails | null> {
+    const call = await this.lookupCall(id, ms)
+    return call && 'state' in call ? call : null
+  }
   /** Validate a delayed delivery. The stable key also covers a restart between recording the line and closing M1's item. */
   async checkWaitingCall(id: string, why: CallWait, thread?: string): Promise<CallCheck> {
-    const call = await this.getCall(id)
-    if (!call?.state) return 'wait'
+    const call = await this.lookupCall(id)
+    if (!call) return 'wait'
+    if ('fate' in call) {
+      this.cfg.log('warn', `onsen: ending wait for Call ${id} after GET returned HTTP ${call.status}`)
+      return { final: `http_${call.status}` }
+    }
+    if (!call.state) return 'wait'
     if (!['failed', 'cancelled', 'completed', 'expired'].includes(call.state)) return 'open'
+    if (!thread) {
+      this.cfg.log('info', `onsen: waited Call ${id} is ${call.state}. No notice written because no local thread holds the asker.`)
+      return { final: call.state }
+    }
     const when = { wall: '上限解除時', offline: '主線恢復連線時', restart: '重新啟動時' }
     const text = `${when[why]}這件已經是 ${call.state}，沒有交給主線`
     const key = `waited-call:${id}:${call.state}`
-    if (thread) {
-      const at = new Date().toISOString()
-      return this.recordThreads([{ thread, event: 'item', at, dedupe: key,
-        item: { id: key, kind: 'notice', at, text } }]) ? { final: call.state } : 'wait'
-    }
-    if (!call.conversation_id) return 'wait'
-    const r = await this.request('POST', `/v1/conversations/${encodeURIComponent(call.conversation_id)}/messages`, {
-      type: 'system', body: { format: 'markdown', text }, to: call.caller ? [call.caller] : [],
-      thread_ids: call.thread_id ? [call.thread_id] : [], client_message_id: key,
-    })
-    return r && r.status >= 200 && r.status < 300 ? { final: call.state } : 'wait'
+    const at = new Date().toISOString()
+    return this.recordThreads([{ thread, event: 'item', at, dedupe: key,
+      item: { id: key, kind: 'notice', at, text } }]) ? { final: call.state } : 'wait'
   }
   /** a GET tried at CALL_RETRY_AT while Onsen does not answer or answers 5xx (408, 429), all within `ms`: the 2xx answer, or a fate */
   private async retried(path: string, ms: number): Promise<{ status: number; json: any } | CallLineFate> {
