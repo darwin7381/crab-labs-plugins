@@ -1,12 +1,13 @@
 import { afterEach, expect, test } from 'bun:test'
 import { randomUUID } from 'crypto'
-import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { Journal } from './lanes-state.ts'
 import { itemRef } from './onsen-items.ts'
+import { startOnsenStandin } from './test-fixtures/onsen-standin.ts'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
 import { startBotApiMock } from './test-fixtures/tg-bot-api-mock.ts'
 import { freePort, until } from './test-fixtures/tg-daemon.ts'
@@ -43,8 +44,8 @@ async function waitFor(ok: () => boolean | Promise<boolean>, ms = 5000) {
   while (!await ok() && Date.now() < end) await Bun.sleep(15)
   expect(await ok()).toBe(true)
 }
-async function daemon(env: Record<string, string> = {}, initialMode = 200, setup?: (root: string, f: ReturnType<typeof fakeItems>) => Record<string, string> | Promise<Record<string, string>>) {
-  const f = fakeItems(env.LANES_AGENT || 'adam'), root = mkdtempSync(join(tmpdir(), 'take-daemon-')), state = join(root, 'tg'), lanes = join(root, '.lanes')
+async function daemon(env: Record<string, string> = {}, initialMode = 200, setup?: (root: string, f: ReturnType<typeof fakeItems>) => Record<string, string> | Promise<Record<string, string>>, actionPort?: number) {
+  const f = fakeItems(env.LANES_AGENT || 'adam', actionPort), root = mkdtempSync(join(tmpdir(), 'take-daemon-')), state = join(root, 'tg'), lanes = join(root, '.lanes')
   clean.push(async () => { try { await f.stop() } finally { rmSync(root, { recursive: true, force: true }) } })
   f.mode(initialMode)
   for (const dir of [state, lanes, join(root, 'home')]) mkdirSync(dir)
@@ -643,6 +644,62 @@ test('a later successful probe drains the local poll before the bridge can carry
   expect(bot.polls).toHaveLength(calls)
   await waitFor(() => d.f.calls.some(c => c.body?.connector === 'mac-mini/' + member && c.path.endsWith('/observation')))
 }, 9000)
+
+test('/roam without a target creates one menu Action; a returned choice is handled once through control', async () => {
+  const actions = startOnsenStandin({ 'test-member': member })
+  clean.push(() => actions.stop())
+  const d = await daemon({ ...roamerEnv, ONSEN_OWNER: 'joey', C6_ROAMER_MENU: '1' }, 200, root => {
+    const bin = join(root, 'bin')
+    mkdirSync(bin)
+    // This takeover already has an MCP stream. There is no real tmux pane or Claude argv in the fixture.
+    writeFileSync(join(bin, 'ps'), '#!/bin/sh\nexit 1\n', { mode: 0o700 })
+    writeFileSync(join(bin, 'tmux'), '#!/bin/sh\n[ "$1" = has-session ]\n', { mode: 0o700 })
+    return { ...roamerState(root), PATH: bin + ':' + process.env.PATH }
+  }, actions.port)
+  const available = join(d.root, 'lab-target')
+  const lab = await target(d)
+  const entry = { pid: lab.child.pid, sessionId: lab.sid, cwd: lab.cwd, kind: 'interactive', status: 'idle', startedAt: 1 }
+  writeFileSync(available, JSON.stringify(entry))
+  const cmd = command(d, 'choose', '/roam@space_roamersbot', '99')
+  await waitFor(() => cmd.state === 'completed')
+  expect(actions.actions.size).toBe(1)
+  const action = [...actions.actions.values()][0]!
+  expect(action).toMatchObject({ source: 'menu', assignees: ['joey'], options: [{ id: '1', label: expect.any(String) }] })
+  expect(d.f.calls.filter(c => c.path === '/v1/messages')).toHaveLength(0)
+  const payload = actions.press(action.id, '1')
+  const press = (id: string) => d.f.add(id, 'control', { action_id: action.id, payload })
+  const first = press('press')
+  await waitFor(() => first.state === 'completed')
+  expect(JSON.parse(readFileSync(roamerState(d.root).ROAMER_STATE_FILE, 'utf8')).current_target.session_id).toBe(lab.sid)
+  const replies = d.f.calls.filter(c => c.path === '/v1/messages').length
+  expect(replies).toBeGreaterThan(0)
+  expect(actions.acalls.filter(c => c.path.endsWith('/applied'))).toHaveLength(1)
+  const repeat = press('repeat')
+  await waitFor(() => repeat.reason === 'not_applied')
+  expect(actions.acalls.filter(c => c.path.endsWith('/applied'))).toHaveLength(1)
+  expect(d.f.calls.filter(c => c.path === '/v1/messages')).toHaveLength(replies)
+  const next = command(d, 'stale', '/roam', '100')
+  await waitFor(() => next.state === 'completed')
+  const stale = [...actions.actions.values()].at(-1)!
+  unlinkSync(available)
+  const missed = d.f.add('stale-choice', 'control', { action_id: stale.id, payload: actions.press(stale.id, '1') })
+  await waitFor(() => missed.reason === 'not_applied')
+  expect(actions.acalls.filter(c => c.path === '/v1/actions/' + stale.id + '/applied')).toHaveLength(0)
+  for (const [slash, kind] of [['/resume_list', 'resume_picker'], ['/model', 'model_picker'], ['/effort', 'other']]) {
+    lab.select()
+    lab.accept({ meta: { message_id: '99', onsen_claims: '' } })
+    const before = actions.actions.size
+    const c = command(d, slash.slice(1), slash, String(100 + before))
+    await waitFor(() => c.state === 'completed')
+    expect(actions.actions.size).toBe(before + 1)
+    const picker = [...actions.actions.values()].at(-1)!
+    expect(picker).toMatchObject({ source: 'menu', menu_kind: kind })
+    writeFileSync(roamerState(d.root).ROAMER_STATE_FILE, JSON.stringify({ current_target: null }))
+    const gone = d.f.add('gone-' + slash.slice(1), 'control', { action_id: picker.id, payload: actions.press(picker.id, '1') })
+    await waitFor(() => gone.reason === 'not_applied')
+    expect(actions.acalls.filter(c => c.path === '/v1/actions/' + picker.id + '/applied')).toHaveLength(0)
+  }
+}, 15000)
 
 async function target(d: Awaited<ReturnType<typeof daemon>>) {
   const child = Bun.spawn(['sleep', '300']), sid = randomUUID()

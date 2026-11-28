@@ -1,4 +1,6 @@
 // Child of the C1 HTTP tests. Both identities live entirely in memory.
+import { existsSync, readFileSync } from 'fs'
+import { join } from 'path'
 import { mock, spyOn } from 'bun:test'
 import * as identity from '../mesh-identity.ts'
 import * as mcpAuth from '../mcp-auth.ts'
@@ -21,6 +23,15 @@ if (process.env.C1_COMMAND_FAILURE === '1') {
 if (process.env.ROAMER_MODE === '1') {
   const lanes = await import('../lanes.ts')
   spyOn(lanes, 'claudePidOf').mockImplementation(req => Number(req.headers['x-test-claude-pid']) || null)
+}
+if (process.env.C6_ROAMER_MENU === '1') {
+  const finder = await import('../session-finder.ts')
+  const dir = process.env.AGENT_WORKSPACE_DIR!
+  const roamer = await import('../roamer-control.ts')
+  roamer.startTakeoverWait('lab-tmux')
+  const listing = join(dir, 'lab-target')
+  spyOn(finder, 'claudeAgents').mockImplementation(async () => existsSync(listing) ? [JSON.parse(readFileSync(listing, 'utf8'))] : [])
+  spyOn(finder, 'findTmuxForPid').mockResolvedValue('lab-tmux')
 }
 if (process.env.C6_FAST_PROBE === '1') {
   const { TakeMode } = await import('../onsen-take.ts')

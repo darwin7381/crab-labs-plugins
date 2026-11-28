@@ -564,8 +564,9 @@ async function applyKeyboardControl(ka: KeyboardAsk, h: Onsen.ActionHandle, c: O
   const here = ka.where                                                       // answered where the command was typed
   const reply = (msg: string, opts?: ReplyOptions) => sendTextWithMaybeKeyboard(ka.chat, msg, opts?.keyboard, here)
   let ok = true
-  try { await Onsen.withSender('system:control', () => runControlCallback(ka.datas[idx]!, String(process.env.TELEGRAM_HTTP_PORT ?? HTTP_PORT), reply)) }
+  try { await Onsen.withSender('system:control', () => runControlCallback(ka.datas[idx]!, String(process.env.TELEGRAM_HTTP_PORT ?? HTTP_PORT), reply, () => { ok = false })) }
   catch (e) { ok = false; log('warn', `connector: the choice ${c.option_id} of action ${c.action_id} failed: ${e instanceof Error ? e.message : e}`) }
+  if (!ok) { acts.cancel(h, '選項未能套用'); return false }
   acts.applied(h, { at: new Date().toISOString() })
   log('info', `connector: action ${c.action_id} (a command's choice): option ${c.option_id} pressed in Onsen, done as a tap on it`)
   return ok
@@ -3243,7 +3244,7 @@ async function pairedStatusText(name: string): Promise<string> {
 
 /** the choice a command offered (resume: roam: model: effort:), pressed: what the press does (a Telegram tap, or WO-197 segment 2: the Onsen Action's
  *  option, action_control) */
-async function runControlCallback(data: string, httpPort: string, reply: (msg: string, opts?: ReplyOptions) => Promise<void>): Promise<void> {
+async function runControlCallback(data: string, httpPort: string, reply: (msg: string, opts?: ReplyOptions) => Promise<void>, notApplied?: () => void): Promise<void> {
   // Roamer /model + /effort picker taps carry `@<hash6>` — validate + drive
   // the CURRENT target (issue #7). Plain model:/effort: stays channel-bot.
   if (isRoamerEnabled() && (data.startsWith('model:') || data.startsWith('effort:')) && data.includes('@')) {
@@ -3252,10 +3253,10 @@ async function runControlCallback(data: string, httpPort: string, reply: (msg: s
     const value = data.slice(prefix.length, at).trim()
     const hash = data.slice(at + 1).trim()
     const cmd = prefix === 'model:' ? '/model' as const : '/effort' as const
-    if (await handleModelCallbackForCurrentTarget(value, hash, reply, cmd)) return
+    if (await handleModelCallbackForCurrentTarget(value, hash, reply, cmd, notApplied)) return
   }
   if (isRoamerEnabled() && !data.startsWith('model:') && !data.startsWith('effort:')) {
-    await handleRoamerCallback(data, reply)
+    if (!await handleRoamerCallback(data, reply, notApplied)) notApplied?.()
   } else if (data.startsWith('resume:') || data.startsWith('model:') || data.startsWith('effort:')) {
     await handleCallbackData(data, httpPort, reply)
   }

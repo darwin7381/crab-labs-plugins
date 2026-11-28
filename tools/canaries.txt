@@ -300,7 +300,7 @@ plugins/telegram-http/server.ts::if (!tg) { await connectorAnswer(chatId, text, 
 plugins/telegram-http/server.ts::async function connectorAnswer(chat: string, text: string, keyboard?: InlineButton[][], where?: Lanes.TopicAsk): Promise<void> {
 plugins/telegram-http/server.ts::function commandMenuKind(datas: string[]): string {
 plugins/telegram-http/server.ts::async function connectorCommand(text: string, chat: string, ref: string, userId: string, user: string, topic: number | undefined, atIso?: string,
-plugins/telegram-http/server.ts::async function runControlCallback(data: string, httpPort: string, reply: (msg: string, opts?: ReplyOptions) => Promise<void>): Promise<void> {
+plugins/telegram-http/server.ts::async function runControlCallback(data: string, httpPort: string, reply: (msg: string, opts?: ReplyOptions) => Promise<void>, notApplied?: () => void): Promise<void> {
 plugins/telegram-http/server.ts::async function reportCommands(): Promise<void> {
 plugins/telegram-http/server.ts::function connectorOwner(): string | null {
 plugins/telegram-http/server.ts::if (CONNECTOR) { void ownerSay('system:alert', text); return }
