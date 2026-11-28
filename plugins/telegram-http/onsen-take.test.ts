@@ -469,6 +469,20 @@ test('settled 59: the next delivery carries the waiting line once and its normal
   expect(r.f.calls.filter(c => c.path === '/v1/items/' + r.resume.id && c.body.outcome)).toMatchObject([{ body: { expected_version: 1, outcome: 'withdrawn' } }])
 })
 
+test('settled 59: when the wall clears with a message already waiting, the resume rides that message', async () => {
+  const r = await accountCut()
+  r.enqueue(r.f.add('also-waiting'))
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 })
+  await until(() => { void r.m.pump(); return r.offers.length === 1 })
+  expect(r.offers).toHaveLength(1)
+  expect(r.offers[0].params.content).toContain('also-waiting')
+  expect(r.offers[0].params.content.split(r.row.payload.text)).toHaveLength(2)
+  expect(r.row.state).toBe('waiting')
+  await r.hook('UserPromptSubmit', { dids: [r.offers[0].params.meta.did] })
+  await r.hook('Stop', { phase: 'final' }); await r.sync()
+  expect(r.row.reason).toBe('withdrawn')
+})
+
 test.each(['PostToolUse', 'Stop'])('settled 59: a row pulled at %s carries the line into that prompt once', async boundary => {
   const r = await waitingModelCut()
   const turn = { prompt_id: 'background', source: 'task-notification' }

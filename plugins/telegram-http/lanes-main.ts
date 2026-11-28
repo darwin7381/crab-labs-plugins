@@ -537,6 +537,7 @@ export function createMain(E: MainEnv) {
       // Keep the existing leads first. A process-cut item rides one, or leads if none can be written.
       return ready.filter(r => (!heldCut(r) || releasedCut(r)) && !r.onsen_items?.some((ref: ItemRef) => ref.reason === 'cut_person'))
         .concat(ready.filter(r => heldCut(r) && r.cut_by === 'gen_end'))
+        .sort((a, b) => Number(isResume(a)) - Number(isResume(b))) // a waiting resume rides a deliverable row before it leads
     }
     const cands = candidates()
     if (!cands.length && !resume) return
