@@ -54,7 +54,7 @@ plugins/telegram-http/startup-picker.ts::opts.skip?.(t.tmux)
 plugins/telegram-http/inbox-text.ts::send_to_agent：找別隻 agent 只有這一個工具，底下三條線
 plugins/telegram-http/fleet-mail.ts::export async function sendToAgent
 plugins/telegram-http/channel-bot-control.ts::hooks.afterClear(ok)
-plugins/telegram-http/server.ts::reply, connectorClearHooks(chat, ref,
+plugins/telegram-http/server.ts::reply, { ...connectorClearHooks(chat, ref,
 plugins/telegram-http/server.ts::await deliverEditedMessage(m, [String(p.message_id)])
 plugins/telegram-http/onsen-client.ts::async drawLine(
 plugins/telegram-http/server.ts::onsenFacts.delivered(chat_id, msgId)
@@ -212,7 +212,7 @@ plugins/telegram-http/roamer-telegram.ts::await h.finishInbound(this.inboundFact
 plugins/telegram-http/server.ts::if (it.kind === 'person_message' || it.kind === 'person_edit') return personPulled(it, again)
 plugins/telegram-http/server.ts::const r = await fetch(`http://127.0.0.1:${port}/onsen/person`
 plugins/telegram-http/server.ts::if (!INBOX_ONLY && u.pathname === '/onsen/person' && req.method === 'POST') {
-plugins/telegram-http/server.ts::await deliverFormAnswer(fi, await onsenInboundNow() ? 'rules' : 'main', [String(p.message_id)])
+plugins/telegram-http/server.ts::await deliverFormAnswer(fi, it.item?.main || !await onsenInboundNow() ? 'main' : 'rules', [String(p.message_id)]
 plugins/telegram-http/onsen-inbound.ts::export const BACK_MS = 20_000
 plugins/telegram-http/onsen-inbound.ts::after(of: string, event: Record<string, unknown>): boolean {
 plugins/telegram-http/server.ts::const INBOUND_BACK_MS = Number(process.env.ONSEN_INBOUND_BACK_MS) || OnsenInbound.BACK_MS
@@ -247,7 +247,7 @@ plugins/telegram-http/server.ts::...(a.mime && !sticker ? { mime: String(a.mime)
 plugins/telegram-http/onsen-status.ts::export const HANDLED_HERE = 'daemon'
 plugins/telegram-http/onsen-status.ts::this.emit(chat, String(id), 'turn_end', HANDLED_HERE, at, { handled_here: how }, { outcome, ...(turnId ? { turn_id: turnId } : {}) })
 plugins/telegram-http/server.ts::async function handledHere<T>(who: SelfWho | null, how: string, run: () => Promise<T>, mine: (r: T | undefined) => boolean = () => true): Promise<T> {
-plugins/telegram-http/server.ts::return handledHere({ chat, id: ref, from: userId
+plugins/telegram-http/server.ts::handled = await handledHere({ chat, id: ref, from: userId
 plugins/telegram-http/roamer-telegram.ts::await h.handledHere(self, 'permission', async () => {
 plugins/telegram-http/roamer-telegram.ts::const handled = await h.handledHere(ownSlash, 'command', () => handleControlSlash(text, h.httpPort,
 plugins/telegram-http/roamer-telegram.ts::const handled = await h.handledHere(ownSlash, 'command', () => handleRoamerSlash(text, async (msg: string, opts?: ReplyOptions) => {
@@ -268,7 +268,7 @@ plugins/telegram-http/startup-picker.ts::export function permissionShaped(option
 plugins/telegram-http/server.ts::observe: paneObserved,
 plugins/telegram-http/server.ts::const carried = !!picker && permissionCarried(picker)
 plugins/telegram-http/server.ts::is the permission prompt: its own Action carries it, no second one${!tg ? ', nothing to Telegram' : ''}
-plugins/telegram-http/server.ts::if (pa) { await applyPickerControl(pa, h, c); return }
+plugins/telegram-http/server.ts::if (pa) return applyPickerControl(pa, h, c)
 plugins/telegram-http/server.ts::try { res = await driveStartupPicker(pa.tmux, idx, pa.key) } finally { pa.ended = true; pa.pressing = false }
 plugins/telegram-http/server.ts::for (const p of openMainPrompts()) if (p.opened + PERM_DRAW_GRACE_MS <= sinceBoth) permOffScreen(p,
 plugins/telegram-http/server.ts::if (open.some(p => p.opened > was.since)) for (const p of open) if (p.opened <= was.since) permOffScreen(p,
@@ -391,7 +391,7 @@ plugins/telegram-http/lanes-main.ts::function wallDelivery(
 plugins/telegram-http/lanes-main.ts::return wall.person && r.kind === 'joey' && !refused
 plugins/telegram-http/lanes-main.ts::if (wake === 'wall-clear' || (wake === 'person' && wallDelivery().person)) wallWakePending = true
 # WO-204 part 2 (1.59.4)
-plugins/telegram-http/lanes-main.ts::ready.filter(r => !heldCut(r) || releasedCut(r))
+plugins/telegram-http/lanes-main.ts::ready.filter(r => (!heldCut(r) || releasedCut(r))
 # WO-205 (1.59.5)
 plugins/telegram-http/onsen-status.ts::mainForAdoption()
 plugins/telegram-http/lanes-main.ts::main adopted from the session registry
