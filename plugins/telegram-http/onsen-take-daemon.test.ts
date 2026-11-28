@@ -135,6 +135,208 @@ function scriptedLane(root: string) {
   return { LANES_CLAUDE_BIN: bin }
 }
 
+const worker = 'adam.worker.1'
+async function laneHook(root: string, n: number, event: string) {
+  const file = join(root, 'hook-' + n)
+  writeFileSync(file, event)
+  await waitFor(() => existsSync(file + '.out'))
+  return readFileSync(file + '.out', 'utf8').trim()
+}
+async function runningWorker() {
+  const d = await daemon({}, 200, root => {
+    const thread = 'adam#worker', last = new Date().toISOString()
+    writeFileSync(join(root, '.lanes', 'state.json'), JSON.stringify({
+      lanes: { [worker]: { id: worker, kind: 'worker', n: 1, session_id: '32b0d8cc-1a32-4fd9-abac-1662c9fe4b33',
+        thread, status: 'idle', created: last, last, transcript: join(root, 'worker.jsonl'), runs: 0, tokens_in: 0, tokens_out: 0, topic: 555 } },
+      threads: { [thread]: { id: thread, lane: worker, peer: null, hops: 0, tokens: 0, created: last, last } }, topics: { '555': worker },
+    }))
+    return scriptedLane(root)
+  })
+  const person = (id: string, tg: string) => d.f.add(id, 'message', { message_id: id, payload: {
+    message_id: id, from: 'joey', conversation_id: 'conv', kind: 'text', thread: 555, text: id,
+    client: { name: 'telegram', chat: '1', msg_id: tg, user_id: '1', user: 'Joey', thread: '555' },
+  } })
+  person('start-worker', '550')
+  await waitFor(() => d.f.history.some(h => h.item_id === 'start-worker' && h.body.session_id === worker))
+  const row = person('message-during-run', '551')
+  const input = join(d.lanes, 'run', 'steer', worker + '.in.jsonl')
+  await waitFor(() => existsSync(input) && readFileSync(input, 'utf8').includes(row.id))
+  const hook = (n: number, event: string) => laneHook(d.root, n, event)
+  const reports = () => d.f.history.filter(h => h.item_id === row.id)
+  const takes = () => d.f.calls.filter(c => c.path.endsWith('/take') && c.body.item_ids.includes(row.id))
+  return { d, person, row, input, hook, reports, takes }
+}
+
+for (const event of ['PostToolUse', 'Stop']) test('the running worker takes a person at its ' + event + ' steer hook', async () => {
+  const { d, row, input, hook, reports, takes } = await runningWorker()
+  const stub = JSON.parse(readFileSync(input, 'utf8').trim())
+  expect(stub).toEqual({ id: 'item-' + row.id + '-v1', run: worker + '.r1', take: true })
+  const refused = await fetch(d.base + '/lane-steer', { method: 'POST', body: JSON.stringify({ ids: [stub.id] }) })
+  expect(refused.status).toBe(403)
+  expect(row.state).toBe('waiting')
+  expect(takes()).toHaveLength(0)
+  const out = JSON.parse(await hook(1, event))
+  expect(event === 'Stop' ? out.reason : out.hookSpecificOutput.additionalContext).toContain(row.id)
+  await waitFor(() => reports().some(h => h.body.outcome === 'in_session'))
+  expect(reports()[0]!.body.session_id).toBe(worker)
+  expect(takes().map(c => c.body.item_ids)).toEqual([[row.id]])
+  expect(await hook(2, 'PostToolUse')).toBe('')
+  const folded = d.journal().find(r => r.rec === 'run' && r.steered?.some((ev: any) => ev.id === stub.id))
+  expect(folded.id).toBe(d.journal().find(r => r.rec === 'run' && r.run === stub.run).id)
+  writeFileSync(join(d.root, 'release-lane'), '')
+  await waitFor(() => row.state !== 'claimed')
+  expect(reports().map(h => h.body.outcome)).toEqual(['in_session', 'completed'])
+  expect(d.journal().filter(r => r.rec === 'run' && r.state === 'leased' && r.lane === worker)).toHaveLength(1)
+}, 13000)
+
+test('a late lane hook take renders nothing, retries the same key and returns the claim', async () => {
+  const { d, row, hook, reports, takes } = await runningWorker()
+  d.f.delayTake(4200)
+  const start = Date.now()
+  expect(await hook(1, 'PostToolUse')).toBe('')
+  expect(Date.now() - start).toBeLessThan(3750)
+  await waitFor(() => reports().some(h => h.body.outcome === 'not_taken'))
+  expect(takes().length).toBeGreaterThanOrEqual(2)
+  expect(new Set(takes().map(c => c.key)).size).toBe(1)
+  expect(reports().map(h => h.body.outcome)).toEqual(['not_taken'])
+  d.f.delayTake(0)
+  expect(await hook(2, 'PostToolUse')).toContain(row.id)
+  await waitFor(() => reports().some(h => h.body.session_id === worker))
+  writeFileSync(join(d.root, 'release-lane'), '')
+  await waitFor(() => row.state === 'completed')
+}, 14000)
+
+test('one hook takes the available messages together, uses the pending edit and drops a cancelled row', async () => {
+  const { d, person, row, input, hook, takes } = await runningWorker()
+  const cancelled = person('cancel-before-hook', '552'), other = person('another-message', '553')
+  await waitFor(() => readFileSync(input, 'utf8').includes(other.id))
+  row.payload.text = 'edited at the tool boundary'
+  d.f.change(row, 'edited')
+  cancelled.state = 'cancelled'; d.f.change(cancelled, 'cancelled')
+  await waitFor(() => readFileSync(join(d.lanes, 'state.json'), 'utf8').includes(row.payload.text))
+  const text = JSON.parse(await hook(1, 'PostToolUse')).hookSpecificOutput.additionalContext
+  expect(text).toContain(row.payload.text)
+  expect(text).toContain(other.id)
+  expect(text).not.toContain(cancelled.id)
+  expect(takes().map(c => c.body.item_ids)).toEqual([[row.id, cancelled.id, other.id]])
+  expect(d.f.calls.filter(c => c.path === '/v1/items/' + cancelled.id)).toHaveLength(1)
+  await waitFor(() => [row, other].every(r => d.f.history.some(h => h.item_id === r.id && h.body.session_id === worker)))
+  expect(JSON.parse(readFileSync(join(d.lanes, 'state.json'), 'utf8')).steering?.[worker]).toBeUndefined()
+  expect(d.f.history.filter(h => h.item_id === cancelled.id)).toHaveLength(0)
+  writeFileSync(join(d.root, 'release-lane'), '')
+})
+
+test('closing a worker before its hook releases the pending person to M1 without a report', async () => {
+  const { d, row, hook, reports, takes } = await runningWorker()
+  const version = row.version
+  const closed = command(d, 'close-steering', '/lanes close ' + worker, '554')
+  await waitFor(() => closed.state === 'completed')
+  await waitFor(() => d.journal().some(r => r.rec === 'msg' && r.onsen_items?.[0]?.onsen_item_id === row.id))
+  expect(await hook(1, 'PostToolUse')).not.toContain(row.id)
+  expect([row.state, row.version]).toEqual(['waiting', version])
+  expect(takes()).toHaveLength(0)
+  expect(reports()).toHaveLength(0)
+  writeFileSync(join(d.root, 'release-lane'), '')
+})
+
+test('a worker closing while its hook take is in flight reassigns only the granted row', async () => {
+  const { d, row, hook, reports, takes } = await runningWorker()
+  d.f.delayTake(1300)
+  const result = hook(1, 'PostToolUse')
+  await waitFor(() => row.state === 'claimed')
+  d.f.delayTake(0)
+  const close = command(d, 'close-at-hook', '/lanes close ' + worker, '555')
+  await waitFor(() => close.state === 'completed')
+  expect(await result).toBe('')
+  await waitFor(() => d.journal().some(r => r.rec === 'msg' && r.onsen_items?.[0]?.onsen_item_id === row.id))
+  expect(takes()).toHaveLength(1)
+  expect(reports().map(h => h.body.outcome)).toEqual(['reassigned'])
+  expect(reports()[0]!.body.note).toContain(worker)
+  writeFileSync(join(d.root, 'release-lane'), '')
+})
+
+test('a running worker receives all the waiting album IDs in one hook take', async () => {
+  const { d, person, row, hook, takes } = await runningWorker()
+  const album = ['left', 'right'].map((id, n) => {
+    const r = person(id, String(560 + n))
+    Object.assign(r.payload, { media_group_id: 'worker-album', kind: 'document',
+      attachments: [{ kind: 'document', name: id + '.pdf', client_ref: id, mime: 'application/pdf' }] })
+    r.payload.client.meta = { media_group_count: '2' }
+    return r
+  })
+  const pending = () => JSON.parse(readFileSync(join(d.lanes, 'state.json'), 'utf8')).steering?.[worker] ?? []
+  await waitFor(() => pending().some((s: any) => s.ev.onsen_items?.length === 2))
+  expect(album.every(r => r.state === 'waiting')).toBe(true)
+  expect(takes()).toHaveLength(0)
+  const content = JSON.parse(await hook(1, 'PostToolUse')).hookSpecificOutput.additionalContext
+  for (const r of album) expect(content).toContain(r.id)
+  expect(takes().map(c => c.body.item_ids)).toEqual([[row.id, ...album.map(r => r.id)]])
+  await waitFor(() => album.every(r => d.f.history.some(h => h.item_id === r.id && h.body.session_id === worker)))
+  writeFileSync(join(d.root, 'release-lane'), '')
+  await waitFor(() => album.every(r => r.state === 'completed'))
+})
+
+test('two peek pages of steering reach one boundary in takes of at most 100 IDs', async () => {
+  const { d, person, row, input, hook } = await runningWorker()
+  const messages = [row, ...Array.from({ length: 100 }, (_, n) => person('burst-' + n, String(1000 + n)))]
+  await waitFor(() => readFileSync(input, 'utf8').trim().split('\n').length === messages.length, 8000)
+  expect(messages.every(r => r.state === 'waiting')).toBe(true)
+  const text = JSON.parse(await hook(1, 'PostToolUse')).hookSpecificOutput.additionalContext
+  expect(text).toContain('「burst-99」')
+  expect(text).toContain('「' + row.id + '」')
+  const takes = d.f.calls.filter(c => c.path.endsWith('/take') && !c.body.item_ids.includes('start-worker'))
+  expect(takes.map(c => c.body.item_ids.length).sort((a, b) => b - a)).toEqual([100, 1])
+  expect(new Set(takes.flatMap(c => c.body.item_ids))).toEqual(new Set(messages.map(r => r.id)))
+  writeFileSync(join(d.root, 'release-lane'), '')
+}, 15000)
+
+test('a worker that ends before a boundary takes its pending message once at the next run start', async () => {
+  const { d, row, takes, reports } = await runningWorker()
+  expect(takes()).toHaveLength(0)
+  writeFileSync(join(d.root, 'release-lane'), '')
+  await waitFor(() => row.state === 'completed')
+  expect(takes()).toHaveLength(1)
+  expect(reports().map(h => h.body.outcome)).toEqual(['in_session', 'completed'])
+  const run = d.journal().find(r => r.rec === 'run' && r.state === 'running' && r.event === 'item-' + row.id + '-v1')
+  expect(run.run).toBeTruthy()
+  expect(reports()[0]!.body.session_id).toBe(worker)
+  expect(d.journal().filter(r => r.rec === 'run' && r.state === 'leased' && r.lane === worker)).toHaveLength(2)
+}, 10000)
+
+test('a daemon restart folds the steer receipt into the interrupted run and reports its cut once', async () => {
+  const { d, row, hook, reports } = await runningWorker()
+  expect(await hook(1, 'PostToolUse')).toContain(row.id)
+  const claim = row.claim!.id
+  d.f.mode(409)  // the interrupted claims can finish; no fresh delivery on this boot
+  await d.restart()
+  await waitFor(() => reports().some(h => h.body.outcome === 'cut'), 8000)
+  expect(reports().filter(h => h.body.claim_id === claim).map(h => h.body.outcome)).toEqual(['in_session', 'cut'])
+  expect(reports()[0]!.body.session_id).toBe(worker)
+  expect(d.journal().some(r => r.rec === 'run' && r.steered?.some((e: any) => e.onsen_items[0].onsen_item_id === row.id))).toBe(true)
+  expect(d.journal().some(r => r.rec === 'run' && r.state === 'queued' && r.ev?.onsen_items?.[0]?.onsen_item_id === row.id)).toBe(false)
+  writeFileSync(join(d.root, 'release-lane'), '')
+}, 12000)
+
+test('a second alert of the running incident is taken and merged at its steer hook', async () => {
+  const d = await daemon({}, 200, scriptedLane)
+  const alert = (id: string, check: string) => d.f.add(id, 'alert', { from: 'alert-dispatcher',
+    refs: [{ kind: 'incident', value: 'node-1' }, { kind: 'alert', value: id }],
+    payload: { text: '【警報 warning】alert ' + id + '：netdata / node-1 / ' + check + ' = 1 checks', line: 'call' } })
+  const first = alert('9021', 'first_check')
+  await waitFor(() => d.f.history.some(h => h.item_id === first.id && h.body.outcome === 'in_session'))
+  const lane = d.f.history.find(h => h.item_id === first.id)!.body.session_id!
+  const second = alert('9022', 'another_check'), input = join(d.lanes, 'run', 'steer', lane + '.in.jsonl')
+  await waitFor(() => existsSync(input) && readFileSync(input, 'utf8').includes(second.id))
+  expect(second.state).toBe('waiting')
+  const text = JSON.parse(await laneHook(d.root, 1, 'PostToolUse')).hookSpecificOutput.additionalContext
+  expect(text).toContain('系統併入')
+  expect(text).toContain('another_check')
+  await waitFor(() => d.f.history.some(h => h.item_id === second.id && h.body.session_id === lane))
+  writeFileSync(join(d.root, 'release-lane'), '')
+  await waitFor(() => second.state === 'completed')
+  expect(d.f.history.filter(h => h.item_id === second.id).map(h => h.body.outcome)).toEqual(['in_session', 'completed'])
+})
+
 test('a busy lane slot leaves the next alert waiting; its run receives the claim and hands back the note to M1', async () => {
   const d = await daemon({ LANES_MAX: '1' }, 200, scriptedLane)
   const add = (id: string) => d.f.add(id, 'alert', { from: 'alert-dispatcher', payload: { text: '[P2] ' + id, line: 'call' } })
