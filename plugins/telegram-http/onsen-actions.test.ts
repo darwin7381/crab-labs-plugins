@@ -99,69 +99,47 @@ describe('OnsenActions', () => {
     expect(a.find(null, '1')).toBe(h)
   })
 
-  test('the duty officer\'s own press is made resolved; summary and labels cut to one line', async () => {
+  test('a menu opens with summary and labels cut to one line', async () => {
     const s = standIn()
     const a = new OnsenActions({ req: s.req, log })
     const h = a.open({ source: 'menu', menu_kind: 'model_picker', session_id: null, assignees: ['duty-officer'], summary: '模型\n選單 ' + 'x'.repeat(300), body: null,
-      options: [{ id: '1', label: 'Opus\n5.5' }, { id: '2', label: 'Sonnet' }], resolved: { option_id: '1', by: 'duty-officer' } }, 'menu:k')!
+      options: [{ id: '1', label: 'Opus\n5.5' }, { id: '2', label: 'Sonnet' }] }, 'menu:k')!
     await h.tail
     const b = s.calls[0]!.body
-    expect(b).toMatchObject({ state: 'resolved', selected_option_id: '1', resolved_by: 'duty-officer', menu_kind: 'model_picker', options: [{ id: '1', label: 'Opus 5.5' }, { id: '2', label: 'Sonnet' }] })
+    expect(b).toMatchObject({ menu_kind: 'model_picker', options: [{ id: '1', label: 'Opus 5.5' }, { id: '2', label: 'Sonnet' }] })
     expect(b.summary.length).toBe(200)
     expect(b.summary.includes('\n')).toBe(false)
     expect('session_id' in b || 'body' in b).toBe(false)              // null: not sent
-    expect(h.state).toBe('resolved')
+    expect(h.state).toBe('open')
   })
 
-  test('Onsen 0.36.0: expiry_note goes with expires_at on an open Action, one line, 2000 characters at most; never without expires_at, never on a resolved one', async () => {
+  test('Onsen 0.36.0: expiry_note goes with expires_at on an open Action, one line, 2000 characters at most; only with expires_at', async () => {
     const s = standIn()
     const a = new OnsenActions({ req: s.req, log })
     const at = '2026-11-27T20:00:05.000Z', menu = { source: 'menu' as const, menu_kind: 'other', session_id: 'main', assignees: ['joey'], summary: 's', options: [{ id: 'line', label: 'x' }] }
     const h1 = a.open({ ...menu, expires_at: at, expiry_note: '沒按：新的一段\n看得到之前的對話' }, 'x1')!
     const h2 = a.open({ ...menu, expiry_note: '沒選：沒有更動' }, 'x2')!                                    // no expires_at: dropped
     const h3 = a.open({ ...menu, expires_at: at, expiry_note: 'y'.repeat(2500) }, 'x3')!
-    const h4 = a.open({ ...menu, expires_at: at, expiry_note: 'z', resolved: { option_id: 'line', by: 'duty-officer' } }, 'x4')!   // resolved: dropped
     const h5 = a.open({ ...menu, expires_at: at, expiry_note: '  ' }, 'x5')!                                  // blank: not sent
-    for (const h of [h1, h2, h3, h4, h5]) await h.tail
+    for (const h of [h1, h2, h3, h5]) await h.tail
     const body = (k: number) => s.calls.filter(c => c.path === '/v1/actions')[k]!.body
     expect(body(0)).toMatchObject({ expires_at: at, expiry_note: '沒按：新的一段 看得到之前的對話' })
     expect('expiry_note' in body(1) || 'expires_at' in body(1)).toBe(false)
     expect(body(2).expiry_note.length).toBe(2000)
-    expect('expiry_note' in body(3)).toBe(false); expect(body(3).state).toBe('resolved')
-    expect('expiry_note' in body(4)).toBe(false)
-    expect([h1, h2, h3, h4, h5].map(h => h.state)).toEqual(['open', 'open', 'open', 'resolved', 'open'])   // Onsen took every one (no 400)
+    expect('expiry_note' in body(3)).toBe(false)
+    expect([h1, h2, h3, h5].map(h => h.state)).toEqual(['open', 'open', 'open', 'open'])   // Onsen took every one (no 400)
   })
 
-  test('pressed in Telegram: resolve (the presser, an assignee), then applied; the calls wait for the create', async () => {
-    const s = standIn({ delayMs: 20 })
+  test('an external answer arriving before the create completes closes the same Action once', async () => {
+    const s = standIn({ delayMs: 10 })
     const a = new OnsenActions({ req: s.req, log })
-    const h = a.open({ ...perm, assignees: ['joey', 'joey-test'] }, 'k1')!
-    a.pressedElsewhere(h, 'allow', 'joey-test', '2026-11-26T03:00:00.000Z')   // before the create answered
-    await h.tail; await h.tail
-    expect(s.calls.map(c => c.path)).toEqual(['/v1/actions', '/v1/actions/1/resolve'])
-    expect(s.calls[1]!.body).toEqual({ option_id: 'allow', expected_version: 1, resolved_by: 'joey-test', at: '2026-11-26T03:00:00.000Z' })   // r3: when it was pressed
-    expect(h.appliedAt).toBe('2026-11-26T03:00:00.000Z')
-    expect(s.acts.get('1')).toMatchObject({ state: 'resolved', selected_option_id: 'allow', resolved_by: 'joey-test' })
-    // a presser who is not an assignee: the first assignee
-    const h2 = a.open(perm, 'k2')!
-    a.pressedElsewhere(h2, 'deny', '', undefined)
-    await h2.tail
-    expect(s.calls.find(c => c.path === '/v1/actions/2/resolve')!.body.resolved_by).toBe('joey')
-  })
-
-  test('Onsen answered first (409 on resolve): applied with what was pressed in Telegram, and by whom', async () => {
-    const s = standIn()
-    const a = new OnsenActions({ req: s.req, log })
-    const h = a.open(perm, 'k')!
+    const h = a.open(perm, 'one-prompt')!
+    a.cancel(h, '在別處按了')
+    a.cancel(h, '在別處按了')
     await h.tail
-    Object.assign(s.acts.get('1'), { state: 'resolved', selected_option_id: 'deny', resolved_by: 'joey', version: 2 })   // a press in Onsen, its control on the way
-    a.pressedElsewhere(h, 'allow', 'joey')
-    await h.tail
-    expect(s.calls.slice(1).map(c => [c.path, c.body])).toEqual([
-      ['/v1/actions/1/resolve', { option_id: 'allow', expected_version: 1, resolved_by: 'joey' }]])
-    expect(h.selected).toBe('allow')
-    expect(s.acts.get('1').selected_option_id).toBe('deny')
-    expect(a.stats.conflicts).toBe(1)
+    expect(s.calls.map(c => c.path)).toEqual(['/v1/actions', '/v1/actions/1/cancel'])
+    expect(s.calls[1]!.body).toEqual({ expected_version: 1, reason: '在別處按了', note: '在別處按了' })
+    expect(s.acts.get('1')).toMatchObject({ state: 'cancelled', applied_at: null })
   })
 
   test('cancel: open, or answered in Onsen and not applied (the version that moved is read once); an Action that is over is left alone', async () => {
@@ -205,7 +183,6 @@ describe('OnsenActions', () => {
     const down = standIn({ fail: () => 503 })
     const b = new OnsenActions({ req: down.req, log, retryMs: [5, 5] })
     const h2 = b.open(perm, 'k')!
-    b.pressedElsewhere(h2, 'allow', 'joey')
     b.cancel(h2, 'x')
     await h2.tail
     expect(down.calls).toHaveLength(3)                               // the create's three tries; nothing after it
@@ -276,10 +253,9 @@ describe('OnsenActions', () => {
     expect(j).toHaveLength(1)
     expect(j[0]!.body).toEqual({ action_id: '1', assignees: ['joey', 'joey-test'] })
     expect([h.version, h.assignees, seen]).toEqual([2, ['joey', 'joey-test'], 2])
-    // the next resolve carries the joined version; the presser joey-test is an assignee now
-    a.pressedElsewhere(h, 'allow', 'joey-test')
+    a.cancel(h, '在別處按了')
     await h.tail
-    expect(s.calls.find(c => c.path === '/v1/actions/1/resolve')!.body).toEqual({ option_id: 'allow', expected_version: 2, resolved_by: 'joey-test' })
+    expect(s.calls.find(c => c.path === '/v1/actions/1/cancel')!.body).toEqual({ expected_version: 2, reason: '在別處按了', note: '在別處按了' })
     // not open any more: no join call
     const n = s.calls.length
     a.join(h, ['someone'])
@@ -300,53 +276,6 @@ describe('OnsenActions', () => {
     expect(b.find(null, '1')).toBe(f!)
     expect(await b.findOpen('adam', d => d.source === 'card')).toBeNull()
     expect(await new OnsenActions({ req: async () => { throw new Error('down') }, log }).findOpen('adam', () => true)).toBeNull()
-  })
-
-  test('r3 press times (Onsen 0.24.3): the officer\'s own record carries resolved_at / opened_at, a requester\'s resolve and applied carry at; any other unknown field is still refused', async () => {
-    const T = { at: '2026-11-26T04:18:03.388Z', opened_at: '2026-11-26T04:17:42.000Z' }
-    const s = standIn()
-    const a = new OnsenActions({ req: s.req, log })
-    const h = a.open({ source: 'menu', menu_kind: 'model_picker', assignees: ['duty-officer'], summary: 'm', options: [{ id: '1', label: 'Opus' }], resolved: { option_id: '1', by: 'duty-officer', ...T } }, 'k')!
-    await h.tail
-    expect(s.calls).toHaveLength(1)                                     // taken as sent: no second try
-    expect(s.calls[0]!.body).toMatchObject({ state: 'resolved', selected_option_id: '1', resolved_by: 'duty-officer', resolved_at: T.at, opened_at: T.opened_at })
-    expect(h.state).toBe('resolved')
-    const h2 = a.open(perm, 'k2')!
-    a.pressedElsewhere(h2, 'allow', 'joey', T.at)
-    await h2.tail
-    expect(s.calls.filter(c => c.path === '/v1/actions/2/resolve').map(c => c.body)).toEqual([{ option_id: 'allow', expected_version: 1, resolved_by: 'joey', at: T.at }])
-    expect(h2.appliedAt).toBe(T.at)
-    const bad = await s.req('POST', '/v1/actions', { ...perm, pressed_at: T.at })   // the stand-in still refuses a field Onsen does not take
-    expect(bad!.status).toBe(400)
-  })
-
-  test('r3: the duty officer pressing on the screen resolves as duty-officer as it is (no join: the assignees stay who was asked)', async () => {
-    const s = standIn()
-    const a = new OnsenActions({ req: s.req, log })
-    const h = a.open(perm, 'k')!
-    a.pressedElsewhere(h, 'deny', 'duty-officer', '2026-11-26T04:30:00.000Z', true)
-    await h.tail
-    expect(s.calls.map(c => c.path)).toEqual(['/v1/actions', '/v1/actions/1/resolve'])
-    expect(s.calls[1]!.body).toEqual({ option_id: 'deny', expected_version: 1, resolved_by: 'duty-officer', at: '2026-11-26T04:30:00.000Z' })
-    expect(s.acts.get('1')).toMatchObject({ state: 'resolved', resolved_by: 'duty-officer', selected_option_id: 'deny', assignees: ['joey'] })
-    // without asIs a name that is not an assignee is taken for the first assignee (a Telegram presser Onsen has no name for)
-    const h2 = a.open(perm, 'k2')!
-    a.pressedElsewhere(h2, 'allow', 'duty-officer')
-    await h2.tail
-    expect(s.calls.find(c => c.path === '/v1/actions/2/resolve')!.body.resolved_by).toBe('joey')
-  })
-
-  test('WO-197 (lab 18:0xZ): the log says where it was pressed: the duty officer on the screen is not "in Telegram"; a Telegram press is', async () => {
-    const s = standIn()
-    const a = new OnsenActions({ req: s.req, log })
-    const h = a.open(perm, 'kw1')!
-    a.pressedElsewhere(h, 'allow', 'duty-officer', undefined, true, 'on the screen by the duty officer')
-    await h.tail
-    expect(logs).toContain(`onsen action ${h.id}: resolved allow by duty-officer (pressed on the screen by the duty officer)`)
-    const h2 = a.open(perm, 'kw2')!
-    a.pressedElsewhere(h2, 'deny', 'joey')
-    await h2.tail
-    expect(logs).toContain(`onsen action ${h2.id}: resolved deny by joey (pressed in Telegram)`)
   })
 
   test('WO-197 (Chiron mesh 12852): `on` as a function is asked at each new Action (a connector named at runtime has its Actions on from then)', async () => {
@@ -370,7 +299,7 @@ describe('OnsenActions', () => {
     await new Promise(r => setTimeout(r, 3))
     const h2 = a.open(perm, 'k2')!; await h2.tail
     expect(a.newestOpen(h => h.source === 'permission')).toBe(h2)
-    a.pressedElsewhere(h2, 'allow', 'joey'); await h2.tail
+    a.cancel(h2, '在別處按了'); await h2.tail
     expect(a.newestOpen(h => h.source === 'permission')).toBe(h1)
     expect(a.newestOpen(h => h.source === 'menu')).toBeNull()
   })

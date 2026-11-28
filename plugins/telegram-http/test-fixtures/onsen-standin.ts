@@ -183,7 +183,7 @@ export function startOnsenStandin(creds: Record<string, Who>, port = 0): OnsenSt
       if (op === 'cancel') {
         if (!(a.state === 'open' || (a.state === 'resolved' && !a.applied_at))) return aerr(409, `動作 ${a.id} 已經${a.state}`)
         if (body?.expected_version !== a.version) return aerr(409, '版本對不上')
-        Object.assign(a, { state: 'cancelled', cancel_reason: body?.reason ?? null, version: a.version + 1 })
+        Object.assign(a, { state: 'cancelled', cancel_reason: body?.reason ?? null, note: body?.note ?? null, version: a.version + 1 })
         return Response.json({ data: a })
       }
       return aerr(404, 'no route')

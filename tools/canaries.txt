@@ -234,8 +234,8 @@ plugins/telegram-http/onsen-screen-menu-daemon.test.ts::its Action is cancelled 
 plugins/telegram-http/server.ts::on: () => CONNECTOR || Onsen.actionsOn(process.env, ONSEN_AGENT) }) : null
 plugins/telegram-http/onsen-client.ts::get on(): boolean { const v = this.o.on; return typeof v === 'function' ? v() !== false : v !== false }
 plugins/telegram-http/onsen-connector-actions-daemon.test.ts::no ONSEN_BRIDGE (the machine config names someone else), ONSEN_ACTIONS=0: a connector all the same
-plugins/telegram-http/server.ts::const OFFICER_ON_SCREEN = 'on the screen by the duty officer'
-plugins/telegram-http/onsen-client.ts::resolved ${option_id} by ${who} (pressed ${where})
+plugins/telegram-http/duty-officer.ts::export const PRESSED_ELSEWHERE = '在別處按了'
+plugins/telegram-http/server.ts::onsenActions?.cancel(pa.h, PRESSED_ELSEWHERE)
 plugins/telegram-http/onsen-inbound.ts::export const albumItem = (f: Pick<Facts, 'mgid' | 'image' | 'attachment' | 'fromReply'>): boolean =>
 plugins/telegram-http/onsen-album-restart-daemon.test.ts::a connector killed during photo download routes one album across two restarts
 plugins/telegram-http/startup-picker.ts::hot?: () => Iterable<string>

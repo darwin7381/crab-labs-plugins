@@ -1376,12 +1376,8 @@ export function recordFor(env: NodeJS.ProcessEnv, agent: string): boolean {
 export const onsenBase = (env: NodeJS.ProcessEnv): string => ((env.ONSEN_BASE ?? '').trim() || 'https://core.kbro.ai/api/onsen').replace(/\/+$/, '')
 
 // ------------------------------------------------------------------ WO-176: Actions (Onsen client API v1 /v1/actions; fleet-core onsen_actions.py)
-// A thing waiting on a person's decision that this daemon relays: a Claude Code permission prompt, a menu the duty officer asks about; and a menu the duty
-// officer pressed itself (made resolved, assignees duty-officer). The daemon makes the Action, reports a press in Telegram (resolve, then applied; Onsen
-// answered first: applied with what was really pressed), a press it made for Onsen (applied), and a menu that went away (cancel). Every call is
-// best-effort: it runs in the background (nothing here is awaited by a Telegram send or by Claude Code's answer), 5 s each, two more tries after a
-// transport failure, a 5xx or a 429; it never throws. The calls of one Action run in order, its create first; an Action Onsen never made takes no other
-// call. ONSEN_ACTIONS (a comma list of agent names or `*`; unset = every agent; 0 = none) is the stop switch for making new ones.
+// A permission or menu opens an Action. Onsen projects an applied control from its Item report.
+// An external answer closes the existing Action with its reason.
 export const ACTION_CONTROL_KIND = 'action_control'
 export const ACTION_CONTROL_SENDER = 'onsen'
 export type ActionOption = { id: string; label: string }
@@ -1393,9 +1389,7 @@ export type NewAction = { source: ActionSource; menu_kind?: string | null; sessi
   /** Onsen 0.36.0 (WO-196, Chiron mesh 12917): the line Onsen writes into its note when nobody answered by expires_at (what happens then); one line,
    *  2000 characters at most; sent only with expires_at on an open Action (anything else is Onsen's 400), else dropped */
   expiry_note?: string
-  /** the duty officer's own press: made resolved (the option it pressed, resolved_by duty-officer), applied at once; `at` (WO-176 r3, Onsen 0.24.3):
-   *  when the keys were sent (resolved_at and applied_at), `opened_at`: when the menu appeared (created_at) */
-  resolved?: { option_id: string; by: string; at?: string; opened_at?: string } }
+}
 export type ActionReq = (method: 'GET' | 'POST', path: string, body?: unknown, timeoutMs?: number, headers?: Record<string, string>) => Promise<{ status: number; json: any } | null>
 export type ActionState = 'pending' | 'open' | 'resolved' | 'expired' | 'cancelled' | 'failed'
 /** an Action control item's payload (onsen_actions.py _control) */
@@ -1498,16 +1492,13 @@ export class OnsenActions {
       if (a.session_id) body.session_id = String(a.session_id).slice(0, 120)
       if (a.body) body.body = { format: 'markdown', text: a.body.length > 4000 ? a.body.slice(0, 3999) + '…' : a.body }
       if (a.expires_at) body.expires_at = a.expires_at
-      const xnote = a.expires_at && !a.resolved ? actionLine(a.expiry_note, EXPIRY_NOTE_MAX) : ''
+      const xnote = a.expires_at ? actionLine(a.expiry_note, EXPIRY_NOTE_MAX) : ''
       if (xnote) body.expiry_note = xnote
-      if (a.resolved) Object.assign(body, { state: 'resolved', selected_option_id: a.resolved.option_id, resolved_by: a.resolved.by })
-      if (a.resolved?.at) body.resolved_at = a.resolved.at
-      if (a.resolved?.opened_at) body.opened_at = a.resolved.opened_at
       const r = await this.call('POST', '/v1/actions', body, { 'Idempotency-Key': key })
       if (r && (r.status === 201 || r.status === 200) && r.json?.data?.id != null) {
         this.take(h, r.json.data)
         this.stats.created++
-        this.o.log('info', `onsen action ${h.id}: made (${a.source}${a.menu_kind ? ` ${a.menu_kind}` : ''}, ${h.state}${a.resolved ? ` ${a.resolved.option_id} by ${a.resolved.by}` : ''}, for ${a.assignees.join(',')})`)
+        this.o.log('info', `onsen action ${h.id}: made (${a.source}${a.menu_kind ? ` ${a.menu_kind}` : ''}, ${h.state}, for ${a.assignees.join(',')})`)
         try { made?.(h) } catch {}
       } else {
         h.state = 'failed'
@@ -1527,23 +1518,7 @@ export class OnsenActions {
   }
   find(key?: string | null, id?: string | null): ActionHandle | undefined { return (key ? this.byKey.get(key) : undefined) ?? (id ? this.byId.get(id) : undefined) }
 
-  /** pressed in Telegram by `by` (a member): resolve, then applied; Onsen answered first (409): applied with what was really pressed. `at` (Onsen
-   *  0.24.3): when it was pressed (resolved_at, and applied's at). `asIs` (WO-176 r3): `by` is sent as it is, not taken for an assignee (the duty
-   *  officer pressing a permission prompt on the screen: Onsen 0.24.3 takes resolved_by duty-officer on a permission / menu Action). `where`
-   *  (WO-197, lab 18:0xZ): where it was pressed, for the log line (`in Telegram`; the duty officer's press: `on the screen by the duty officer`) */
-  pressedElsewhere(h: ActionHandle | null | undefined, option_id: string, by: string, at?: string, asIs = false, where = 'in Telegram'): void {
-    if (!h) return
-    this.queue(h, async () => {
-      if (!h.id) return
-      const who = asIs ? by : h.assignee(by)
-      const r = await this.call('POST', `/v1/actions/${h.id}/resolve`, { option_id, expected_version: h.version, resolved_by: who, ...(at ? { at } : {}) })
-      if (r?.status === 200) { this.take(h, r.json?.data); this.stats.resolved++; this.o.log('info', `onsen action ${h.id}: resolved ${option_id} by ${who} (pressed ${where})`) }
-      else if (r?.status === 409) { this.stats.conflicts++; this.o.log('info', `onsen action ${h.id}: answered in Onsen first (${errOf(r)}); recorded local choice ${where} (${option_id})`) }
-      else { this.fail(`resolve ${h.id}`, r); return }
-      this.applied(h, { at, option_id })
-    })
-  }
-  /** this daemon pressed the answer (for Onsen's control item, or the answer Telegram gave before it came: option_id and resolved_by) */
+  /** Suppress a screen-gone cancellation after executing an Onsen control. */
   applied(h: ActionHandle | null | undefined, o: { at?: string; option_id?: string; resolved_by?: string } = {}): void {
     if (!h) return
     // Keep the local prompt from being cancelled after a handled press. Onsen

@@ -73,7 +73,7 @@ test('a prompt answered on the screen (the poll at its default 8 s): its Action 
   expect(await until(() => !!cancelOf(a.id), 12000)).toBe(true)
   const dt = cancelOf(a.id)!.at - t0
   expect(dt).toBeLessThanOrEqual(5500)
-  expect(onsen.actions.get(a.id).state).toBe('cancelled')
+  expect(onsen.actions.get(a.id)).toMatchObject({ state: 'cancelled', note: '在別處按了', applied_at: null })
   expect(api.calls).toEqual([])
 }, 40000)
 
