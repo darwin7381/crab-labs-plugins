@@ -85,6 +85,7 @@ export type StatusFact = { idem_key: string; agent: string; state: StatusState; 
 export type FormAck = { ids: number[]; at: string }
 /** fw (WO-190, local only, never posted): this message's files are being stored in Onsen; the sync joins their ids when it sends the line */
 import type { ItemReport } from './onsen-receive.ts'
+import { scheduleRef } from './onsen-items.ts'
 import { isDeepStrictEqual } from 'node:util'
 import { ItemWrites, type ItemWrite } from './onsen-item-writes.ts'
 export type SpoolLine = { k: 'm'; r: OnsenItem; fw?: 1 } | { k: 'e'; r: OnsenEvent } | { k: 'l'; r: RestartLineDraw } | { k: 'u'; r: RestartLineLift }
@@ -114,7 +115,7 @@ export type CallStateName = 'accepted' | 'running' | 'completed' | 'failed'
 export type CallStateLine = { call_id: string; kind: CallRef['kind']; event: string; idem: string
   body: { state: CallStateName; session_id: string | null; result?: { outcome?: string; body?: { format: 'markdown'; text: string } }; at: string } }
 /** A take receipt supplements the Call. Only the Item reports the turn's progress. */
-export type ScheduledResultLine = { event: string; idem: string; call_id: string | null; run_id: string
+export type ScheduledResultLine = { item_id?: string; claim_id?: string; event: string; idem: string; call_id: string | null; run_id: string
   body: { state?: never; result: { outcome: string; steps?: Step[]; body?: { format: 'markdown'; text: string } } } }
 // Older queued receipts included result.steps. Fleet Core accepts the checklist as Markdown in result.body.
 export function scheduledResult(outcome: string, summary: string, steps?: Step[] | null) {
@@ -459,6 +460,8 @@ export class OnsenClient {
   /** WO-175: what became of the Call lines sent lately (idem → fate), and who waits for one not sent yet */
   private itemReports = 0
   private reportedThrough: number
+  private sentAhead = new Set<number>()
+  private waitingForResult = false
   private itemBody?: (line: ItemReport) => ItemReport['body']
   private itemAck?: (line: ItemReport, ok: boolean, state?: string) => void
 
@@ -472,7 +475,7 @@ export class OnsenClient {
 
   private *pendingReports() {
     for (const entry of this.pendingEntries(Math.max(this.readCursor(), this.reportedThrough))) {
-      if (entry.line?.k === 'ir') yield { ...entry, line: entry.line }
+      if (entry.line?.k === 'ir' && !this.sentAhead.has(entry.end)) yield { ...entry, line: entry.line }
     }
   }
 
@@ -531,7 +534,7 @@ export class OnsenClient {
   }
   recordItemReport(line: ItemReport): boolean {
     if (!this.append({ k: 'ir', r: line })) return false
-    if (!this.itemReports) this.nextTryAt = 0 // let the first report past a non-report's backoff
+    if (!this.itemReports || this.waitingForResult) this.nextTryAt = 0 // let the first report past a non-report's backoff
     this.itemReports++
     return true
   }
@@ -555,6 +558,10 @@ export class OnsenClient {
     this.spoolOld = join(cfg.dir, 'spool.1.jsonl')
     this.cursorFile = join(cfg.dir, 'cursor.json')
     this.reportedThrough = this.readCursor('reportedThrough')
+    try {
+      const cursor = JSON.parse(readFileSync(this.cursorFile, 'utf8'))
+      this.sentAhead = new Set((cursor.sentAhead ?? []).filter((n: number) => Number.isSafeInteger(n) && n > cursor.offset))
+    } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') this.cfg.log('warn', 'onsen: unreadable spool cursor, replaying idempotent requests') }
     this.rejected = join(cfg.dir, 'rejected.jsonl')
     this.linesFile = join(cfg.dir, 'lines.json')
     this.itemWrites = new ItemWrites(join(cfg.dir, 'item-ids'), cfg.agent, (...args) => this.request(...args))
@@ -847,7 +854,8 @@ export class OnsenClient {
   }
   private writeCursor(offset: number, reportEnd = this.reportedThrough): void {
     const tmp = `${this.cursorFile}.${process.pid}.tmp`
-    writeFileSync(tmp, JSON.stringify({ offset, ...(reportEnd > offset ? { reportedThrough: reportEnd } : {}), at: new Date().toISOString() }), { mode: 0o600 })
+    for (const end of this.sentAhead) if (end <= offset) this.sentAhead.delete(end)
+    writeFileSync(tmp, JSON.stringify({ offset, ...(this.sentAhead.size ? { sentAhead: [...this.sentAhead] } : {}), ...(reportEnd > offset ? { reportedThrough: reportEnd } : {}), at: new Date().toISOString() }), { mode: 0o600 })
     renameSync(tmp, this.cursorFile)
     this.reportedThrough = reportEnd > offset ? reportEnd : 0
   }
@@ -964,9 +972,76 @@ export class OnsenClient {
     finally { if (fd != null) try { closeSync(fd) } catch {} }
   }
 
+  private acknowledgeAhead(end: number): void {
+    this.sentAhead.add(end)
+    this.writeCursor(this.readCursor())
+  }
+
+  private async sendScheduleResult(c: ScheduledResultLine, cred: string): Promise<boolean> {
+    let id = c.call_id
+    if (!id) {
+      const path = callsForRun(c.run_id)
+      const lookup = await this.get(path, cred, 'hook').catch(e => ({ status: 0, json: { error: errText(e) } }))
+      const call = lookup.status === 200 && firstRunCall(lookup.json)
+      if (!call) {
+        if (lookup.status >= 400 && lookup.status < 500) this.cfg.log('error', `onsen: Call result ${c.idem} lookup HTTP ${lookup.status}; retained in spool`)
+        this.fail('Call result ' + c.idem + ' awaiting lookup: HTTP ' + lookup.status)
+        return false
+      }
+      id = String(call.id)
+    }
+    const old = c.body.result
+    const body = old.steps ? { result: scheduledResult(old.outcome, old.body?.text ?? '', old.steps) } : c.body
+    const path = '/v1/calls/' + encodeURIComponent(id) + '/state'
+    const response = await this.put(path, body, cred).catch(e => ({ status: 0, json: { error: errText(e) } }))
+    if (response.status < 200 || response.status >= 300) {
+      if (response.status >= 400 && response.status < 500) this.cfg.log('error', `onsen: Call result ${c.idem} HTTP ${response.status}; retained in spool`)
+      this.failStatus(response, path)
+      return false
+    }
+    this.stats.calls_put++
+    this.settleCall(c.idem, { fate: 'took', state: response.json?.data?.state ?? null })
+    return true
+  }
+
+  /** Each completed report waits only for its own Call. Legacy spool lines can recover the association from the Item. */
+  private async resultReady(report: ItemReport, results: Map<number, ScheduledResultLine>, attempted: Set<number>, cred: string): Promise<boolean> {
+    if (report.body.outcome !== 'completed' || report.kind && report.kind !== 'schedule') return true
+    let schedule = report.schedule
+    if (!report.kind) {
+      const lookup = await this.get('/v1/items/' + encodeURIComponent(report.item_id), cred, 'hook').catch(() => null)
+      if (!lookup || lookup.status !== 200 || !lookup.json?.data) { this.fail('awaiting Item details for ' + report.item_id); return false }
+      schedule = scheduleRef(lookup.json.data)
+    }
+    if (!schedule) return true
+    for (const [end, c] of results) {
+      const matches = c.item_id ? c.item_id === report.item_id && (!c.claim_id || c.claim_id === report.body.claim_id)
+        : (!!c.call_id && c.call_id === schedule.call_id) || c.run_id === schedule.run_id || c.event === report.item_id
+      if (!matches) continue
+      if (this.sentAhead.has(end)) return true
+      if (attempted.has(end)) return false
+      attempted.add(end)
+      if (!await this.sendScheduleResult(c, cred)) return false
+      this.acknowledgeAhead(end)
+      return true
+    }
+    // The result may have drained before a restart, or the lane may still owe its receipt.
+    if (schedule.run_id && this.callFates.get('call:run:' + schedule.run_id + ':result')?.fate === 'took') return true
+    const path = schedule.call_id ? '/v1/calls/' + encodeURIComponent(schedule.call_id) : schedule.run_id ? callsForRun(schedule.run_id) : null
+    if (path) {
+      const lookup = await this.get(path, cred, 'hook').catch(() => null)
+      const call = lookup?.status === 200 && (schedule.call_id ? lookup.json?.data : firstRunCall(lookup.json))
+      if (call?.result != null) return true
+    }
+    this.fail('awaiting Call result for Item ' + report.item_id)
+    return false
+  }
+
   private async pass(): Promise<void> {
     const fifo = this.unsent()
-    const todo = this.itemReports ? [...this.pendingReports(), ...fifo] : fifo
+    this.waitingForResult = false
+    const priority = this.itemReports ? [...this.pendingReports()] : []
+    const todo = [...priority, ...fifo]
     if (!todo.length) {
       this.rotateIfDrained()
       if (this.interval) await this.itemWrites.reconcile()
@@ -981,9 +1056,17 @@ export class OnsenClient {
       this.nextTryAt = Date.now() + 30_000
       return
     }
+    const results = new Map<number, ScheduledResultLine>(), attempted = new Set<number>()
+    if (priority.some(t => t.line.r.body.outcome === 'completed' && (!t.line.r.kind || t.line.r.kind === 'schedule'))) {
+      for (const t of this.pendingEntries(this.readCursor())) if (t.line?.k === 'c' && 'run_id' in t.line.r) results.set(t.end, t.line.r)
+    }
     let i = 0
     while (i < todo.length) {
       const t = todo[i]!
+      if (this.sentAhead.has(t.end) || t.line?.k === 'ir' && t.end <= this.reportedThrough) {
+        if (i >= priority.length) this.writeCursor(t.end)
+        i++; continue
+      }
       if (!t.line) { this.reject(t.raw.slice(0, 2000), 'unreadable spool line'); this.writeCursor(t.end); i++; continue }
       if (t.line.k === 'l' || t.line.k === 'u') {
         // step 2 (WO-142): a restart line drawn or lifted while Onsen did not answer, in its place in the order
@@ -1055,8 +1138,11 @@ export class OnsenClient {
         this.ok(); i++; continue
       }
       if (t.line.k === 'ir') {
-        // The FIFO cursor can now pass a report acknowledged ahead of a stuck record.
-        if (t.end <= this.reportedThrough) { this.writeCursor(t.end); i++; continue }
+        if (!await this.resultReady(t.line.r, results, attempted, cred)) {
+          this.waitingForResult = true
+          if (i >= priority.length) return
+          i++; continue
+        }
         const line = t.line.r, body = this.itemBody?.(line) ?? line.body
         const path = '/v1/items/' + encodeURIComponent(line.item_id) + '/report'
         const key = ['ir', line.item_id, body.claim_id, body.outcome].map(encodeURIComponent).join(':')
@@ -1073,30 +1159,17 @@ export class OnsenClient {
         }
         if (ok) this.itemWrites.observe(r.json?.data)
         this.itemAck?.(line, ok, r.json?.data?.state)
-        this.writeCursor(this.readCursor(), t.end)
+        this.acknowledgeAhead(t.end)
         this.itemReports = Math.max(0, this.itemReports - 1)
         this.ok(); i++; continue
       }
       if (t.line.k === 'c') {
         const c = t.line.r
-        let id = c.call_id ?? ''
-        if ('run_id' in c && !id) {
-          // Resolve inside the spool so an outage before the lookup cannot lose the receipt.
-          const path = callsForRun(c.run_id)
-          const lookup = await this.get(path, cred, 'hook').catch(e => ({ status: 0, json: { error: errText(e) } }))
-          if (lookup.status !== 200 && !refusedForGood(lookup)) return this.failStatus(lookup, path)
-          const call = lookup.status === 200 && firstRunCall(lookup.json)
-          if (!call) {
-            this.reject(t.line, `GET ${path}: ${lookup.status === 200 ? 'no Call for this scheduler run' : callSaid(lookup.json)}`)
-            this.writeCursor(t.end); this.ok(); i++; continue
-          }
-          id = String(call.id)
+        if ('run_id' in c) {
+          if (attempted.has(t.end) || !await this.sendScheduleResult(c, cred)) return
+          this.writeCursor(t.end); this.ok(); i++; continue
         }
-        let body = c.body
-        if ('run_id' in c && c.body.result.steps) {
-          const old = c.body.result
-          body = { result: scheduledResult(old.outcome, old.body?.text ?? '', old.steps) }
-        }
+        const id = c.call_id, body = c.body
         const r = await this.put(`/v1/calls/${encodeURIComponent(id)}/state`, body, cred).catch(e => ({ status: 0, json: { error: errText(e) } }))
         if (r.status >= 200 && r.status < 300) {
           const st = r.json?.data?.state

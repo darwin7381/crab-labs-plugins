@@ -9,6 +9,12 @@ export type InboxItem = {
   claim?: { id: string; connector: string; taken_at: string; expires_at: string; session_id: string | null } | null
 }
 
+export function scheduleRef(row: InboxItem): { call_id?: string; run_id?: string } | undefined {
+  if (row.kind !== 'schedule') return
+  const run = row.refs?.find(ref => ref.kind === 'run')?.value ?? row.payload?.run_id
+  return { ...(row.call_id != null ? { call_id: String(row.call_id) } : {}), ...(run != null ? { run_id: String(run) } : {}) }
+}
+
 /** Only references travel in the M1 and lane journals. A waiting reference owns no claim. */
 export type ReceivingState = { status: string; turn?: string | null; lastTurn?: string | null }
 export type ReceivingTarget = { session_id: string; claude_pid: number; tmux: string; transcript: string; transcriptOffset?: number; stateAtOffer?: ReceivingState }

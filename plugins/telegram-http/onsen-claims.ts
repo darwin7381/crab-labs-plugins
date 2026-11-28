@@ -3,12 +3,13 @@ import { dirname } from 'path'
 import { reportSession } from './onsen-session.ts'
 import type { Journal } from './lanes-state.ts'
 import { genuineAssistantAfterFile } from './liveness.ts'
-import type { InboxItem, ItemRef, ReceivingState, ReceivingTarget } from './onsen-items.ts'
+import { scheduleRef, type InboxItem, type ItemRef, type ReceivingState, type ReceivingTarget } from './onsen-items.ts'
 import type { ClaimStore, ItemReport, Outcome, ReportFields } from './onsen-receive.ts'
 
 const intermediate = new Set<Outcome>(['in_session', 'owed', 'background', 'stuck'])
 const week = 7 * 86400_000
 type Claim = {
+  kind?: string; schedule?: ItemReport['schedule']
   claim_id: string; taken_at: string; session_id?: string; in_session_at?: string; last_outcome?: Outcome
   turn?: string; registry_session?: string; conversation?: string; message_id?: string; replies?: string[]
   intakeAt?: string; target?: ReceivingTarget
@@ -164,7 +165,7 @@ export class Claims implements ClaimStore {
     const claim = row.claim!
     if (this.rows[row.id]?.claim_id === claim.id) return
     const message = row.message_id ?? row.payload?.message_id
-    this.rows[row.id] = { claim_id: claim.id, taken_at: claim.taken_at, conversation: ref.conversation, target: ref.target,
+    this.rows[row.id] = { kind: row.kind, schedule: scheduleRef(row), claim_id: claim.id, taken_at: claim.taken_at, conversation: ref.conversation, target: ref.target,
       ...(message != null ? { message_id: String(message) } : {}) }
     this.save(); this.clock(row.id); this.changed()
   }
@@ -203,7 +204,7 @@ export class Claims implements ClaimStore {
     if (row.last_outcome === outcome) return true
     const body = { claim_id: row.claim_id, outcome, at: new Date(this.now()).toISOString(),
       ...(outcome === 'completed' ? { response_message_ids: row.replies ?? [] } : {}), ...fields }
-    if (!this.spool.recordItemReport({ item_id: id, body })) throw new Error('could not spool item report for ' + id)
+    if (!this.spool.recordItemReport({ item_id: id, kind: row.kind, schedule: row.schedule, body })) throw new Error('could not spool item report for ' + id)
     this.replay({ item_id: id, body })
     this.save(); this.clock(id)
     return true

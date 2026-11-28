@@ -7926,7 +7926,9 @@ export async function completeRun(tok: RunTok, runId: string, outcome: string, n
     const text = stripMarkup((via === 'receipt' && tok.receipt?.text) || String(note ?? ''))
     const normalized = btccOutcome(outcome)
     const result = scheduledResult(normalized === 'nothing-to-do' ? 'nothing_to_do' : normalized, text, steps)
-    const ok = D.recordScheduleResult?.({ event: event?.id ?? tok.evId, call_id: event?.call_id ?? null, run_id: runId,
+    const itemId = event?.onsen_items?.find(ref => ref.kind === 'schedule')?.onsen_item_id
+    const claimId = itemId && itemReceiver.claims.owns(itemId) ? itemReceiver.claims.receipt?.(itemId) : undefined
+    const ok = D.recordScheduleResult?.({ item_id: itemId, claim_id: claimId, event: event?.id ?? tok.evId, call_id: event?.call_id ?? null, run_id: runId,
       idem: `call:run:${runId}:result`, body: { result } }) ?? false
     return { ok, text: ok ? `Call result queued for scheduler run ${runId}.` : `Could not queue the Call result for scheduler run ${runId}.` }
   }

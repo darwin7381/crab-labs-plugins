@@ -1554,6 +1554,39 @@ test('a stuck non-report cannot block an item report, including after restarting
   expect(r.f.calls.filter(c => c.path.endsWith('/report'))).toHaveLength(1)
 })
 
+test('a refused Call result holds only its completion across restart and another schedule can finish', async () => {
+  const r = rig()
+  await r.mode.probe()
+  const schedule = (id: string) => {
+    r.f.scheduleCalls.set(id, { id, run: id, result: null })
+    return r.f.add('scheduled-' + id, 'schedule', { call_id: id, refs: [{ kind: 'run', value: id }] })
+  }
+  const a = schedule('101'), b = schedule('102'), other = r.f.add('independent')
+  await r.receiver.receive([a, b, other].map(itemRef))
+  r.f.resultStatus.set('101', 400)
+  const body = { result: { outcome: 'failed', body: { format: 'markdown' as const, text: 'job failed' } } }
+  // An older durable result has no item_id. Its Call/run still ties it to the same claim.
+  r.client.recordCall({ call_id: '101', run_id: '101', event: 'old-event', idem: 'call:run:101:result', body })
+  r.claims.report(a.id, 'completed')
+  r.client.recordCall({ item_id: b.id, claim_id: r.claims.receipt(b.id), call_id: '102', run_id: '102', event: 'new-event', idem: 'call:run:102:result', body })
+  r.claims.report(b.id, 'completed'); r.claims.report(other.id, 'completed')
+  await r.sync()
+  expect(a.state).toBe('claimed'); expect(b.state).toBe('completed'); expect(other.state).toBe('completed')
+  expect(r.outcomes(a.id)).not.toContain('completed')
+  expect(r.f.scheduleCalls.get('102')!.result).toEqual(body.result)
+  expect(r.logs.some(l => l.includes('HTTP 400') && l.includes('retained in spool'))).toBe(true)
+  r.client.stop()
+  const next = new OnsenClient(r.client.cfg), restored = new Claims(r.file, next, () => {}, () => {})
+  clean.push(() => { restored.stop(); next.stop() })
+  next.watchItemReports(line => restored.replay(line), (line, ok, state) => restored.acknowledged(line, ok, state))
+  expect(next.hasItemReports()).toBe(true)
+  r.f.resultStatus.delete('101')
+  await next.syncNow(true)
+  expect(a.state).toBe('completed'); expect(r.f.scheduleCalls.get('101')!.result).toEqual(body.result)
+  expect(next.pendingBytes()).toBe(0)
+  expect(r.outcomes(other.id).filter(o => o === 'completed')).toHaveLength(1)
+})
+
 test('late conflicting report is logged, a permanent 4xx is rejected and the spool advances', async () => {
   const r = rig(), row = r.f.add('settled')
   const errors: string[] = [], log = r.client.cfg.log

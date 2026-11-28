@@ -53,6 +53,7 @@ export function fakeItems(member = 'adam', actionPort?: number, clock?: () => nu
   const takes = new Map<string, { claim: string; body: unknown; result: Response }>()
   const lastClaim = new Map<string, string>(), expired = new Map<string, boolean>()
   const overdue = new Set<string>()
+  const resultStatus = new Map<string, number>()
   const unreadMail = new Set<string>()
   const givenByPull = new Set<Row>()
   let pullAcked = 0
@@ -122,10 +123,16 @@ export function fakeItems(member = 'adam', actionPort?: number, clock?: () => nu
     // Existing resources used by the real tg daemon alongside the Item API.
     if (path === '/v1/calls' && req.method === 'GET' && q.get('ref_kind') === 'run')
       return Response.json({ items: [...scheduleCalls.values()].filter(c => c.run === q.get('ref_value')) })
+    const singleCall = /^\/v1\/calls\/([^/]+)$/.exec(path)?.[1]
+    if (singleCall && req.method === 'GET') {
+      const call = scheduleCalls.get(singleCall)
+      return call ? detail(call) : error(404, 'not_found')
+    }
     const callId = /^\/v1\/calls\/([^/]+)\/state$/.exec(path)?.[1]
     if (callId && req.method === 'PUT') {
       const call = scheduleCalls.get(callId)
       if (!call) return error(404, 'not_found')
+      if (resultStatus.has(callId)) return error(resultStatus.get(callId)!, 'test_result_refusal')
       if (Object.keys(b).length !== 1 || !b.result || 'steps' in b.result) return error(400, 'invalid_request')
       call.result = b.result
       return detail(call)
@@ -287,7 +294,7 @@ export function fakeItems(member = 'adam', actionPort?: number, clock?: () => nu
     if (key) writes.set(idem, { body: b, response: answer.clone() })
     return answer
   } })
-  return { base: 'http://127.0.0.1:' + server.port, rows, calls, scheduleCalls, history, unreadMail, add, change, now: () => now,
+  return { base: 'http://127.0.0.1:' + server.port, rows, calls, scheduleCalls, history, unreadMail, resultStatus, add, change, now: () => now,
     advance(ms: number) {
       now += ms; skew += ms; expire()
       for (const row of rows.values()) {
