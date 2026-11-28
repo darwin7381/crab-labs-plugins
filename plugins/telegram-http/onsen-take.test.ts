@@ -41,13 +41,13 @@ async function mainRig(restart?: () => Promise<void>) {
   const journal = new Journal(join(r.dir, 'state.jsonl')), offers: any[] = [], notices: string[] = []
   const sid = crypto.randomUUID(), pid = 1051
   let oldPidAlive = true
-  let member = 'idle', bg = 0, owes = false, wall: MainWall | null = null
+  let member = 'idle', bg = 0, owes: boolean | string = false, wall: MainWall | null = null
   const restarts: string[] = []
   const m = createMain({ journal, agent: 'adam', itemReceiver: () => r.receiver, log: () => {}, offer: async n => { offers.push(n); return true },
     streamOpen: () => true, memberState: () => member, expectedSession: () => [sid], pidAlive: n => n !== pid || oldPidAlive, context: () => '', info: () => null,
     genChanged: () => {}, refused: () => {}, done: () => {}, undone: () => {},
     restartSession: async () => { restarts.push(sid); await restart?.(); return sid }, tellJoey: (_s, rule) => notices.push(rule), genuineAfter: () => 1,
-    mainOwed: ids => owes ? ids.map(id => ({ id, from: 'joey', text: id, owes: ['reply'] })) : [], usageWall: () => wall })
+    mainOwed: ids => ids.filter(id => owes === true || owes === id).map(id => ({ id, from: 'joey', text: id, owes: ['reply'] })), usageWall: () => wall })
   m.initMain(); r.attach(m)
   const hook = (event: string, data: Partial<MainEvent> = {}) => m.mainEvent({ event, pid, session_id: sid, prompt_id: 'turn', ...data })
   await hook('SessionStart', { source: 'startup' })
@@ -62,7 +62,7 @@ async function mainRig(restart?: () => Promise<void>) {
     return did
   }
   return { ...r, m, journal, offers, notices, restarts, hook, enqueue, bind, sid, oldPidExited() { oldPidAlive = false }, setWall(value: MainWall | null) { wall = value }, status(s: string, n = 0) { member = s; bg = n; r.claims.statusRecord(s, () => bg, REGISTRY_SETTLE_MS) },
-    owing(value: boolean) { owes = value } }
+    owing(value: boolean | string) { owes = value } }
 }
 
 test('switch, prerequisites, stable machine/member and all probe refusals', async () => {
@@ -304,7 +304,7 @@ test('the last-result check and open obligations share one owed prompt on the bo
   expect((await r.hook('Stop', { prompt_id: 'empty' })).block).toBeUndefined()
 })
 
-test('the Stop hook checks unsent results per sender and uses the daemon’s single owed hold', () => {
+for (const structural of [false, true]) test('the Stop hook combines a missed answer and an unsent result, existing hold=' + structural, () => {
   const r = rig()
   const script = `
 import importlib.util, io, json, os, sys
@@ -315,7 +315,8 @@ def load(name):
     spec.loader.exec_module(mod)
     return mod
 hook, gate = load('main-hook'), load('main-answered-gate')
-items = [{'mid': name, 'user': name, 'body': 'report the result'} for name in ['eve', 'adam']]
+items = [{'mid': name, 'user': name, 'kind': 'tg', 'no_reply': False, 'system': False, 'body': body}
+         for name, body in [('eve', 'report the result'), ('adam', 'when is the deadline?')]]
 turn = {'prompt_id': 'p', 'calls': [{'name': 'mcp__reply'}, {'name': 'Read'}]}
 payload = {'hook_event_name': 'Stop', 'session_id': 's', 'prompt_id': 'p',
            'last_assistant_message': 'There were 194 failed requests in the logs across twenty pages.'}
@@ -323,23 +324,54 @@ phases, printed = [], []
 def post(b, timeout):
     phases.append(b['phase'])
     if b['phase'] == 'owed':
-        assert b['owed_mids'] == ['eve']
-        return {'accepted': True}
-    return {'item_stop': 'done' if 'owed' in phases else 'check', 'items': items,
-            'turn': turn, 'outputs': [{'to': 'eve', 'text': 'Looking up the logs.'}]}
+        assert b['owed_mids'] == ['adam', 'eve']
+        return {} if ${structural ? 'True' : 'False'} else {'accepted': True}
+    return {'block': 'existing obligation' if ${structural ? 'True' : 'False'} and 'owed' not in phases else None,
+            'item_stop': 'done' if 'owed' in phases else 'check', 'items': items,
+            'turn': turn, 'outputs': [{'to': 'eve', 'reply_to': 'eve', 'text': 'Looking up the logs.'}]}
 def aid(file, fn, *args):
     return gate.take_owed(*args) if fn == 'take_owed' else None
 with patch.object(hook, 'post', post), patch.object(hook, 'out', printed.append), patch.object(hook, 'aid', aid), \\
+     patch.object(gate, 'ask', lambda state, questions: {k: {'noul': 1 if k.endswith('reply_needed') else 0} for k in questions}), \
      patch.object(gate, 'unsent_p', lambda msgs, outs, final: 1 if msgs[0]['user'] == 'eve' else 0):
     for _ in range(2):
         with patch.object(sys, 'stdin', io.StringIO(json.dumps(payload))):
             hook.main()
+assert 'when is the deadline?' in printed[0]['reason'] and gate.UNSENT_WORDS in printed[0]['reason']
+assert ('existing obligation' in printed[0]['reason']) == ${structural ? 'True' : 'False'}
 print(json.dumps([phases, len(printed), bool(os.path.exists(os.path.join(os.environ['LANES_DIR'], 'run', 'answered-gate.json')))]))
 `
   const proc = Bun.spawnSync(['python3', '-B', '-c', script], { cwd: import.meta.dir, env: { ...process.env, LANES_DIR: r.dir } })
   expect(proc.stderr.toString()).toBe('')
   expect(proc.exitCode).toBe(0)
   expect(JSON.parse(proc.stdout.toString())).toEqual([['check', 'owed', 'check', 'final'], 1, false])
+})
+
+test('the content check adds the missed claim to an existing obligation in the same Stop', async () => {
+  const r = await mainRig(), a = r.f.add('explicit-obligation'), b = r.f.add('missed-content')
+  await r.bind(a); r.status('busy'); r.enqueue(b); await r.hook('PostToolUse')
+  r.owing(a.id)
+  const check = await r.hook('Stop')
+  expect(check.block).toContain(a.id)
+  expect(check.item_stop).toBe('check')
+  await r.hook('Stop', { phase: 'owed', owed_mids: [String(b.number)] })
+  expect((await r.hook('Stop')).item_stop).toBe('done')
+  await r.hook('Stop', { phase: 'final' }); r.f.advance(4000); r.status('idle'); await r.sync()
+  for (const row of [a, b]) expect(r.outcomes(row.id)).toEqual(['in_session', 'owed', 'completed'])
+})
+
+test('a missed pre-switch message can hold one Stop without claiming it', async () => {
+  const r = await mainRig(), local = r.f.add('legacy'), owned = r.f.add('owned')
+  await r.bind(owned)
+  r.status('busy'); r.enqueue(local, true); await r.hook('PostToolUse')
+  const check = await r.hook('Stop')
+  expect(check.items?.length).toBe(2)
+  const mids = [String(local.number)]
+  expect((await r.hook('Stop', { phase: 'owed', owed_mids: mids })).accepted).toBe(true)
+  expect((await r.hook('Stop')).item_stop).toBe('done')
+  await r.hook('Stop', { phase: 'final' }); r.f.advance(4000); r.status('idle'); await r.sync()
+  expect(r.outcomes(local.id)).toEqual([])
+  expect(r.outcomes(owned.id)).toEqual(['in_session', 'completed'])
 })
 
 test('a later hook reopens a final Stop; owed and background remain claimed through the next session Stop', async () => {

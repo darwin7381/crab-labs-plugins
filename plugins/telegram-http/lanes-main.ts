@@ -997,11 +997,13 @@ export function createMain(E: MainEnv) {
       case 'Stop': {
         if (!p) return {}
         if (b.phase === 'owed') {
-          if (!taking() || g.state !== 'in_turn' || g.prompt_id !== p || g.owed_hold === p) return {}
-          const rows = unsettled(g, p).filter(r => r.state === 'bound' && r.onsen_items && b.owed_mids?.includes(aidItem(r).mid))
+          if (!taking() || g.state !== 'in_turn' || g.prompt_id !== p) return {}
+          const holding = g.owed_hold === p
+          const prior: string[] = holding ? g.owed_events ?? [] : []
+          const rows = unsettled(g, p).filter(r => r.state === 'bound' && !prior.includes(r.event) && b.owed_mids?.includes(aidItem(r).mid))
           if (!rows.length) return {}
-          markOwed(g, p, rows, rows.map(r => r.event))
-          return { accepted: true }
+          markOwed(g, p, rows, [...prior, ...rows.map(r => r.event)])
+          return holding ? {} : { accepted: true }
         }
         beginTurn(g, p)
         if (b.phase !== 'final') {
@@ -1014,15 +1016,18 @@ export function createMain(E: MainEnv) {
           // (a turn that took in nothing is asked about the work it carries on). One hold per turn (owed_hold on the gen), naming each: the next Stop of
           // the same turn ends it, and what is still owed stays open on its event.
           const gen = J().get('main', g.id)!
-          if (E.mainOwed && gen.owed_hold !== p && !(taking() && t.carried)) {
+          const take = taking()
+          let block: string | undefined
+          if (E.mainOwed && gen.owed_hold !== p && !(take && t.carried)) {
             const owed = E.mainOwed(t.events)
             if (owed.length) {
               markOwed(gen, p, t.items, owed.map(o => o.id))
-              return { block: `這一輪還欠事沒交代，先不要結束：${owed.map(o => `${o.from}「${firstWords(o.text)}」：${o.owes.join('、')}`).join('；')}。Joey 用 reply 回（一則可以回全部），同事用 send_to_agent 回，排程用 ~/.claude/tools/btcc-receipt complete <run> 回執；做完再結束這一輪。` }
+              block = `這一輪還欠事沒交代，先不要結束：${owed.map(o => `${o.from}「${firstWords(o.text)}」：${o.owes.join('、')}`).join('；')}。Joey 用 reply 回（一則可以回全部），同事用 send_to_agent 回，排程用 ~/.claude/tools/btcc-receipt complete <run> 回執；做完再結束這一輪。`
+              if (!take) return { block }
             }
           }
           const its = t.carried ? [] : t.items.filter(r => r.state === 'bound').map(aidItem), w = t.carried ? work.get(g.id) : undefined
-          const itemStop: MainReply = taking() ? { item_stop: gen.owed_hold === p || t.carried ? 'done' : 'check' } : {}
+          const itemStop: MainReply = take ? { item_stop: !block && (gen.owed_hold === p || t.carried) ? 'done' : 'check', block } : {}
           return { ...itemStop, items: its, outputs: outputs.get(p) ?? [], ...(w ? { context: { items: w.items, outputs: w.outputs } } : {}),
             turn: turnOf(J().get('main', g.id)!, p), ...(E.memory ? E.memory() : { proposals: [], curator: false }) }   // PL5: the memory gate's facts
         }

@@ -237,20 +237,26 @@ def _save(sp, st):
 def _reason(p, msgs, outs, turn=None, context=None):
     sid, d = p.get('session_id') or '', lanes_run_dir(p)
     turn = turn if isinstance(turn, dict) else {}
-    return _missed(p, sid, d, msgs, outs) or _unsent(p, sid, d, msgs, outs, turn, context)
+    missed = _missed(sid, d, msgs, outs)
+    return missed['reason'] if missed else _unsent(p, sid, d, msgs, outs, turn, context)
 
 
 def take_owed(p, msgs, outs, turn):
-    """Identify unsent results for the current senders. The daemon owns the hold and the Item reports."""
+    """Combine unanswered messages and unsent results in the daemon's single Stop hold."""
+    sid, d = p.get('session_id') or '', lanes_run_dir(p)
+    missed = _missed(sid, d, msgs, outs, remember=False)
+    mids = list(missed['mids']) if missed else []
+    reasons = [missed['reason']] if missed else []
     by_sender = {}
     for msg in msgs:
         if not msg.get('system') and not msg.get('no_reply'):
             by_sender.setdefault(msg.get('user'), []).append(msg)
-    mids = []
     for group in by_sender.values():
-        if _unsent(p, p.get('session_id'), lanes_run_dir(p), group, outs, turn, remember=False):
+        if _unsent(p, sid, d, group, outs, turn, remember=False):
             mids.extend(m['mid'] for m in group)
-    return {'mids': mids, 'reason': UNSENT_WORDS} if mids else None
+            if UNSENT_WORDS not in reasons:
+                reasons.append(UNSENT_WORDS)
+    return {'mids': list(dict.fromkeys(mids)), 'reason': '\n'.join(reasons)} if mids else None
 
 
 def _unsent(p, sid, d, msgs, outs, turn, context=None, remember=True):
@@ -288,7 +294,7 @@ def _unsent(p, sid, d, msgs, outs, turn, context=None, remember=True):
     return UNSENT_WORDS if not remember or _save(sp, st) else None
 
 
-def _missed(p, sid, d, msgs, outs):
+def _missed(sid, d, msgs, outs, remember=True):
     if len(msgs) < 2:                                   # a turn that took in one message is not checked
         return None
     def log_call():                                      # 002k: the call, when there was one, in the unified log too
@@ -303,7 +309,7 @@ def _missed(p, sid, d, msgs, outs):
         return None
     log_call()
     sp = os.path.join(d, 'answered-gate.json')
-    st = _load(sp)
+    st = _load(sp) if remember else {}
     missed = [m for m in msgs if verdict.get(m['mid']) == 'not_addressed' and f"{sid}:{m['mid']}" not in st]
     mode = os.environ.get('ANSWERED_GATE_MODE', 'enforce')
     record(d, {'session': sid, 'mode': mode, 'outputs': len(outs), 'ms': CALL.get('ms'), 'blocked': [m['mid'] for m in missed] if mode != 'shadow' else [],
@@ -312,11 +318,12 @@ def _missed(p, sid, d, msgs, outs):
         return None
     for m in missed:
         st[f"{sid}:{m['mid']}"] = time.strftime('%Y-%m-%dT%H:%M:%S%z')
-    if not _save(sp, st):
+    if remember and not _save(sp, st):
         return None                                      # cannot remember = would repeat on every stop: say nothing instead
     lines = '\n'.join(f"- {m['user'] or '寄件者'}（{'訊息' if m['kind'] == 'tg' else 'mesh'} {m['mid']}）：「{m['body'][:300]}」" for m in missed)
-    return ('這一輪先不要結束。你這一回合收到的下面這幾則訊息，到現在沒有回應，也沒有交代什麼時候處理：\n' + lines +
+    reason = ('這一輪先不要結束。你這一回合收到的下面這幾則訊息，到現在沒有回應，也沒有交代什麼時候處理：\n' + lines +
             '\n請現在回應；如果要晚一點才處理，也回一句讓對方知道。已經回過的不用重回。')
+    return {'mids': [m['mid'] for m in missed], 'reason': reason}
 
 
 def main():
