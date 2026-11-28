@@ -37,6 +37,10 @@ afterAll(() => {
   for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v }
   rmSync(dir, { recursive: true, force: true })
 })
+async function switchMember(take: boolean) {
+  f.mode(take ? 200 : 409)
+  await mode.probe()
+}
 const selfRows = () => [...f.rows.values()].filter(r => r.kind === 'self')
 const notices = (id: string) => [...f.rows.values()].filter(r => r.kind === 'notice' && r.about_item_id === id)
 
@@ -185,7 +189,7 @@ test('a promise marked done while the connector is paused closes its original It
   expect(row.deadline).toBeTruthy()
   mode.pause('paused for test', 60_000)
   await L.callMainTool('commitment_done', { commitment_id: id }, 'test-main')
-  await mode.probe()
+  await switchMember(true)
   L.resumeSelfItems()
   await client.syncNow(true)
   expect(row.state).toBe('completed')
@@ -193,7 +197,7 @@ test('a promise marked done while the connector is paused closes its original It
 
 test('switching a mixed pull-era event publishes only the outstanding future commitment', async () => {
   const id = 'switch-mixed', now = Date.now(), due = now + 300_000
-  mode.pause('test first switch', 60_000)
+  await switchMember(false)
   const base = { kind: 'peer' as const, level: 'commitment', to: 'ken', due_at: due }
   L.__events().open(id, { class: 'peer', owner: 'main', obligations: [
     { ...base, what: 'future' }, { ...base, what: 'overdue', due_at: now - 1 },
@@ -201,7 +205,7 @@ test('switching a mixed pull-era event publishes only the outstanding future com
     { ...base, what: 'terminal', state: 'met' }, { ...base, what: 'handed', state: 'handed' },
     { ...base, what: 'old answer', level: 'answer', state: 'handed' }
   ] })
-  await mode.probe()
+  await switchMember(true)
   L.resumeSelfItems(); L.__events().note(id, { did: 'updated digest' }); L.resumeSelfItems()
   await client.syncNow(true)
   const rows = selfRows().filter(r => r.payload.text.includes(id))
@@ -209,7 +213,7 @@ test('switching a mixed pull-era event publishes only the outstanding future com
   expect(rows[0]!.payload.text).toContain('future')
 })
 
-test('an overdue answer on an inbound Item keeps its single L18 push', async () => {
+test('an overdue inbound Item leaves notification of its waiter to Onsen', async () => {
   const id = 'item-answer-due', what = '補上 api 日誌', now = Date.now()
   const before = pushes.length
   L.__events().open(id, { class: 'peer', owner: 'main', fields: { onsen_items: [itemRef(f.add(id))] },
@@ -217,7 +221,7 @@ test('an overdue answer on an inbound Item keeps its single L18 push', async () 
   L.dueTick(now); L.dueTick(now + 1000)
   await client.syncNow(true)
   expect(selfRows().filter(r => r.payload.text.includes(id))).toHaveLength(0)
-  expect(pushes.slice(before).filter(text => text.includes(what))).toHaveLength(1)
+  expect(pushes.slice(before).filter(text => text.includes(what))).toHaveLength(0)
 })
 
 test('a pull member keeps a new commitment entirely in M3', async () => {
@@ -261,7 +265,7 @@ test('followup keeps the origin lane and sender limits, and only a due Item ente
   L.resumeSelfItems()
   expect(follow.onsen_item_id).toBe(row.id)
   expect(follow.state).toBe('pending')
-  s.wall = { kind: 'usage', probe_at: Date.now() + 3600_000 } as any
+  s.lanes[lane]!.last_limit_refusal = Date.now()
   L.routeOwnItem(row, itemRef(row), row.payload.text)
   expect(follow.state).toBe('fired')
   expect(follow.fired_event).toBe(event)
@@ -286,7 +290,7 @@ test('a followup waits for its creation response and ignores connector ids prese
   const s = L.__lanesState(), lane = 'adam.reflex.ack', event = 'ack-event', thread = 'adam#ack'
   s.lanes[lane] = { id: lane, kind: 'reflex', thread, status: 'idle', runs: 0, last: new Date().toISOString() } as any
   s.threads[thread] = { id: thread, lane, peer: 'eve' } as any
-  s.wall = { kind: 'usage', probe_at: Date.now() + 3600_000 } as any
+  s.lanes[lane]!.last_limit_refusal = Date.now()
   const tok = { runId: 'local-run', lane, evId: event, trigger: 'peer', cls: 'peer', closers: [] } as any
   L.__events().open(event, { class: 'peer', owner: lane, thread, obligations: [{ kind: 'receipt', run_id: 'scheduler-run-42' }] })
   let earlyState: string | undefined, earlyQueued: boolean | undefined, resets = 0
@@ -324,12 +328,12 @@ test.each([false, true])('no-change withdraws a migrated followup and drops a st
   const thread = 'adam#' + event, runId = 'producer-' + event
   s.lanes[lane] = { id: lane, kind: 'reflex', thread, status: 'idle', runs: 0, last: new Date().toISOString() } as any
   s.threads[thread] = { id: thread, lane, peer: 'eve' } as any
-  s.wall = { kind: 'usage', probe_at: Date.now() + 3600_000 } as any
+  s.lanes[lane]!.last_limit_refusal = Date.now()
   const tok = { runId, lane, evId: event, trigger: 'peer', cls: 'peer', followup: true, closers: [] } as any
   L.__events().open(event, { class: 'peer', owner: lane, thread, obligations: [] })
-  mode.pause('migration', 60_000)
+  await switchMember(false)
   expect(await L.callLaneTool(tok, 'followup', { after_minutes: 5, note: 'check previous result' })).toContain('scheduled')
-  await mode.probe(); L.resumeSelfItems(); await client.syncNow(true)
+  await switchMember(true); L.resumeSelfItems(); await client.syncNow(true)
   const [row] = selfRows().filter(r => r.session_id === lane)
   const ref = itemRef(row!), snapshot = structuredClone(row!), follow = Object.values(s.followups).find(f => f.onsen_item_id === row!.id)!
   if (queued) {
@@ -349,13 +353,13 @@ test.each([false, true])('no-change withdraws a migrated followup and drops a st
 })
 
 test.each([false, true])('a new lane commitment during the Jev await suppresses the duplicate only on take (take=%s)', async take => {
-  if (!take) mode.pause('pull', 60_000)
+  if (!take) await switchMember(false)
   try {
     const tok = { commitments: 0 } as any
     const check = L.promiseCheck({ who: 'adam.reflex.1', to: 'eve', text: '10 分鐘後回報', thread: null, ref: 'during-jev-' + take, tok })
     tok.commitments = 1
     expect(await check).toBe(take ? 'dup' : 'written')
-  } finally { if (!take) await mode.probe() }
+  } finally { if (!take) await switchMember(true) }
 })
 
 test('C1 TakeMode.active gates the lane even before its spool writer is attached', async () => {
@@ -363,9 +367,9 @@ test('C1 TakeMode.active gates the lane even before its spool writer is attached
   try {
     expect(mode.active).toBe(true)
     expect(await L.callMainTool('commitment', { who: '未知？', what: '回報' }, 'test-main')).toContain('who must identify')
-    mode.pause('test pull', 60_000)
+    await switchMember(false)
     expect(await L.callMainTool('commitment', { who: '未知？', what: '回報' }, 'test-main')).toContain('commitment recorded')
-  } finally { L.useItemReceiver(receiver, client); await mode.probe() }
+  } finally { L.useItemReceiver(receiver, client); await switchMember(true) }
 })
 
 test.each([false, true])('a refused followup and promise each use their local timer once (replay=%s)', async replay => {
@@ -373,7 +377,7 @@ test.each([false, true])('a refused followup and promise each use their local ti
   const s = L.__lanesState(), event = 'refused:' + replay, lane = 'adam.reflex.refused-' + replay, thread = 'adam#' + event
   s.lanes[lane] = { id: lane, kind: 'reflex', thread, status: 'idle', runs: 0, last: new Date().toISOString() } as any
   s.threads[thread] = { id: thread, lane, peer: 'eve' } as any
-  s.wall = { kind: 'usage', probe_at: Date.now() + 3600_000 } as any
+  s.lanes[lane]!.last_limit_refusal = Date.now()
   L.__events().open(event, { class: 'peer', owner: lane, thread, obligations: [] })
   const tok = { runId: event, lane, evId: event, trigger: 'peer', cls: 'peer', closers: [] } as any
   const due = Date.now() + 600_000

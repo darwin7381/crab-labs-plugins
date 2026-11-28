@@ -62,7 +62,7 @@ export function fakeItems(member = 'adam', actionPort?: number, clock?: () => nu
   const error = (status: number, code: string, extra = {}) => Response.json({ error: { code, message: code, retryable: status >= 500, ...extra } }, { status })
   const change = (r: Row, kind: string, note = '', updatedAt?: string) => {
     now++
-    r.version++; r.updated_at = updatedAt ?? iso(now); r.events!.push({ at: r.updated_at, kind, claim_id: r.claim?.id ?? lastClaim.get(r.id) ?? null, session_id: r.session_id, state: r.state, reason: r.reason, note: note || null })
+    r.version++; r.updated_at = updatedAt ?? iso(now); r.events!.push({ at: r.updated_at, kind, claim_id: r.claim?.id ?? lastClaim.get(r.id) ?? null, session_id: r.claim?.session_id ?? r.session_id, state: r.state, reason: r.reason, note: note || null })
     for (const wake of waiters) wake()
   }
   const expire = () => {
@@ -258,7 +258,7 @@ export function fakeItems(member = 'adam', actionPort?: number, clock?: () => nu
       history.push({ item_id: row.id, body: b })
       if (['cancelled', 'completed'].includes(row.state) || lastClaim.get(row.id) !== b.claim_id && b.outcome !== 'completed'
         || expired.has(row.id) && intermediate.has(b.outcome)) { change(row, 'late_report', b.note); return detail(view(row)) }
-      if (b.outcome === 'in_session' && row.claim) { row.claim.session_id = b.session_id; row.session_id = b.session_id; row.in_session_at = b.at }
+      if (b.outcome === 'in_session' && row.claim) { row.claim.session_id = b.session_id; row.session_id ??= b.session_id; row.in_session_at = b.at }
       if (typeof b.half_done === 'boolean') row.half_done = b.half_done
       if (b.outcome === 'error') row.not_before = iso(now + (row.failures + 1) * 300_000)
       if (failures.has(b.outcome) && !(b.outcome === 'cut' && row.reason === 'stuck')) row.failures++

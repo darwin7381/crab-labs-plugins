@@ -4318,7 +4318,7 @@ function keeperForLane(lane: Lane): MainWall | null {
 /** pump already serializes starts for this lane. Only a real waiting Item can probe its refusal. */
 function laneMayTake(it: QItem): boolean {
   const lane = S.lanes[it.lane]
-  if (!lane) return false
+  if (!lane) return true  // startRun returns the Item to main
   const last = lane.last_limit_refusal
   const keeper = keeperForLane(lane)
   it.keeperProbe = undefined

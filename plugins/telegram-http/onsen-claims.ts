@@ -214,11 +214,12 @@ export class Claims implements ClaimStore {
       if (row.target && row.session_id && !this.receivers.has(id)) this.receivers.set(id, row.session_id)
     }
   }
-  /** A queued pre-C6 report has the old wire value even after the ledger has been migrated. */
+  /** Keep the local receiving UUID for hooks. Fleet Core 0.42.2 names an ordinary main "main" on the wire. */
   reportBody({ item_id, body }: ItemReport): ItemReport['body'] {
     const row = this.rows[item_id]
-    if (body.outcome === 'in_session' && body.session_id === 'main' && row?.claim_id === body.claim_id && row.session_id)
-      return { ...body, session_id: row.session_id }
+    if (body.outcome === 'in_session' && row?.claim_id === body.claim_id && !row.target &&
+      /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(body.session_id ?? ''))
+      return { ...body, session_id: 'main' }
     return body
   }
   acknowledged(line: ItemReport, accepted: boolean): void {

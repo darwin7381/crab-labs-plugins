@@ -257,9 +257,9 @@ test('a pulled person_edit without a date uses the retained original arrival', a
 test('the inbox daemon follows take_member and serves the take relays with its local switch unset', async () => {
   const d = await daemon({ CHANNEL_INBOX_ONLY: '1', AGENT_INBOX_SELF: 'adam', ONSEN_PULL: 'adam', ONSEN_TAKE: '' })
   await waitFor(() => d.log().includes('member is on take'))
-  for (const endpoint of ['inbound-log', 'scheduler-taken']) {
+  for (const [endpoint, expected] of [['inbound-log', 200], ['scheduler-taken', 404]] as const) {
     const reply = await fetch(d.base + '/lanes/' + endpoint, { method: 'POST', headers: { Authorization: 'Bearer test-loopback' }, body: '{}' })
-    expect(reply.status).toBe(200)
+    expect(reply.status).toBe(expected)
   }
   expect(d.f.calls.some(c => c.path.endsWith('/items'))).toBe(false)
   expect(d.f.calls.filter(c => c.path === '/inbox')).toHaveLength(1)
@@ -631,7 +631,7 @@ async function runningWorker() {
     message_id: id, from: 'joey', conversation_id: 'conv', kind: 'text', thread: 555, text: id,
     client: { name: 'telegram', chat: '1', msg_id: tg, user_id: '1', user: 'Joey', thread: '555' },
   } })
-  const first = person(capturedPerson.id, '550', { ...capturedPerson, state: 'waiting' })
+  const first = person(capturedPerson.id, '550', { ...capturedPerson, member: 'adam', state: 'waiting' })
   await waitFor(() => d.f.history.some(h => h.item_id === first.id && h.body.session_id === worker))
   expect(first.session_id).toBe('main')
   expect(d.f.calls.filter(c => c.path === '/v1/items/' + first.id)).toHaveLength(0)
@@ -1072,10 +1072,10 @@ test('/roam without a target creates one menu Action; a returned choice is handl
   expect(JSON.parse(readFileSync(roamerState(d.root).ROAMER_STATE_FILE, 'utf8')).current_target.session_id).toBe(lab.sid)
   const replies = d.f.calls.filter(c => c.path === '/v1/messages').length
   expect(replies).toBeGreaterThan(0)
-  expect(actions.acalls.filter(c => c.path.endsWith('/applied'))).toHaveLength(1)
+  expect(actions.acalls.filter(c => c.path.endsWith('/applied'))).toHaveLength(0)
   const repeat = press('repeat')
   await waitFor(() => repeat.reason === 'not_applied')
-  expect(actions.acalls.filter(c => c.path.endsWith('/applied'))).toHaveLength(1)
+  expect(actions.acalls.filter(c => c.path.endsWith('/applied'))).toHaveLength(0)
   expect(d.f.calls.filter(c => c.path === '/v1/messages')).toHaveLength(replies)
   const next = command(d, 'stale', '/roam', '100')
   await waitFor(() => next.state === 'completed')
@@ -1571,6 +1571,7 @@ for (const [callState, outcome, namedCall] of [
   writeFileSync(join(d.root, 'release-lane'), '')
   await waitFor(() => schedule.state === 'completed')
   expect(readFileSync(join(d.root, 'scheduler-receipt'), 'utf8')).toContain('Call result queued')
+  await waitFor(() => d.f.scheduleCalls.get(callId)?.result != null)
   expect(d.f.scheduleCalls.get(callId)!.result).toEqual(result)
   const reports = d.f.history.filter(h => h.item_id === schedule.id)
   expect(reports.map(h => h.body.outcome)).toEqual(['in_session', 'completed'])

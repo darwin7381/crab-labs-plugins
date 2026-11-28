@@ -517,7 +517,7 @@ export function createMain(E: MainEnv) {
       do {
         pumpAgain = false
         const receiver = E.itemReceiver?.()
-        if (receiver && E.itemReceiver?.()?.mode.active && !receiver.claims.blocked()) {
+        if (receiver?.mode.canReceive && !receiver.claims.blocked()) {
           for (const r of items(r => r.resume_claim && !r.resume_claim.waiting)) await restoreResumeClaim(receiver, r)
         }
         await offerNext()
@@ -529,7 +529,7 @@ export function createMain(E: MainEnv) {
     const ref: ItemRef = r.onsen_items[0], receipt = r.resume_claim
     if (!receipt) return
     if (!receiver.claims.completed(ref.onsen_item_id)) {
-      const { given } = await receiver.receive([ref], true, true, (gone, claimed) => {
+      const { given } = await receiver.receive([ref], false, true, (gone, claimed) => {
         if (gone.has(ref.onsen_item_id) && r.resume_claim === receipt) J().write('msg', r.id, r.state, {
           resume_claim: claimed.has(ref.onsen_item_id) ? { ...receipt, waiting: true } : null })
       })

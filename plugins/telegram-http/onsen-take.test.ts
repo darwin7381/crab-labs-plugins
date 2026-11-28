@@ -28,7 +28,7 @@ function rig() {
   const file = join(dir, 'claims.json')
   let main: MainApi | undefined
   const claims = new Claims(file, client, (id, outcome) => { misses.push(id); main?.offerMissed(id, outcome) }, () => {}, f.now, id => main?.unboundOutcome(id) ?? 'not_taken')
-  client.watchItemReports(r => claims.replay(r), (r, ok) => claims.acknowledged(r, ok))
+  client.watchItemReports(r => claims.replay(r), (r, ok) => claims.acknowledged(r, ok), line => claims.reportBody(line))
   const receiver = new ItemReceiver(mode, claims, time => deadlines.push(time))
   clean.push(() => { mode.stop(); claims.stop(); client.stop(); f.stop(); rmSync(dir, { recursive: true, force: true }) })
   const outcomes = (id: string) => f.history.filter(r => r.item_id === id).map(r => r.body.outcome)
@@ -789,6 +789,7 @@ test('C4 a permanently refused DELETE retires its local offer and advances the s
   await r.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] })
   for (let i = 0; i < 10; i++) { await r.m.pump(); await r.sync() }
   r.m.routeResume(itemRef(r.row), r.row.payload.text)
+  await until(() => r.client.skipped.count === 1 && r.client.pendingBytes() === 0)
   expect([deletes, r.client.skipped.count, r.client.pendingBytes(), r.offers.length]).toEqual([1, 1, 0, 0])
   expect(r.logs.filter(l => l.includes('moved to rejected.jsonl'))).toHaveLength(1)
 })
@@ -886,7 +887,7 @@ test('a pre-C6 claim and a replayed main wire report retain the original receivi
   r.client.watchItemReports(l => claims.replay(l), (l, ok) => claims.acknowledged(l, ok), l => claims.reportBody(l))
   await r.sync()
   expect(row.session_id).toBe('main')
-  expect(row.claim!.session_id).toBe(sid)
+  expect(row.claim!.session_id).toBe('main')
   claims.finalStop('main', 'turn')
   claims.statusRecord(sid, 'idle', () => 0, 0)
   claims.finalStop(sid, 'turn')
@@ -1077,7 +1078,7 @@ test('idle main takes before offer, binds, completes only after final Stop and i
   row.session_id = 'main'
   await r.bind(row)
   expect(row.session_id).toBe('main')
-  expect(row.claim?.session_id).toBe(r.sid)
+  expect(row.claim?.session_id).toBe('main')
   r.claims.finalStop('another-session', 'turn')
   r.f.advance(3001); r.status('idle'); await r.sync()
   expect(r.outcomes(row.id)).toEqual(['in_session'])
@@ -1208,7 +1209,7 @@ test('while busy mail waits, a person binds inside PostToolUse, pre-switch work 
   expect(r.claims.held()).toEqual([])
   await r.hook('PostToolUse'); await r.sync()
   expect(mail.claim).toBeNull(); expect(r.outcomes('legacy')).toEqual([])
-  expect(message.claim?.session_id).toBe(r.sid)
+  expect(message.claim?.session_id).toBe('main')
   for (const id of r.claims.held()) { const it = r.f.rows.get(id)!; expect(!!it.in_session_at || r.f.now() - Date.parse(it.claim!.taken_at) < 20_000).toBe(true) }
 })
 
@@ -1219,7 +1220,7 @@ test('claim invariant after every idle, busy and walled main transition', async 
     const held = [...r.f.rows.values()].filter(row => row.state === 'claimed')
     expect(r.claims.held().sort()).toEqual(held.map(row => row.id).sort())
     for (const row of held) {
-      if (row.in_session_at) expect(row.claim!.session_id).toBe(r.sid)
+      if (row.in_session_at) expect(row.claim!.session_id).toBe('main')
       else {
         const offered = r.m.items(it => it.state === 'offered' && it.onsen_items?.some((ref: any) => ref.onsen_item_id === row.id))
         expect(offered).toHaveLength(1)
