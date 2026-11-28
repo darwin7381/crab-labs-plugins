@@ -17,6 +17,7 @@ const JOEY = '1828'
 function fakeOnsen() {
   const store = new Map<string, any>()            // idem_key → row
   const events = new Map<string, any>()
+  const readErrors = new Map<string, number>()
   const calls: Array<{ method: string; path: string; headers: Record<string, string>; body: any }> = []
   const st = { down: false, status5xx: false, hang: false, refuseKey: '' as string, batch400: false }
   let next = 1
@@ -48,6 +49,8 @@ function fakeOnsen() {
       if (events.has(body.idem_key)) return json(200, { id: events.get(body.idem_key).id, duplicate: true })
       const id = next++; events.set(body.idem_key, { ...body, id }); return json(200, { id, duplicate: false, message_id: 1 })
     }
+    const readError = readErrors.get(path)
+    if (readError != null) return json(readError, {})
     if (path.startsWith('/messages?')) {
       const rows = [...store.values()].filter(r => !url.searchParams.get('chat') || r.chat === url.searchParams.get('chat'))
         .filter(r => !url.searchParams.get('q') || r.body.includes(url.searchParams.get('q')!))
@@ -64,12 +67,12 @@ function fakeOnsen() {
     }
     const alias = /^\/alias\/telegram\/([^/]+)\/([^/]+)\/(\d+)$/.exec(path)
     if (alias) {
-      const r = [...store.values()].find(x => x.chat === alias[2] && x.client_msg_id === alias[3])
+      const r = [...store.values()].find(x => x.agent === alias[1] && x.chat === alias[2] && x.client_msg_id === alias[3])
       return r ? json(200, { id: r.id }) : json(404, { error: 'no alias' })
     }
     return json(404, { error: 'no route' })
   }) as typeof fetch
-  return { f, store, events, calls, st }
+  return { f, store, events, calls, st, readErrors }
 }
 
 function client(dir: string, f: typeof fetch, o: { cred?: string | null; logs?: string[]; queryTimeoutMs?: number } = {}) {
@@ -304,20 +307,92 @@ describe('chat_history', () => {
     expect(src).toContain("const text = await onsen.queryHistory(args, 'hook')")
   })
 
-  test('id: an Onsen id; tg:<n>; a bare number (Onsen id first, then the Telegram alias); full text with its events', async () => {
+  test('a bare message_id resolves only in this agent’s selected chat, even when another chat has that Onsen id', async () => {
+    const on = fakeOnsen(), c = client(tmp(), on.f)
+    const group = { id: -10042, type: 'supergroup' }
+    c.recordMessage(inboundItem(AGENT, tgMsg(182, 'other conversation', { chat: group }), 'other conversation'))  // #1
+    c.recordMessage(inboundItem(AGENT, tgMsg(1, 'group', { chat: group }), 'group'))                             // #2
+    c.recordMessage(inboundItem(AGENT, tgMsg(1, 'Joey DM'), 'Joey DM'))                                          // #3
+    await c.syncNow(true)
+
+    const start = on.calls.length
+    expect(await c.queryHistory({ id: '1' })).toContain('#3 tg:1\nJoey DM')
+    expect(await c.queryHistory({ id: '1', chat: String(group.id) })).toContain('#2 tg:1\ngroup')
+    expect(await c.queryHistory({ id: '2' })).toContain('找不到')
+    expect(on.calls.slice(start).map(x => x.path)).toEqual([
+      `/alias/telegram/${AGENT}/${JOEY}/1`, '/messages/3',
+      `/alias/telegram/${AGENT}/${group.id}/1`, '/messages/2',
+      `/alias/telegram/${AGENT}/${JOEY}/2`,
+    ])
+    expect(await c.queryHistory({ id: '#1' })).toContain('#1 tg:182\nother conversation')
+  })
+
+  test('full text and events by list id, Telegram alias, or the Onsen ids used in reply and page tags', async () => {
     const dir = tmp(), on = fakeOnsen(), c = client(dir, on.f)
     c.recordMessage(outText('main', 2168, 'y'.repeat(500)).r as OnsenItem)
     c.recordEvent(outboundRecord(AGENT, { sender: 'main' }, 'editMessageText', { chat_id: JOEY, message_id: 2168, text: '改過的字' }, { message_id: 2168 })!.r as OnsenEvent)
     c.recordEvent(outboundRecord(AGENT, { sender: `tg:${JOEY}` }, 'setMessageReaction', { chat_id: JOEY, message_id: 2168, reaction: [{ type: 'emoji', emoji: '👍' }] }, true)!.r as OnsenEvent)
     await c.syncNow(true)
-    const full = await c.queryHistory({ id: '1' })
+    const full = await c.queryHistory({ id: '#1' })
     expect(full).toContain('y'.repeat(500))
     expect(full).toContain('main 改成：改過的字'); expect(full).toContain('Joey 按了 👍')
-    expect(await c.queryHistory({ id: 'tg:2168' })).toContain('y'.repeat(500))
-    const n0 = on.calls.length
-    expect(await c.queryHistory({ id: '2168' })).toContain('y'.repeat(500))    // no Onsen #2168: the alias
-    expect(on.calls.slice(n0).map(x => x.path)).toEqual(['/messages/2168', `/alias/telegram/${AGENT}/${JOEY}/2168`, '/messages/1'])
+    for (const id of ['tg:2168', ' TG:2168 ', '2168', 'onsen:1', 'form-1']) {
+      expect(await c.queryHistory({ id })).toBe(full)
+    }
     expect(await c.queryHistory({ id: 'tg:9999' })).toContain('找不到')
+  })
+
+  test('without a default DM, a bare id needs a chat even when another chat is in the local spool', async () => {
+    const on = fakeOnsen()
+    const c = new OnsenClient({ ...client(tmp(), on.f).cfg, joeyChat: () => '' })
+    c.recordMessage(inboundItem(AGENT, tgMsg(10, 'cached group message', { chat: { id: -10042, type: 'supergroup' } }), 'cached group message'))
+    on.st.down = true
+    expect(await c.queryHistory({ id: '10' })).toContain('chat_id')
+    expect(on.calls).toHaveLength(0)
+    expect(await c.queryHistory({ id: '10', chat: '-10042' })).toContain('cached group message')
+  })
+
+  test.each([403, 404])('HTTP %i on the alias, its target or an explicit Onsen id explains the refusal without showing a cached copy', async status => {
+    const on = fakeOnsen(), c = client(tmp(), on.f)
+    c.recordMessage(inboundItem(AGENT, tgMsg(3114, 'cached copy'), 'cached copy'))
+    await c.syncNow(true)
+    const alias = `/alias/telegram/${AGENT}/${JOEY}/3114`
+    const start = on.calls.length
+    on.readErrors.set('/messages/1', status)
+    const direct = await c.queryHistory({ id: '#1' })
+    const target = await c.queryHistory({ id: '3114' })
+    on.readErrors.set(alias, status)
+    const scoped = await c.queryHistory({ id: 'tg:3114' })
+
+    for (const answer of [direct, target, scoped]) {
+      expect(answer).toContain(status === 403 ? '不在你看得到的對話裡' : '找不到這一則')
+      expect(answer).toMatch(/message_id.*純數字.*tg:N.*#N/)
+      expect(answer).not.toMatch(/Onsen 連不上|本機暫存|cached copy/)
+    }
+    expect(on.calls.slice(start).map(x => x.path)).toEqual(['/messages/1', alias, '/messages/1', alias])
+  })
+
+  test('a timed-out id lookup reports the timeout and shows the cached message from the selected chat', async () => {
+    const on = fakeOnsen(), c = client(tmp(), on.f, { queryTimeoutMs: 50 })
+    c.recordMessage(inboundItem(AGENT, tgMsg(3114, 'group', { chat: { id: -10042, type: 'supergroup' } }), 'group'))
+    c.recordMessage(inboundItem(AGENT, tgMsg(3114, 'DM'), 'DM'))
+    const other = new OnsenClient({ ...c.cfg, agent: 'eve' })
+    other.recordMessage(inboundItem('eve', tgMsg(3114, 'another agent’s DM'), 'another agent’s DM'))
+    other.recordEvent(outboundRecord('eve', { sender: 'main' }, 'editMessageText', { chat_id: JOEY, message_id: 3114, text: 'another edit' }, {})!.r as OnsenEvent)
+    on.st.hang = true
+    const answer = await c.queryHistory({ id: '3114' })
+    expect(answer.split('\n')[0]).toMatch(/Onsen 連不上.*秒內沒回應.*本機暫存/)
+    expect(answer).toEndWith('tg:3114\nDM')
+  })
+
+  test('HTTP 503 fetching a resolved id uses the spool, where only Telegram ids are known', async () => {
+    const on = fakeOnsen(), c = client(tmp(), on.f)
+    c.recordMessage(inboundItem(AGENT, tgMsg(3114, 'cached copy'), 'cached copy'))
+    await c.syncNow(true)
+    on.readErrors.set('/messages/1', 503)
+    expect(await c.queryHistory({ id: '3114' })).toMatch(/Onsen 連不上（HTTP 503）.*本機暫存[\s\S]*tg:3114\ncached copy$/)
+    on.st.status5xx = true
+    expect(await c.queryHistory({ id: '#3114' })).toMatch(/Onsen 連不上（HTTP 503）.*本機暫存[\s\S]*找不到 #3114。$/)
   })
 
   test('Onsen silent (no answer in time, down, or no credential): the local spool answers and says so', async () => {
@@ -374,6 +449,8 @@ describe('chat_history', () => {
 
   test('chat_history is listed for the main (server.ts) and for every lane kind (lanes.ts); the old "ask them to paste" sentence is gone', () => {
     expect(CHAT_HISTORY_TOOL.description.startsWith('查之前講過什麼：你和 Joey 在這裡的每一則問答（他說的、你回的、分身推的）都在 Onsen。')).toBe(true)
+    expect(CHAT_HISTORY_TOOL.description).toContain('message_id 用純數字或 tg:N，清單上的 Onsen 編號用 #N')
+    expect(CHAT_HISTORY_TOOL.inputSchema.properties.id.description).toContain('3114 或 tg:3114 查指定聊天的 message_id，#47192 查 Onsen 編號')
     expect(CHAT_HISTORY_TOOL.inputSchema.properties.limit.description).toContain('最多 200')
     expect(LANE_TOOLS.map(t => t.name)).toContain('chat_history')
     for (const k of ['reflex', 'worker', 'mail', 'fork', undefined] as any[]) expect(laneToolsFor(k).map((t: any) => t.name)).toContain('chat_history')
