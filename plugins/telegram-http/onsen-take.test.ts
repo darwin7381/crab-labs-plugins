@@ -1592,6 +1592,29 @@ test('a plain-text report refusal keeps the server explanation on one error line
   expect(errors[0]).not.toContain('\n')
 })
 
+test.each([200, 400])('a retryable Item refusal logs once across a restart and a final HTTP %i', async endStatus => {
+  const r = rig()
+  let status = 429
+  const cfg = { ...r.client.cfg, fetch: async () => new Response(status === 429 ? 'slow down' : 'final answer', { status }) }
+  const client = new OnsenClient(cfg)
+  client.recordItemReport({ item_id: 'limited', body: { claim_id: 'one', outcome: 'cut', at: new Date().toISOString() } })
+  await client.syncNow(true)
+  expect(client.pendingBytes()).toBeGreaterThan(0)
+  expect(existsSync(client.rejected)).toBe(false)
+  client.stop()
+  const restarted = new OnsenClient(cfg)
+  await restarted.syncNow(true)
+  status = endStatus
+  await restarted.syncNow(true)
+  expect(restarted.pendingBytes()).toBe(0)
+  const errors = r.logs.filter(l => l.startsWith('[error]'))
+  expect(errors).toHaveLength(1)
+  expect(errors[0]).toMatch(/Item limited cut .*HTTP 429 slow down/)
+  expect(existsSync(restarted.rejected)).toBe(endStatus === 400)
+  if (endStatus === 400) expect(JSON.parse(readFileSync(restarted.rejected, 'utf8')).why).toContain('HTTP 400 final answer')
+  restarted.stop()
+})
+
 test('a foreign connector pauses all receives for 45 s and keeps the observation latched', async () => {
   const r = rig()
   let retry: (() => void) | undefined, interval = 0

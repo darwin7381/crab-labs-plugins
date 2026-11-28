@@ -455,6 +455,7 @@ export class OnsenClient {
   /** WO-175: what became of the Call lines sent lately (idem → fate), and who waits for one not sent yet */
   private itemReports = 0
   private reportedThrough: number
+  private refusedReportEnd: number
   private itemAck?: (line: ItemReport, ok: boolean) => void
 
   watchItemReports(replay: (line: ItemReport) => void, ack: (line: ItemReport, ok: boolean) => void): void {
@@ -549,6 +550,7 @@ export class OnsenClient {
     this.spoolOld = join(cfg.dir, 'spool.1.jsonl')
     this.cursorFile = join(cfg.dir, 'cursor.json')
     this.reportedThrough = this.readCursor('reportedThrough')
+    this.refusedReportEnd = this.readCursor('refusedReportEnd')
     this.rejected = join(cfg.dir, 'rejected.jsonl')
     this.linesFile = join(cfg.dir, 'lines.json')
     this.itemWrites = new ItemWrites(join(cfg.dir, 'item-ids'), cfg.agent, (...args) => this.request(...args))
@@ -835,7 +837,9 @@ export class OnsenClient {
   }
   private writeCursor(offset: number, reportEnd = this.reportedThrough): void {
     const tmp = `${this.cursorFile}.${process.pid}.tmp`
-    writeFileSync(tmp, JSON.stringify({ offset, ...(reportEnd > offset ? { reportedThrough: reportEnd } : {}), at: new Date().toISOString() }), { mode: 0o600 })
+    if (this.refusedReportEnd <= Math.max(offset, reportEnd)) this.refusedReportEnd = 0
+    writeFileSync(tmp, JSON.stringify({ offset, ...(reportEnd > offset ? { reportedThrough: reportEnd } : {}),
+      ...(this.refusedReportEnd ? { refusedReportEnd: this.refusedReportEnd } : {}), at: new Date().toISOString() }), { mode: 0o600 })
     renameSync(tmp, this.cursorFile)
     this.reportedThrough = reportEnd > offset ? reportEnd : 0
   }
@@ -847,12 +851,12 @@ export class OnsenClient {
   }
   private ok(): void { this.backoffMs = 0; this.nextTryAt = 0; this.stats.last_ok_at = new Date().toISOString(); this.stats.last_error = null }
   /** `skip` (1.58.32): Onsen refused it (a 4xx, an item's own refusal in a batch): counted in `skipped`, the last one kept for /healthz */
-  private reject(line: unknown, why: string, skip?: SkippedInfo): void {
+  private reject(line: unknown, why: string, skip?: SkippedInfo, level: 'warn' | 'error' = 'warn'): void {
     this.stats.rejected++
     try { appendFileSync(this.rejected, JSON.stringify({ at: new Date().toISOString(), why, line }) + '\n', { mode: 0o600 }) } catch {}
     const key = lineKey(line)
     if (skip) this.noteSkipped(1, skip, key)
-    this.cfg.log(skip?.kind === 'ir' ? 'error' : 'warn', `onsen: rejected ${key} (${why}); moved to rejected.jsonl, not retried`)
+    this.cfg.log(level, `onsen: rejected ${key} (${why}); moved to rejected.jsonl, not retried`)
   }
   /** step 3: a whole batch refused: each line to rejected.jsonl, one log line for the lot */
   private rejectRun(lines: unknown[], why: string, skip?: SkippedInfo): void {
@@ -1055,9 +1059,18 @@ export class OnsenClient {
         const r = await this.put(path, body, cred, undefined, { 'Idempotency-Key': key }).catch(e => ({ status: 0, json: { error: errText(e) } }))
         const ok = r.status === 200
         if (!ok) {
-          const code = errCode(r.json)
-          if (refusedForGood(r)) this.reject(t.line, `PUT ${path}: HTTP ${r.status} ${callSaid(r.json)}`, { kind: 'ir', path, status: r.status, code })
-          else return this.failStatus(r, path)
+          const why = `PUT ${path}: HTTP ${r.status} ${callSaid(r.json)}`
+          const logged = this.refusedReportEnd === t.end
+          if (refusedForGood(r)) {
+            this.reject(t.line, why, { kind: 'ir', path, status: r.status, code: errCode(r.json) }, logged ? 'warn' : 'error')
+          } else {
+            if (!logged && r.status >= 400 && r.status < 500) {
+              this.cfg.log('error', `onsen: ${lineKey(t.line)} (${why}); kept for retry`)
+              this.refusedReportEnd = t.end
+              this.writeCursor(this.readCursor())
+            }
+            return this.failStatus(r, path)
+          }
         }
         if (ok) this.itemWrites.observe(r.json?.data)
         this.itemAck?.(line, ok)
