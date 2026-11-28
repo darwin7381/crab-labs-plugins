@@ -258,13 +258,23 @@ export class Claims implements ClaimStore {
       // Receipts match an explicit quote by its Onsen message id. Unquoted replies belong to the work of this turn in this session.
       if (replyToMessageId != null) { if (row.message_id !== replyToMessageId) continue }
       else {
-        const continued = row.last_outcome === 'background' && !!session
-        if (session && localSession(row) !== session || !turn || !continued && row.turn !== turn) continue
+        if (!session || localSession(row) !== session || !turn || row.turn !== turn) continue
       }
       const replies = row.replies ??= []
       if (!replies.includes(message)) { replies.push(message); updated = true }
     }
     if (updated) this.save()
+  }
+  continueBackground(refs: ItemRef[], session: string, turn: string): void {
+    let changed = false
+    for (const ref of refs) {
+      const row = this.rows[ref.onsen_item_id]
+      if (row?.last_outcome === 'background' && localSession(row) === session && row.turn !== turn) {
+        row.turn = turn
+        changed = true
+      }
+    }
+    if (changed) this.save()
   }
   finalStop(session: string, turn: string): void {
     let updated = false

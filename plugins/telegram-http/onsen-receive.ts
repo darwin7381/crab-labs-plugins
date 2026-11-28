@@ -24,6 +24,7 @@ export type ClaimStore = {
   bind(id: string, session: string, turn: string, registrySession?: string): void
   report(id: string, outcome: Outcome, fields?: ReportFields): boolean
   finalStop(session: string, turn: string): void
+  continueBackground(refs: ItemRef[], session: string, turn: string): void
   continued(session: string, turn: string): void
 }
 

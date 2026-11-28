@@ -1049,6 +1049,10 @@ export function createMain(E: MainEnv) {
       setMain(g, 'in_turn', { prompt_id: prompt, tool_open: null, stopped_prompt: null })
     }
     const accepted = items(canBind)
+    if (backgroundNotice && !accepted.length) {
+      const carried = turnWork(g, prompt)
+      if (carried.carried) receiver?.claims.continueBackground(carried.items.flatMap(r => r.onsen_items ?? []), g.session_id, prompt)
+    }
     for (const r of accepted) if (r.onsen_items) receiver?.bind(r.onsen_items, 'main', prompt, g.session_id)
     const at = new Date().toISOString()
     for (const r of accepted) J().write('msg', r.id, 'bound', { gen: g.id, prompt_id: prompt, bound_at: at,

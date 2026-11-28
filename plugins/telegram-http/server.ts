@@ -4460,7 +4460,7 @@ if (Lanes.LANES_ON) {
         if (!tg) {
           // WO-197: the line written into Onsen (its label as its first line, as recorded today); the bridge draws it. Not reported within 3 s: said
           // (OnsenFirst.HeldInOnsen: pushJoey / sendLine count it as told, the lane owes nothing)
-          const r = await connectorReply({ chat, sender, text: Connector.withoutOnsenLabel(fl.text, sender, ONSEN_AGENT, Lanes.kindName), redact: fl.redact, rich: useRich, files: [], replyTo: o.replyTo ?? null,
+          const r = await connectorReply({ chat, sender, session: o.laneId, text: Connector.withoutOnsenLabel(fl.text, sender, ONSEN_AGENT, Lanes.kindName), redact: fl.redact, rich: useRich, files: [], replyTo: o.replyTo ?? null,
             topic: tf.message_thread_id, silent: !!o.silent, turn_id })
           if (r.held || !r.ids.length) throw new OnsenFirst.HeldInOnsen(r.held ? Connector.HELD : `sent (id: onsen:${r.onsenId})`, Number(r.onsenId), [])
           const ids = r.ids.map(Number)
