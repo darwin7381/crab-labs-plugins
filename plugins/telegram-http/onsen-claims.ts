@@ -27,6 +27,11 @@ export class Claims implements ClaimStore {
     try {
       const data = JSON.parse(readFileSync(file, 'utf8'))
       this.rows = Object.assign(Object.create(null), data.claims)
+      // Pre-C6 main claims stored the receiving UUID separately from the wire value "main".
+      for (const row of Object.values(this.rows)) if (row.registry_session) {
+        row.session_id = row.registry_session
+        delete row.registry_session
+      }
       this.done = data.done ?? []
     } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e }
   }
@@ -69,10 +74,10 @@ export class Claims implements ClaimStore {
     this.rows[row.id] = { claim_id: claim.id, taken_at: claim.taken_at, conversation: ref.conversation }
     this.save(); this.clock(row.id); this.changed()
   }
-  bind(id: string, session: string, turn: string, registrySession?: string): void {
+  bind(id: string, session: string, turn: string): void {
     if (!this.owns(id)) return
     const row = this.rows[id]!
-    Object.assign(row, { session_id: session, turn, registry_session: registrySession })
+    Object.assign(row, { session_id: session, turn })
     if (!row.in_session_at) this.report(id, 'in_session', { session_id: session })
   }
   report(id: string, outcome: Outcome, fields: ReportFields = {}): void {
@@ -88,7 +93,7 @@ export class Claims implements ClaimStore {
     const row = this.rows[id]
     if (row?.claim_id !== body.claim_id) return
     row.last_outcome = body.outcome
-    if (body.outcome === 'in_session') { row.in_session_at = body.at; row.session_id = body.session_id }
+    if (body.outcome === 'in_session') { row.in_session_at = body.at; row.session_id ??= body.session_id }
   }
   acknowledged(line: ItemReport, accepted: boolean): void {
     const { item_id: id, body } = line
@@ -101,7 +106,8 @@ export class Claims implements ClaimStore {
   reply(turn: string, conversation: string, message: string, registrySession?: string | null): void {
     let updated = false
     for (const row of Object.values(this.rows)) {
-      const continued = row.last_outcome === 'background' && registrySession && row.registry_session === registrySession
+      if (registrySession && row.session_id !== registrySession) continue
+      const continued = row.last_outcome === 'background' && registrySession && row.session_id === registrySession
       if ((!continued && row.turn !== turn) || row.conversation !== conversation) continue
       const replies = row.replies ??= []
       if (!replies.includes(message)) { replies.push(message); updated = true }
@@ -111,21 +117,21 @@ export class Claims implements ClaimStore {
   finalStop(session: string, turn: string): void {
     let updated = false
     for (const row of Object.values(this.rows)) {
-      if (row.session_id !== 'main' || row.registry_session !== session) continue
+      if (row.session_id !== session) continue
       if (row.turn === turn || row.last_outcome === 'background') { row.stop = { turn, at: this.now() }; updated = true }
     }
     if (updated) this.save()
   }
-  continued(turn: string): void {
+  continued(session: string, turn: string): void {
     let updated = false
-    for (const row of Object.values(this.rows)) if (row.stop?.turn === turn) { delete row.stop; updated = true }
+    for (const row of Object.values(this.rows)) if (row.session_id === session && row.stop?.turn === turn) { delete row.stop; updated = true }
     if (updated) this.save()
   }
-  statusRecord(member: string, background: (session: string) => number | null, settleMs: number): void {
-    if (['busy', 'stuck', 'compacting'].includes(member)) return
+  statusRecord(session: string | null, member: string, background: (session: string) => number | null, settleMs: number): void {
+    if (!session || ['busy', 'stuck', 'compacting'].includes(member)) return
     for (const [id, row] of Object.entries(this.rows)) {
-      if (!this.owns(id) || !row.stop || this.now() < row.stop.at + settleMs) continue
-      const count = background(row.registry_session!)
+      if (row.session_id !== session || !this.owns(id) || !row.stop || this.now() < row.stop.at + settleMs) continue
+      const count = background(session)
       if (count == null) continue
       this.report(id, count > 0 ? 'background' : 'completed', count > 0 ? {} : { response_message_ids: row.replies ?? [] })
       delete row.stop
