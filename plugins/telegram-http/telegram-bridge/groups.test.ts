@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { Agent } from './agent.ts'
 import { FakeOnsen, FakeTelegram, until } from './fakes.ts'
 import { Bridge, configFromEnv } from './telegram-bridge.ts'
+import { messageKey } from './groups.ts'
 
 const a = '101:lab-a', b = '102:lab-b'
 const supergroup = { id: -100212, type: 'supergroup' }, group = { id: -23, type: 'group' }
@@ -80,6 +81,41 @@ test('basic group dedupes different bot-local ids by person, second and raw capt
     'tg:-23:42:1700000000:c7225dbf105eeed5', 'tg:-23:42:1700000001:c7225dbf105eeed5',
     'tg:-23:42:1700000000:f2632a784b0d7c93',
   ].sort())
+})
+
+test('three basic-group album photos get three keys across both bots, including two without captions', async () => {
+  for (const [token, offset] of [[a, 10], [b, 80]] as const) {
+    for (let i = 0; i < 3; i++) {
+      const file = offset + '-photo-' + i
+      tg.files.set('f/' + file, new Uint8Array([i]))
+      tg.push(token, { message: { chat: group, from, date, message_id: offset + i, media_group_id: 'album',
+        ...(i === 0 ? { caption: '三張' } : {}), photo: [{ file_id: file, file_unique_id: 'photo-' + i, file_size: 1 }] } })
+    }
+  }
+  await confirmed()
+  expect(onsen.messages).toHaveLength(3)
+  expect(new Set(onsen.messages.map(m => m.idem_key)).size).toBe(3)
+  expect(onsen.files.size).toBe(3)
+  expect([...bridge.agents.values()].reduce((n, bot) => n + bot.stats.duplicates, 0)).toBe(3)
+})
+
+test('basic-group keys include stable album, file and forward identities', () => {
+  const key = (extra: Record<string, unknown>) => messageKey('lab-a', { chat: group, from, date, ...extra })
+  for (const kind of ['photo', 'video', 'video_note', 'voice', 'sticker', 'animation', 'audio', 'document']) {
+    const media = (id: string, unique: string) => kind === 'photo' ? [{ file_id: id, file_unique_id: unique }] : { file_id: id, file_unique_id: unique }
+    expect(key({ [kind]: media('bot A', 'one') })).toBe(key({ [kind]: media('bot B', 'one') }))
+    expect(key({ [kind]: media('bot A', 'one') })).not.toBe(key({ [kind]: media('bot A', 'two') }))
+    expect(key({ [kind]: media('id', 'one'), media_group_id: 'first' })).not.toBe(key({ [kind]: media('id', 'one'), media_group_id: 'next' }))
+  }
+  const origin = { type: 'channel', chat: { id: -10048 }, date, message_id: 11 }
+  expect(key({ forward_origin: origin })).not.toBe(key({ forward_origin: { ...origin, message_id: 12 } }))
+  const link = (url: string) => ({ text: '圖', entities: [{ type: 'text_link', offset: 0, length: 1, url }] })
+  expect(key(link('tg://user?id=1'))).not.toBe(key(link('tg://user?id=2')))
+  const rich = (file_id: string, text: string) => ({ rich_message: { blocks: [
+    { type: 'paragraph', text }, { type: 'photo', photo: [{ file_id, file_unique_id: 'pic' }] },
+  ] } })
+  expect(key(rich('bot-a-pic', '甲'))).toBe(key(rich('bot-b-pic', '甲')))
+  expect(key(rich('bot-a-pic', '甲'))).not.toBe(key(rich('bot-a-pic', '乙')))
 })
 
 test('entities, text mentions by id and patterns name carried members even on another bot', async () => {
