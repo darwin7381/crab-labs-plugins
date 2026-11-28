@@ -1,8 +1,30 @@
 import { hostname } from 'os'
+import { randomUUID } from 'crypto'
+import { linkSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs'
+import { join } from 'path'
 import type { ActionReq, OnsenClient } from './onsen-client.ts'
 
 export function machineName(host = process.env.ONSEN_HOST): string {
   return (host?.trim() || hostname().replace(/\.local$/, '')).toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+/, '').slice(0, 32) || 'unknown'
+}
+
+/** Publish a complete instance id atomically, including when two starts share the directory. */
+export function instanceConnector(dir: string, member: string, machine = machineName()): string {
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  const file = join(dir, 'connector-id')
+  let id: string
+  try { id = readFileSync(file, 'utf8').trim() }
+  catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
+    const fresh = randomUUID().replaceAll('-', ''), tmp = file + '.' + fresh
+    writeFileSync(tmp, fresh + '\n', { flag: 'wx', mode: 0o600 })
+    try { linkSync(tmp, file) }
+    catch (err) { if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err }
+    finally { unlinkSync(tmp) }
+    id = readFileSync(file, 'utf8').trim()
+  }
+  if (!/^[0-9a-f]{32}$/.test(id)) throw new Error('invalid connector-id in ' + dir)
+  return (machine + '/' + member).slice(0, 47) + '@' + id
 }
 
 export function takeRefusal(o: { inbox: boolean; roamer: boolean; targetRouting?: boolean; lanes: boolean; record: boolean; observation: boolean }): string | undefined {
@@ -22,7 +44,7 @@ export function reportedDelivery(source: 'items' | 'inbox', status?: number, cod
     if (status === 409 && code === 'take_member') return 'take'
   } else {
     if (status === 200) return 'take'
-    if (status === 400 || status === 404 || (status === 409 && code === 'not_take_member')) return 'pull'
+    if (status === 409 && code === 'not_take_member') return 'pull'
     if (status === 409 && code === 'not_current_connector') return 'foreign'
   }
 }
@@ -57,11 +79,11 @@ export class TakeMode extends MemberDelivery {
   readonly now = () => Date.now() + this.offset
 
   constructor(readonly member: string, readonly req: ItemRequest, readonly changed: (canReceive: boolean) => void | Promise<void>,
-    readonly log: (line: string) => void, machine = machineName(),
+    readonly log: (line: string, level?: 'error') => void, machine: string | { stateDir: string } = machineName(),
     readonly later = (fn: () => void, ms: number) => setTimeout(fn, ms)) {
     super()
     this.path = '/v1/members/' + encodeURIComponent(member) + '/items'
-    this.connector = machine + '/' + member
+    this.connector = typeof machine === 'string' ? machine + '/' + member : instanceConnector(machine.stateDir, member)
   }
 
   get canReceive(): boolean { return this.active && !this.stopped && !this.reason }
@@ -70,6 +92,7 @@ export class TakeMode extends MemberDelivery {
     const mode = await deliveryMode(this.req, this.path, this.connector)
     if (this.stopped) return
     this.checking = false
+    if (mode.status === 401 || mode.status === 403) this.log('onsen take: member probe HTTP ' + mode.status, 'error')
     const observed = this.observe(mode.observation)
     if (mode.observation === 'foreign') {
       this.pause('not_current_connector', 45_000)

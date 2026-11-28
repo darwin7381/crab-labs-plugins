@@ -79,6 +79,11 @@ export class Claims implements ClaimStore {
 
   wasOwed(id: string): boolean { return this.rows[id]?.last_outcome === 'owed' }
   carriedBy(connector: string): boolean { return this.connector === connector }
+  upgradeCarrier(previous: string, connector: string): void {
+    if (!this.carriedBy(previous)) return
+    this.save(connector, this.pollOffset)
+    this.connector = connector
+  }
   rememberCarrier(connector: string): void {
     if (this.carriedBy(connector)) return
     this.save(connector, null)

@@ -6,7 +6,7 @@ import { fakeItems } from './test-fixtures/onsen-items.ts'
 import { OnsenClient, roamerMember } from './onsen-client.ts'
 import { OnsenInbox, OnsenPuller, switchOn } from './onsen-inbox.ts'
 import { receivingUUID, reportSession } from './onsen-session.ts'
-import { deliveryMode, machineName, takeRefusal, TakeMode } from './onsen-take.ts'
+import { deliveryMode, instanceConnector, machineName, takeRefusal, TakeMode } from './onsen-take.ts'
 import { ItemPeek, itemRef, type InboxItem } from './onsen-items.ts'
 import { Claims } from './onsen-claims.ts'
 import { ItemReceiver, type Outcome } from './onsen-receive.ts'
@@ -930,6 +930,9 @@ test('switch, prerequisites, stable machine/member and all probe refusals', asyn
   const valid = { inbox: false, roamer: false, lanes: true, record: true, observation: true }
   for (const key of Object.keys(valid) as Array<keyof typeof valid>) expect(takeRefusal({ ...valid, [key]: !valid[key] })).toBeTruthy()
   expect(takeRefusal(valid)).toBeUndefined()
+  const first = instanceConnector(join(r.dir, 'one'), 'adam', 'mac-mini')
+  expect(instanceConnector(join(r.dir, 'one'), 'adam', 'mac-mini')).toBe(first)
+  expect(instanceConnector(join(r.dir, 'two'), 'adam', 'mac-mini')).not.toBe(first)
   expect(machineName('  --Mac_Mini  ')).toBe('mac-mini')
   const { path, connector, req } = r.mode
   for (const status of [400, 404, 409]) { r.f.mode(status); expect(await deliveryMode(req, path, connector)).toMatchObject({ status, take: false }) }
@@ -1592,7 +1595,7 @@ test('a foreign connector pauses all receives for 45 s and keeps the observation
 
 test('a 409 pause keeps the take gate until the probe confirms pull', async () => {
   const r = rig(), transitions: Array<[boolean, boolean]> = []
-  const mode = new TakeMode('adam', r.mode.req, ready => transitions.push([mode.active, ready]), () => {}, 'mac-mini')
+  const mode = new TakeMode('adam', r.mode.req, ready => transitions.push([mode.active, ready]), (line, level) => r.logs.push(level + ' ' + line), 'mac-mini')
   clean.push(() => mode.stop())
   await mode.probe()
   r.f.mode(409)
@@ -1602,10 +1605,12 @@ test('a 409 pause keeps the take gate until the probe confirms pull', async () =
   expect(mode.active).toBe(true)
   expect(mode.canReceive).toBe(false)
   r.f.down(false)
-  for (const status of [401, 403, 429]) {
+  for (const status of [400, 401, 403, 404, 429]) {
     r.f.mode(status); await mode.probe()
     expect(mode.active).toBe(true); expect(mode.canReceive).toBe(false)
   }
+  expect(r.logs).toContain('error onsen take: member probe HTTP 401')
+  expect(r.logs).toContain('error onsen take: member probe HTTP 403')
   r.f.mode(409); await mode.probe()
   expect(transitions.at(-1)).toEqual([false, false])
   r.f.mode(200); await mode.probe()
