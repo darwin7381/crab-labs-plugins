@@ -13,20 +13,13 @@ process.env.LANES_FLOOD_CONTROL = '0'
 let L: typeof import('./lanes.ts')
 const srv = createServer((req, res) => { void L.handleLanesHttp(new URL(req.url ?? '/', 'http://127.0.0.1'), req, res).catch(() => { try { res.writeHead(500); res.end() } catch {} }) })
 await new Promise<void>(r => srv.listen(0, '127.0.0.1', () => r()))
-process.env.LANES_TG_PORT = String((srv.address() as AddressInfo).port)
 L = await import('./lanes.ts?w-d-test') as typeof import('./lanes.ts')
-const I = await import('./lanes.ts?w-d-inbox') as typeof import('./lanes.ts')     // the inbox daemon's side
-delete process.env.LANES_TG_PORT
 const dir = mkdtempSync(join(tmpdir(), 'lanes-w-d-'))
 process.env.LANES_DIR = dir
 copyFileSync(process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json', join(dir, 'router.json'))
 const open = new Set<string>()
 L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, httpPort: 0, log: () => {}, authOk: () => true, registryNames: () => ['eve'],
   notifySession: async (sid: string) => open.has(sid), streamOpen: (sid: string) => open.has(sid), toolsChanged: () => {}, sendBot: async () => 1, joeyChatId: () => '1' } as any)
-const idir = mkdtempSync(join(tmpdir(), 'lanes-w-d-inbox-'))
-process.env.LANES_DIR = idir
-I.lanesInit({ role: 'inbox', agent: 'adam', workspaceDir: idir, transcriptDir: idir, httpPort: 0, log: () => {}, authOk: () => true, registryNames: () => ['eve'] } as any)
-process.env.LANES_DIR = dir
 const procs: any[] = []
 afterAll(() => { for (const p of procs) { try { p.kill('SIGKILL') } catch {} } srv.close(); delete process.env.LANES_FLOOD_CONTROL })
 const M = () => L.__main(), E = () => L.__events()
@@ -61,14 +54,12 @@ test('002w D, gap 10, path the Telegram router failing (toMainDirect): the event
   expect(E().get('tg-1-9101')!.state).toBe('closed')
 })
 
-test('002w D, gap 10, path the mesh router failing in the tg daemon (/lanes/route): the event goes to the main through the same builder, and the inbox daemon is told so (no broadcast); 2a936a7 left the request unanswered and the inbox broadcast it', async () => {
-  const ev = { id: 'mesh-9201', source: 'mesh', from: 'eve', verified: true, text: undefined, btcc_msg_id: '9201', meta: { btcc_msg_id: '9201' },
-    notif: { method: 'notifications/claude/channel', params: { content: '週五前可以給報告嗎？', meta: { btcc_msg_id: '9201' } } } }   // the router throws on it
-  const d = await I.routeRemote(ev as any)
-  expect(d).toMatchObject({ target: 'main', rule: 'router-failed' })
-  expect(E().get('mesh-9201')).toMatchObject({ owner: 'main', class: 'peer' })
-  expect(ob('mesh-9201', 'peer')).toMatchObject({ state: 'handed', to: 'eve', req: '9201' })
-  expect(M().items(r => r.event === 'mesh-9201').length).toBe(1)
+test('a peer event cannot enter the lane router through the previous daemon hand-over', async () => {
+  const r = await fetch('http://127.0.0.1:' + (srv.address() as AddressInfo).port + '/lanes/route', {
+    method: 'POST', headers: { authorization: 'Bearer test' }, body: JSON.stringify({ id: 'mesh-9201', from: 'eve', source: 'mesh' }),
+  })
+  expect(r.status).toBe(404)
+  expect(M().items(r => r.event === 'mesh-9201')).toHaveLength(0)
 })
 
 test('002w D, gap 17, path an event the router gives the main (master switch off, toMain): a scheduler\'s event keeps class scheduled and owes its receipt (2a936a7: class peer, no receipt)', async () => {

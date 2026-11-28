@@ -241,12 +241,9 @@ that took in nothing the owed hold asked nothing, mark_no_reply marked nothing, 
 **Every inbound event has a record, whatever its route** (one helper in the router, `recordInbound`): one given to a lane (with what it owes),
 one given to the main (a hand-over owed to it, plus what its class owes, already `handed`: the same obligations a lane's event opens with, from one
 builder; 002p), and one the router keeps to itself: a `no_reply` notice, a peer message held by a hold or a flood
-gate, an alert repeat, a message on a stopped thread. 002w (D, gap 10): the router's failures go through the same builder: a Telegram message the
-router threw on (server.ts) and a mesh message it threw on (`POST /lanes/route` answers `{rule: router-failed, target: main}`, so the inbox daemon
-does not broadcast it) are given to the main by `toMainDirect` = `toMain` (their own record, what their class owes handed to the main, their M1 item);
-a record the router had already opened gets the one hand-over. 2a936a7 opened a `direct-…` record with a main obligation only (no Joey line: the owed
-hold never held, the main's reply met nothing) and the inbox daemon broadcast a mesh message to every open session. What remains broadcast is a mesh
-message when the tg daemon itself cannot be reached (there is no M1 to queue into). A hand-over never creates a record. What the main must know about an event is a field of its
+gate, an alert repeat, a message on a stopped thread. When routing fails, the Telegram daemon passes the original event to `toMainDirect`. The main gets the event's obligations and M1 item.
+The Item keeps the claim reference throughout. BTCC mailbox decisions and deadlines enter through the authenticated `POST /lanes/mail-event`.
+What the main must know about an event is a field of its
 record (below); the ledger (`ledger.jsonl`) is an audit log that no view and no state reads.
 
 | state | meaning |

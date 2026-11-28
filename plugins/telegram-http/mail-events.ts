@@ -1,9 +1,8 @@
 // mail-events — the mailbox's two events for the lane router (WO-126; seam claude-epeius/knowledge/lane-mailbox-seam.md v2, agreed with
 // Sonn #10963; Joey TG chiron:2095).
 //
-// The main's mailbox (BTCC /api/mesh/mail) is the one list of what waits on the main's decision. BTCC never pushes anything into a session:
-// the agent-inbox daemon hands the router two events, over the path every mesh item already takes (lanes.ts routeRemote → the tg daemon's
-// /lanes/route):
+// The main's mailbox (BTCC /api/mesh/mail) is the one list of what waits on the main's decision.
+// The mailbox daemon sends its two lifecycle events to the Telegram daemon's /lanes/mail-event.
 //   mail_decision  the main answered a card (mailbox_decide). id mail-decision-<mail_id>. The router wakes the lane of that thread.
 //   mail_due       an undecided card entered the window (GET /due?within=900, read every minute). id mail-due-<mail_id>-<deadline>; the
 //                  router decides whether to wake the main. Only items new to the window are handed over.

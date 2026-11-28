@@ -17,7 +17,7 @@ const AS = ['alert-dispatcher']
 const ctx0 = { main: null, laneKind: null, alertSenders: AS, roster: ROSTER }
 const o = { agent: 'adam', host: 'mini', at: '2026-11-25T10:00:00.000Z', idem: 'wake:adam:1:b:1', memberState: 'idle' }
 const notif = (text: string, meta: Record<string, string> = {}) => ({ method: 'notifications/claude/channel', params: { content: text, meta } })
-/** a mesh event as server.ts laneEventOf builds it from an /inject body (the agent-inbox daemon sends it to /lanes/route as is) */
+/** a peer event as server.ts laneEventOf builds it from an Item */
 function mesh(id: string, from: string, text: string, meta: Record<string, string> = {}, extra: Record<string, unknown> = {}): any {
   return { id, source: 'mesh', from, text, meta, notif: notif(text, meta), verified: meta.verified !== 'false', no_reply: meta.no_reply === 'true',
     ...(meta.btcc_msg_id ? { btcc_msg_id: meta.btcc_msg_id } : {}), line: meta.line ?? (meta.wake === 'mail' ? 'mail' : 'call'),

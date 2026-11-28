@@ -71,7 +71,6 @@ import { ObservationPut } from './onsen-observation.ts'
 import { MentionCards } from './onsen-mentions.ts'
 import { JevJudge, QUESTIONS_PATH_DEFAULT } from './screen-judge-jev.ts'
 import { jevAsk, jevKey, jevLog } from './lanes-triage.ts'
-import { LocalKeepwarm, SENDER as SENDER_KEEPWARM } from './keepwarm-local.ts'
 import { parseFleetConfig } from './fleet-config.ts'
 // Genesis universe 002 (Parallel Awareness). Every call below is behind Lanes.LANES_ON
 // (GENESIS_LANES=1); with it unset the daemon runs the fleet code paths unchanged. In lanes mode nothing here delivers to
@@ -1329,8 +1328,7 @@ function promptOf(h: Onsen.ActionHandle | null | undefined): PermPrompt | undefi
   for (const p of permPrompts.values()) if (p.action === h) return p
   return undefined
 }
-/** WO-176: Onsen's control item for one of this agent's Actions (a person pressed an option in Onsen), handed over by the agent-inbox daemon
- *  (POST /onsen/action): pressed here as a press in Telegram would be, then reported applied; a prompt that is gone: cancelled, nothing pressed */
+/** Apply the claimed control Item to the matching prompt or menu. A vanished prompt is cancelled. */
 async function applyActionControl(c: Onsen.ActionControl): Promise<boolean> {
   const acts = onsenActions
   if (!acts) return false
@@ -1689,7 +1687,7 @@ async function laneMainCore(method: 'GET' | 'POST', path: string, body?: unknown
 // decision (mailbox_decide → mail_decision) and the cards entering the due window (GET /due every minute → mail_due). One the router cannot take
 // now waits in <state>/mail-events.json and goes on the next tick. Lanes off: no events (the main does what it decided itself).
 const mailEvents = INBOX_ONLY && Lanes.LANES_ON
-  ? new MailEvents({ file: join(STATE_DIR, 'mail-events.json'), send: async ev => !!(await Lanes.routeRemote(ev as unknown as Lanes.InEvent)), log: (l, m) => log(l as 'info' | 'warn' | 'error', m) })
+  ? new MailEvents({ file: join(STATE_DIR, 'mail-events.json'), send: async ev => !!(await Lanes.routeMailEvent(ev)), log: (l, m) => log(l as 'info' | 'warn' | 'error', m) })
   : null
 if (mailEvents) {
   const fetchDue = async () => { const r = await btccMail('GET', `/api/mesh/mail/due?within=${MAIL_DUE_WITHIN_S}`).catch(() => null); return r?.status === 200 && Array.isArray(r.json?.due) ? r.json.due : null }
@@ -1798,16 +1796,11 @@ function laneEventOf(n: { method: string; params: unknown }, verified?: boolean,
     ...facts,
   }
 }
-// lanes-golive (C1, C3): THE entrance of a mesh notification with lanes on, from either daemon: the router decides (the agent-inbox daemon asks the tg
-// daemon's router; the tg daemon routes itself).
-async function laneDeliverMesh(n: { method: string; params: unknown }, verified?: boolean, facts: WakeFacts = {}): Promise<Lanes.Decision | null> {
+async function laneDeliverMesh(n: { method: string; params: unknown }, verified: boolean, facts: WakeFacts): Promise<void> {
   const ev = laneEventOf(n, verified, facts)
   Lanes.noteInboundThread(ev.btcc_msg_id, ev.thread, ev.hop)
-  const d = INBOX_ONLY ? await Lanes.routeRemote(ev)                       // target main: the tg daemon queued it for the main (M1)
-    : await Lanes.routeEvent(ev).catch(err => { log('error', `lanes: router failed (${err}) — main`); Lanes.toMainDirect(ev); return { rule: 'router-failed', target: 'main' } as Lanes.Decision })
-  return d
+  await Lanes.routeEvent(ev).catch(err => { log('error', `lanes: router failed (${err}) — main`); Lanes.toMainDirect(ev) })
 }
-
 
 // Board ops room (戰情室, BTCC WO-35): OP-3 / 3 / slug. Tag-safe charset; BTCC resolves it.
 const OP_REF_RE = /^[A-Za-z0-9#-]{1,48}$/
@@ -2435,50 +2428,6 @@ async function paneWatchTargets(): Promise<WatchTarget[]> {
 // duty-officer (~/.config/mesh/duty-officer.credential); without it they are kept in rulings-unsent.jsonl.
 const DUTY_RULINGS_TO = (process.env.DUTY_OFFICER_RULINGS_TO ?? 'chiron').trim()
 const DUTY_CREDENTIAL = join(homedir(), '.config', 'mesh', 'duty-officer.credential')
-// 保溫 / 讀信箱 from this agent-inbox daemon itself, for agents the Mac mini watchdog cannot see (MBP, txmonster;
-// Joey TG chiron:1483). Switch KEEPWARM_LOCAL (live | dry | off) in the machine config, re-read every pass, so
-// setting it to off stops it without a restart. The Mac mini never sets it (its agents are the watchdog's).
-function keepwarmMode(): 'live' | 'dry' | 'off' {
-  let v = process.env.KEEPWARM_LOCAL ?? ''
-  try { v = parseFleetConfig(readFileSync(FLEET_CONFIG_PATH, 'utf8')).KEEPWARM_LOCAL ?? v } catch {}
-  v = v.trim()
-  return v === 'live' || v === 'dry' ? v : 'off'
-}
-if (INBOX_ONLY && keepwarmMode() !== 'off') {
-  new LocalKeepwarm({
-    name: INBOX_SELF,
-    stateDir: STATE_DIR,
-    mode: keepwarmMode,
-    projectsDir: () => (process.env.KEEPWARM_PROJECTS_DIR || '').trim() || TRANSCRIPT_DIR,
-    // lanes-golive (C4): with lanes on the main's transcript by its session id (lane transcripts share the dir); lanes off: the newest, as before
-    ...(Lanes.LANES_ON ? { transcript: () => Lanes.mainTranscriptFile((process.env.KEEPWARM_PROJECTS_DIR || '').trim() || TRANSCRIPT_DIR) } : {}),
-    wall: () => { const w = wallReader.state(); return w ? w.walled : null },   // WO-120: the state decides "walled"
-    // this agent's own unread count, with its own credential (an agent may read only its own row)
-    mail: async () => {
-      try {
-        const r = await btccMail('GET', '/api/mesh/mail/counts/all')
-        if (r.status !== 200) return null
-        const mine = (r.json?.counts ?? {})[INBOX_SELF]
-        return mine ? { on: true, n: Number(mine.n ?? 0), oldestS: mine.oldest_s ?? null } : { on: false, n: 0, oldestS: null }
-      } catch { return null }
-    },
-    // Keep the watchdog sender and no_reply metadata on the local wake.
-    deliver: async (text) => {
-      if (activeServers.size === 0) return false
-      const chatId = String(loadAccess().allowFrom[0] ?? 'local-inject')
-      await dispatchInbound(chatId, {
-        method: 'notifications/claude/channel',
-        params: { content: text, meta: { chat_id: chatId, user: 'fleet-watchdog', user_id: 'local-inject',
-          ts: new Date().toISOString(), via: 'local-inject', verified: 'true', relay: 'daemon', no_reply: 'true',
-          // lanes-golive (C1): the router reads the kind as a field (lanes off: the meta is exactly the fleet's)
-          ...(Lanes.LANES_ON ? { wake: Lanes.wakeKind(SENDER_KEEPWARM, text) ?? 'keepwarm' } : {}) } },
-      })
-      return true
-    },
-    log,
-  }).start()
-}
-
 // WO-165 A (JEV_SCREEN): Jev reads the bottom of the main's screen (screen-status.ts); set up with the Onsen status below. The duty officer's looks of
 // the main's pane are handed to it, so the screen is not captured twice
 let screenStatus: ScreenStatus | null = null
@@ -2597,7 +2546,7 @@ if (isControlEnabled() || isRoamerEnabled()) {
 }
 
 // The update handlers (the commands /start /help /status, /main /lanes with lanes on; the buttons; every message kind) are the roamer's
-// (roamer-telegram.ts). A connector's people reach it through Onsen (personArrived: person_message, person_edit; controlPulled: a press).
+// (roamer-telegram.ts). A connector receives message and control Items through routeInboxItem.
 /** the text of an edited message as the agent reads it (deliverEditedMessage's) */
 function editedText(m: any): string {
   return m.text != null ? expandHiddenEntities(String(m.text), m.entities) : m.caption != null ? expandHiddenEntities(String(m.caption), m.caption_entities)
@@ -2943,10 +2892,6 @@ async function dispatchInbound(chat_id: string, notification: { method: string; 
   if (Lanes.LANES_ON) {
     const p = notification.params as { content?: string; meta?: Record<string, string> }
     const meta = p.meta ?? {}
-    // lanes-golive (C1): only a Telegram message of Joey's is a Telegram event. What else comes down this path (the agent-inbox daemon's keep-warm and
-    // mailbox lines) is a mesh event for the router; building a Telegram event from it made the daemon's own keep-warm
-    // a message from Joey that the main owed a reply.
-    if (INBOX_ONLY || meta.via === 'local-inject') { await laneDeliverMesh(notification); return }
     const ev: Lanes.InEvent = {
       // Onsen step 2 (WO-142): Joey's edit carries the original's message_id; its event is its own (edited_at)
       id: `tg-${chat_id}-${meta.message_id ?? Date.now()}${meta.edited_at ? `-edit-${Date.parse(meta.edited_at) || Date.now()}-${++editEventSeq}` : ''}`, source: 'telegram', from: meta.user ?? 'joey',
@@ -4136,8 +4081,7 @@ async function routePeerItem(body: InboundBody & Record<string, unknown>, verdic
       },
     },
   }
-  const routed = await laneDeliverMesh(notification, verdict.verified, { ...wakeFactsOf(body), onsen_items: [item] })
-  if (!routed) throw new Error('peer delivery did not reach the router for ' + item.onsen_item_id)
+  await laneDeliverMesh(notification, verdict.verified, { ...wakeFactsOf(body), onsen_items: [item] })
 }
 async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
   // A page may omit the event history. Resolve the hand-over note before putting the row into M1.
@@ -4614,4 +4558,3 @@ function startListen(): void {
 // Shipped that way in 1.21.0 and caught on the lab canary in 1.22.0 (its
 // /healthz went dark) before it reached a second agent; blast radius one.
 if (import.meta.main || process.env.CHANNEL_INBOX_ONLY === '1') startListen()
-

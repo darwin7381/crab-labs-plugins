@@ -7,7 +7,7 @@
 // (an id per lane item, the card's deadline, the decision's lane / thread / ref); mail-events.ts builds the events the agent-inbox daemon hands the router.
 // The main is a stand-in process whose turns the test drives through the main's hook events (M1 / M2), as lanes-m3-obligations does.
 import { test, expect, afterAll } from 'bun:test'
-import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, chmodSync, mkdirSync, existsSync, rmSync } from 'fs'
+import { mkdtempSync, readFileSync, writeFileSync, chmodSync, mkdirSync, existsSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { createServer } from 'http'
@@ -31,7 +31,9 @@ const dir = join(ws, '.lanes'); mkdirSync(dir)
 const tmp = mkdtempSync(join(tmpdir(), 'lanes-wo127-'))
 mkdirSync(join(tmp, 'tr'))
 process.env.LANES_DIR = dir
-copyFileSync(process.env.LANES_TEST_ROUTER!, join(dir, 'router.json'))
+const legacyRouter = JSON.parse(readFileSync(process.env.LANES_TEST_ROUTER!, 'utf8'))
+legacyRouter.rules = legacyRouter.rules.filter((r: { to: string }) => r.to !== 'mail_event')
+writeFileSync(join(dir, 'router.json'), JSON.stringify(legacyRouter))
 const ARGV = join(tmp, 'argv.jsonl'), bin = join(tmp, 'lane.py')
 // the lane process: records its argv, ends when the test writes go-<lane id>
 writeFileSync(bin, `#!/usr/bin/env python3
@@ -384,11 +386,11 @@ test('WO-127 item 1 (mail lane): a run that carded mail and did not hand it over
   settle(w.id); L.mailChecked(8821, 'main')
 }, 30000)
 
-test('WO-127: the decision comes over the agent-inbox daemon\'s path (/lanes/route) while the run that asked is still running: it waits behind that run; a resend is the same decision', async () => {
+test('WO-127: the decision comes over the agent-inbox daemon\'s path (/lanes/mail-event) while the run that asked is still running: it waits behind that run; a resend is the same decision', async () => {
   const r = await start(peer('重啟 H？'))
   const out = await call(r, 'decide_later', { title: 'H 要不要重啟', card: CARD })
   const m = Number(out.match(/#(\d+)/)![1])
-  const route = async (ev: any) => (await fetch(`http://127.0.0.1:${(tgSrv.address() as any).port}/lanes/route`, { method: 'POST', body: JSON.stringify(ev), headers: { Authorization: 'Bearer x' } })).json()
+  const route = async (ev: any) => (await fetch(`http://127.0.0.1:${(tgSrv.address() as any).port}/lanes/mail-event`, { method: 'POST', body: JSON.stringify(ev), headers: { Authorization: 'Bearer x' } })).json()
   const d = await route(decided(m, 'as_recommended'))
   expect(d).toMatchObject({ rule: 'mail-decision', target: 'lane', lane: r.lane }); expect(d.note).toContain('queued behind the running run')
   expect(await route(decided(m, 'as_recommended'))).toMatchObject({ rule: 'mail-decision-repeat', target: 'ledger' })   // the inbox daemon did not hear the answer: sends it again

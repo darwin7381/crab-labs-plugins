@@ -51,13 +51,9 @@ test('a mesh no_reply notice that is not a wake-up line still goes to the ledger
   expect(d).toMatchObject({ rule: 'mesh-no-reply', target: 'ledger' })
 })
 
-test('server.ts: with lanes on, dispatchInbound builds a Telegram event only for a Telegram message; the agent-inbox daemon and local injects go to the router as mesh events', () => {
+test('the Telegram daemon routes peer Items with their claim references; the mailbox forwards only its card events', () => {
   const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
-  const di = src.slice(src.indexOf('async function dispatchInbound('), src.indexOf("source: 'telegram', from: meta.user ?? 'joey'"))
-  expect(di).toContain("if (INBOX_ONLY || meta.via === 'local-inject') { await laneDeliverMesh(notification); return }")
-  // the keep-warm's own line carries its kind as a field with lanes on, and only then
-  expect(src).toContain("...(Lanes.LANES_ON ? { wake: Lanes.wakeKind(SENDER_KEEPWARM, text) ?? 'keepwarm' } : {})")
-  // /inject: the wake kind and the line are fields of the meta the router reads
+  expect(src).toContain('laneDeliverMesh(notification, verdict.verified, { ...wakeFactsOf(body), onsen_items: [item] })')
+  expect(src).toContain('Lanes.routeMailEvent(ev)')
   expect(src).toContain('Lanes.wakeKind(from, text, body?.wake)')
-  expect(src).toContain("line: Lanes.lineOf((body as any)?.line ?? (body as any)?.tier) ?? 'call'")
 })

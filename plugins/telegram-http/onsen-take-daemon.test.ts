@@ -101,6 +101,12 @@ test('take starts by default and owns the observation; the old hand-over routes 
   const d = await daemon({ ONSEN_OBSERVATION: '' })
   await waitFor(() => d.f.calls.some(c => c.path.endsWith('/observation') && c.body.connector === 'mac-mini/adam'))
   for (const route of ['/onsen/person', '/onsen/action', '/inject']) expect((await fetch(d.base + route, { method: 'POST' })).status).toBe(404)
+  const old = await fetch(d.base + '/lanes/route', { method: 'POST', headers: { authorization: 'Bearer test-loopback' },
+    body: JSON.stringify({ source: 'mesh', from: 'eve', text: 'old hand-over' }) })
+  expect(old.status).toBe(404)
+  const mail = await fetch(d.base + '/lanes/mail-event', { method: 'POST', headers: { authorization: 'Bearer test-loopback' },
+    body: JSON.stringify({ source: 'mesh', from: 'eve', kind: 'call' }) })
+  expect(mail.status).toBe(400)
   for (const path of ['inbox/pending', 'inbox/undeliverable', 'onsen-inbox.json', 'onsen/inbound-store.json'])
     expect(existsSync(join(d.state, path))).toBe(false)
 })

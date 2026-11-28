@@ -1,4 +1,4 @@
-// WO-126: the mailbox's events reach the router over /lanes/route (lanes.ts routeEvent). A router that does not know source 'mail' (1.37.x; with WO-127,
+// WO-126: the mailbox's events reach the router over /lanes/mail-event (lanes.ts routeEvent). A router that does not know source 'mail' (1.37.x; with WO-127,
 // LANES_DECISIONS=0) must give them to the main as one item: no lane, no ledger-only, no error, no Telegram line. WO-127's own rule: lanes-wo127.test.ts.
 import { test, expect, afterAll } from 'bun:test'
 import { mkdtempSync, copyFileSync } from 'fs'

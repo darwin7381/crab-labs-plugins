@@ -87,9 +87,9 @@ test('keepwarm-local: with the main\'s transcript named it judges the main, not 
   expect(POKE_TEXT).toContain('[保溫]')
 })
 
-test('server.ts: with lanes on keepwarm-local reads the main\'s transcript', () => {
+test('the mailbox daemon no longer starts the retired keepwarm delivery', () => {
   const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
-  expect(src).toContain("...(Lanes.LANES_ON ? { transcript: () => Lanes.mainTranscriptFile(")
+  expect(src).not.toContain('new LocalKeepwarm(')
   if (prev.LANES_DIR) process.env.LANES_DIR = prev.LANES_DIR
   if (prev.CLAUDE_CONFIG_DIR) process.env.CLAUDE_CONFIG_DIR = prev.CLAUDE_CONFIG_DIR
 })

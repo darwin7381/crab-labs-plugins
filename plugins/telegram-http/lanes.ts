@@ -9,7 +9,7 @@
  *         lanes: reflex / worker / fork), ledger, thread table, focus card, digest, the
  *         lane-tools MCP endpoint (/lane-mcp), main-only tools (open_worker, fork, lanes_list,
  *         lane_close, ledger_query).
- *   inbox (agent-inbox daemon): forwards every mesh inbound to the tg router (/lanes/route);
+ *   inbox (agent-inbox daemon): tells the router about BTCC mailbox decisions and deadlines;
  *         performs mesh sends for lanes (/lanes/send — it holds the agent's mesh credential);
  *         writes into its own MCP stream of the main what the tg daemon offers it (/lanes/offer).
  * The tg daemon is the one writer of the lanes state (lanes-state.ts: the journal <state dir>/lanes/state.jsonl).
@@ -21,6 +21,7 @@
  * (lanes, threads, outbound/bot-message/topic maps), queue/ (leased lane events), focus.md
  * (main writes), run/ (per-run MCP configs, stderr).
  */
+import type { MailEvent } from './mail-events.ts'
 import { Journal, type Row } from './lanes-state.ts'
 import { procFactsFor, type ProcFacts } from './lanes-proc.ts'
 import { createMain, mainContext, type MainApi, type MainEnv, type MainWall, type ItemKind, type Via } from './lanes-main.ts'
@@ -2565,7 +2566,7 @@ export function replaceQueuedMain(chat: string, messageId: string, rewrite: Para
   if (ids.length) D.log('info', `lanes: Joey's edit of tg:${messageId} replaced the text of queued item(s) ${ids.join(',')}`)
   return ids.length > 0
 }
-/** 002w (D, gap 10): the router could not decide (it threw), for a Telegram message (server.ts) or a mesh one (/lanes/route): the event still goes to the
+/** 002w (D, gap 10): the router could not decide (it threw), for a Telegram message or a peer Item (server.ts): the event still goes to the
  *  main through the one builder (toMain: its own record, what its class owes handed to the main, its M1 item), never a record of its own kind. A record the
  *  router had already opened (it threw after) gets the one hand-over instead. */
 export function toMainDirect(ev: InEvent): void {
@@ -8400,9 +8401,9 @@ const INBOX_PORT = Number(process.env.LANES_INBOX_PORT ?? 0) || undefined
 export const inboxPost = (p: string, b: unknown) => peerCall(INBOX_PORT, p, 'POST', b)
 const inboxGet = (p: string) => peerCall(INBOX_PORT, p, 'GET')
 
-/** inbox role: ask the tg router what to do with a mesh inbound. null = router unreachable → main. */
-export async function routeRemote(ev: InEvent): Promise<Decision | null> {
-  const r = await peerCall(TG_PORT, '/lanes/route', 'POST', ev)
+/** Forward a local BTCC mailbox decision or deadline to its lane. MailEvents retries unconfirmed changes. */
+export async function routeMailEvent(ev: MailEvent): Promise<Decision | null> {
+  const r = await peerCall(TG_PORT, '/lanes/mail-event', 'POST', ev)
   return r && r.target ? r as Decision : null
 }
 /** inbox role: tell the tg daemon about a mesh send made by the main (send_to_agent). */
@@ -8578,8 +8579,11 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
   if (!D.authOk(req.headers['authorization'] as string | undefined)) { sendJson(res, 403, { error: 'loopback token required' }); return true }
   const p = u.pathname
   if (D.role === 'tg') {
-    if (p === '/lanes/route' && req.method === 'POST') {                    // the inbox daemon's mesh message; 002w (D): a router failure is the main's, through the one builder
+    if (p === '/lanes/mail-event' && req.method === 'POST') {
       const ev = await readBody(req) as InEvent
+      if (ev?.source !== 'mail' || (ev.kind !== 'mail_decision' && ev.kind !== 'mail_due')) {
+        sendJson(res, 400, { error: 'expected a mailbox decision or deadline' }); return true
+      }
       sendJson(res, 200, await routeEvent(ev).catch((e): Decision => { D.log('error', `lanes: router failed on ${ev.id} (${e}): main`); toMainDirect(ev); return { rule: 'router-failed', target: 'main' } }))
       return true
     }
