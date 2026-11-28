@@ -377,7 +377,7 @@ if (ONSEN_TAKE_ON) {
     itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, Lanes.offerMissed, () => registryStatusChanged?.())
     onsen.watchItemReports(line => itemClaims!.replay(line), (line, ok) => itemClaims!.acknowledged(line, ok))
     itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at), () => itemPeek!.reset(), due => !!takeKeepwarm?.matchesWindow(due))
-    Lanes.useItemReceiver(itemReceiver, write => onsen.recordItemWrite(write))
+    Lanes.useItemReceiver(itemReceiver, onsen)
     itemPeek = new ItemPeek(takeMode, Lanes.itemIndex, routeInboxItem, () => !itemClaims!.blocked())
     Lanes.observeItemGates(() => itemPeek!.reset())
   }

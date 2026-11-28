@@ -245,7 +245,7 @@ test('C5 active connector schedules its own keepwarm with the legacy local switc
 })
 
 test('C5 converts a saved followup and delivers its self Item once to the original worker', async () => {
-  const thread = 'adam#check', event = 'prior-run', id = 'fu-old', due = Date.now() + 2500
+  const thread = 'adam#check', event = 'prior-run', id = 'fu-old', due = Date.now() + 3500
   const d = await daemon({}, 200, root => {
     const last = new Date().toISOString()
     writeFileSync(join(root, '.lanes', 'state.json'), JSON.stringify({
@@ -262,6 +262,8 @@ test('C5 converts a saved followup and delivers its self Item once to the origin
   expect(rows).toHaveLength(1)
   const row = rows[0]!
   expect(d.f.calls.find(c => c.key === id)!.body).not.toHaveProperty('waiter')
+  expect(row.refs).toEqual([])
+  await d.restart()
   expect(row).toMatchObject({ session_id: worker, waiter: 'adam', not_before: new Date(due).toISOString(), deadline: null, state: 'waiting' })
   d.f.advance(due - d.f.now() + 1)
   await waitFor(() => d.f.history.some(h => h.item_id === row.id && h.body.outcome === 'in_session'))

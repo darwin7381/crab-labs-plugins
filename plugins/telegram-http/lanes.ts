@@ -25,7 +25,7 @@ import { Journal, type Row } from './lanes-state.ts'
 import { procFactsFor, type ProcFacts } from './lanes-proc.ts'
 import { createMain, mainContext, type MainApi, type MainEnv, type MainWall, type ItemKind, type Via } from './lanes-main.ts'
 import { pidAlive, type CallFacts, type TurnTrigger } from './onsen-status.ts'
-import type { CallCheck, CallRef, CallWait } from './onsen-client.ts'
+import type { CallCheck, CallRef, CallWait, OnsenClient } from './onsen-client.ts'
 import { createEvents, matterKey, type EventsApi, type EvClass, type Ob, type Outcome } from './lanes-events.ts'
 import { anchorSlug, plainTopicName, topicLink, topicMode, type TopicVerdict } from './lanes-topics.ts'
 import { APPEND_MAX, APPENDABLE_FILE, appendText, declaredFor, readDeclared } from './lanes-append.ts'
@@ -3522,9 +3522,20 @@ function threadSummary(thread: string): string {
 // ================================================================== lane queue + runner
 let itemReceiver: import('./onsen-receive.ts').ItemReceiver | undefined
 let itemWriter: ItemWriter | undefined
-export function useItemReceiver(receiver: typeof itemReceiver, writer?: ItemWriter): void {
+type ItemClient = Pick<OnsenClient, 'recordItemWrite' | 'writtenItemId' | 'hasPendingItemCreate' | 'onItemCreateSettled'>
+let itemClient: ItemClient | undefined
+let waitingForFollowupId = false
+export function useItemReceiver(receiver: typeof itemReceiver, client?: ItemClient): void {
+  if (itemClient) itemClient.onItemCreateSettled = undefined
   itemReceiver = receiver
-  itemWriter = writer
+  itemClient = client
+  itemWriter = client?.recordItemWrite.bind(client)
+  if (client) client.onItemCreateSettled = (key, id) => {
+    const f = S?.followups[key]
+    if (!f) return
+    if (id && id !== f.onsen_item_id) { f.onsen_item_id = id; saveState() }
+    if (waitingForFollowupId) { waitingForFollowupId = false; onGateOpen?.() }
+  }
 }
 export function offerMissed(id: string): void { main.offerMissed(id) }
 let onGateOpen: (() => void) | undefined
@@ -4262,13 +4273,13 @@ function fireFollowup(f: Followup, now: number, item?: ItemRef): void {
 
 function followupWrite(f: Followup) {
   const event = events.get(f.event)
-  const refs = [{ kind: 'item', value: f.id }, ...(event?.onsen_items ?? []).map((r: ItemRef) => ({ kind: 'item', value: r.onsen_item_id }))]
+  const refs = (event?.onsen_items ?? []).map((r: ItemRef) => ({ kind: 'item', value: r.onsen_item_id }))
   if (f.run_id) refs.push({ kind: 'run', value: f.run_id })
   return { key: f.id, item: ownItem('self', f.lane, followupEventText(f, f.due), f.due, undefined, null, refs) }
 }
 
 function withdrawCheck(f: Followup, writer: ItemWriter, row?: InboxItem): void {
-  writer({ ...followupWrite(f), outcome: 'withdrawn', id: row?.id })
+  writer({ ...followupWrite(f), outcome: 'withdrawn', id: row?.id ?? f.onsen_item_id })
   f.onsen = 'withdrawn'
   f.withdrawn_version = row?.version
 }
@@ -4294,6 +4305,7 @@ function submitStagedChecks(run: string): void {
 export function resumeSelfItems(): void {
   if (!takingItems() || !itemWriter || !S) return
   for (const f of Object.values(S.followups)) {
+    if (f.onsen && !f.onsen_item_id) f.onsen_item_id = itemClient?.writtenItemId(f.id)
     if (f.state === 'ended' && f.onsen === 'submitted') withdrawCheck(f, itemWriter)
     if (f.state !== 'pending' || f.onsen === 'submitted') continue
     if (f.onsen === 'awaiting_receipt' && queue.get(f.event)?.run === f.run) continue
@@ -4309,7 +4321,16 @@ export function resumeSelfItems(): void {
 const waitingFollowupEvents = new Set<string>()
 /** C1 already checked not_before. Dispatch carries the unclaimed ref into the main or lane that actually receives it. */
 export function routeOwnItem(row: InboxItem, item: ItemRef, text: string): void {
-  const f = row.kind === 'self' && row.refs.map(r => r.kind === 'item' && S.followups[r.value]).find(Boolean)
+  const followups = row.kind === 'self' ? Object.values(S.followups) : []
+  const f = followups.find(f => f.onsen_item_id === row.id)
+  if (!f && followups.length) {
+    // A peek can see the row before the POST reply (even across a restart). Recheck after the spool saves its id.
+    const unacknowledged = followups.filter(f => f.lane === row.session_id && f.onsen && !f.onsen_item_id).map(f => f.id)
+    if (unacknowledged.length && itemClient?.hasPendingItemCreate(new Set(unacknowledged))) {
+      waitingForFollowupId = true
+      return
+    }
+  }
   if (f && f.state === 'ended') {
     // A take in flight can release the row again at a new version after the first withdrawal.
     if (takingItems() && itemWriter && row.state === 'waiting' && f.withdrawn_version !== row.version) {

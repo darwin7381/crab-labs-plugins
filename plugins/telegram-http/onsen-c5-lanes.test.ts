@@ -29,7 +29,7 @@ const client = new OnsenClient({ dir, agent: 'adam', record: true, base: f.base,
 const mode = new TakeMode('adam', client.request.bind(client), () => {}, () => {})
 const claims = new Claims(join(dir, 'claims.json'), client, () => {}, () => {}, f.now)
 const receiver = new ItemReceiver(mode, claims, () => {})
-L.useItemReceiver(receiver, write => client.recordItemWrite(write))
+L.useItemReceiver(receiver, client)
 await mode.probe()
 afterAll(() => {
   mode.stop(); claims.stop(); client.stop(); f.stop(); jev.stop(true)
@@ -227,21 +227,27 @@ test('followup keeps the origin lane and sender limits, and only a due Item ente
   s.lanes[lane] = { id: lane, kind: 'reflex', thread, status: 'idle', runs: 0, last: new Date().toISOString() } as any
   s.threads[thread] = { id: thread, lane, peer: 'eve' } as any
   const tok = { runId: 'check-r1', lane, evId: event, trigger: 'peer', cls: 'peer', closers: [] } as any
-  L.__events().open(event, { class: 'peer', owner: lane, thread, obligations: [] })
+  const origin = f.add('onsen-check-origin')
+  L.__events().open(event, { class: 'peer', owner: lane, thread, obligations: [], fields: { onsen_items: [itemRef(origin)] } })
   const schedule = (note: string) => L.callLaneTool(tok, 'followup', { after_minutes: 10, note })
   for (const note of ['重查 A', '重查 B', '重查 C']) expect(await schedule(note)).toContain('scheduled')
   expect(await schedule('第四個')).toContain('max 3')
   await client.syncNow(true)
   const rows = selfRows().filter(r => r.session_id === lane)
   expect(rows).toHaveLength(3)
-  const row = rows[0]!, follow = s.followups[row.refs[0]!.value]!
+  expect(rows.map(row => row.refs)).toEqual(Array(3).fill([{ kind: 'item', value: origin.id }]))
+  const row = rows[1]!, follow = Object.values(s.followups).find(f => f.onsen_item_id === row.id)!
+  expect(client.writtenItemId(follow.id)).toBe(row.id)
+  expect(follow.note).toBe('重查 B')
   expect(f.calls.find(c => c.key === follow.id)!.body).not.toHaveProperty('waiter')
   expect(row).toMatchObject({ waiter: 'adam', deadline: null, not_before: follow.due_iso, state: 'waiting' })
   expect(row.payload.text).toContain(follow.note)
   // Make the old local tick see an overdue check. Only the Item route can dispatch it.
   follow.due = Date.now() - 1
   L.followupTick()
+  delete follow.onsen_item_id // an older lane snapshot has only the spool's durable receipt
   L.resumeSelfItems()
+  expect(follow.onsen_item_id).toBe(row.id)
   expect(follow.state).toBe('pending')
   s.wall = { kind: 'usage', probe_at: Date.now() + 3600_000 } as any
   L.routeOwnItem(row, itemRef(row), row.payload.text)
@@ -264,6 +270,43 @@ test('followup keeps the origin lane and sender limits, and only a due Item ente
   expect(await L.callLaneTool({ ...next, unchanged: false }, 'followup', { after_minutes: 5, note: '第五趟' })).toContain('cap 4')
 })
 
+test('a followup waits for its creation response and ignores connector ids presented as refs', async () => {
+  const s = L.__lanesState(), lane = 'adam.reflex.ack', event = 'ack-event', thread = 'adam#ack'
+  s.lanes[lane] = { id: lane, kind: 'reflex', thread, status: 'idle', runs: 0, last: new Date().toISOString() } as any
+  s.threads[thread] = { id: thread, lane, peer: 'eve' } as any
+  s.wall = { kind: 'usage', probe_at: Date.now() + 3600_000 } as any
+  const tok = { runId: 'local-run', lane, evId: event, trigger: 'peer', cls: 'peer', closers: [] } as any
+  L.__events().open(event, { class: 'peer', owner: lane, thread, obligations: [{ kind: 'receipt', run_id: 'scheduler-run-42' }] })
+  let earlyState: string | undefined, earlyQueued: boolean | undefined, resets = 0
+  const originalFetch = client.cfg.fetch
+  L.observeItemGates(() => { resets++ })
+  try {
+    expect(await L.callLaneTool(tok, 'followup', { after_minutes: 1, note: '查一次' })).toContain('scheduled')
+    const follow = Object.values(s.followups).find(f => f.lane === lane)!
+    client.cfg.fetch = (async (url, init) => {
+      const res = await fetch(url, init)
+      if (init?.method === 'POST' && new Headers(init.headers).get('Idempotency-Key') === follow.id) {
+        const row = selfRows().find(r => r.session_id === lane)!
+        L.routeOwnItem(row, itemRef(row), row.payload.text)
+        earlyState = follow.state
+        earlyQueued = L.itemIndex().has(row.id)
+      }
+      return res
+    }) as typeof fetch
+    await client.syncNow(true)
+    expect([earlyState, earlyQueued, resets]).toEqual(['pending', false, 1])
+    const row = f.rows.get(follow.onsen_item_id!)!
+    expect(row.refs).toEqual([{ kind: 'run', value: 'scheduler-run-42' }])
+    const other = f.add('unrelated-self', 'self', { session_id: lane, refs: [{ kind: 'item', value: follow.id }] })
+    L.routeOwnItem(other, itemRef(other), 'unrelated reminder')
+    expect(follow.state).toBe('pending')
+    expect(L.itemIndex().has(other.id)).toBe(true)
+    L.routeOwnItem(row, itemRef(row), row.payload.text)
+    expect(follow.state).toBe('fired')
+    expect(L.itemIndex().has(row.id)).toBe(true)
+  } finally { client.cfg.fetch = originalFetch; L.observeItemGates() }
+})
+
 test.each([false, true])('no-change withdraws a migrated followup and drops a stale peek (already queued=%s)', async queued => {
   const s = L.__lanesState(), lane = 'adam.reflex.cancel-' + queued, event = 'cancel-' + queued
   const thread = 'adam#' + event, runId = 'producer-' + event
@@ -276,7 +319,7 @@ test.each([false, true])('no-change withdraws a migrated followup and drops a st
   expect(await L.callLaneTool(tok, 'followup', { after_minutes: 5, note: 'check previous result' })).toContain('scheduled')
   await mode.probe(); L.resumeSelfItems(); await client.syncNow(true)
   const [row] = selfRows().filter(r => r.session_id === lane)
-  const ref = itemRef(row!), snapshot = structuredClone(row!), follow = s.followups[row!.refs[0]!.value]!
+  const ref = itemRef(row!), snapshot = structuredClone(row!), follow = Object.values(s.followups).find(f => f.onsen_item_id === row!.id)!
   if (queued) {
     L.routeOwnItem(row!, ref, 'check')
     expect(L.itemIndex().has(row!.id)).toBe(true)
@@ -310,5 +353,5 @@ test('C1 TakeMode.active gates the lane even before its spool writer is attached
     expect(await L.callMainTool('commitment', { who: '未知？', what: '回報' }, 'test-main')).toContain('who must identify')
     mode.pause('test pull', 60_000)
     expect(await L.callMainTool('commitment', { who: '未知？', what: '回報' }, 'test-main')).toContain('commitment recorded')
-  } finally { L.useItemReceiver(receiver, w => client.recordItemWrite(w)); await mode.probe() }
+  } finally { L.useItemReceiver(receiver, client); await mode.probe() }
 })

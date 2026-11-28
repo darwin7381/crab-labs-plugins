@@ -175,7 +175,7 @@ async function withMemberMode(take: boolean, run: (puller: OnsenPuller) => Promi
     host: 'fixture', takeEnabled: true, waitS: 0, log: () => {}, deliver: async () => 'delivered' })
   try {
     f.mode(take ? 200 : 409)
-    L.useItemReceiver(new ItemReceiver(mode, claims, () => {}), w => client.recordItemWrite(w))
+    L.useItemReceiver(new ItemReceiver(mode, claims, () => {}), client)
     await mode.probe(); await puller.once()
     expect([mode.active, puller.pausedForTake]).toEqual([take, take])
     await run(puller)

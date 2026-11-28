@@ -448,15 +448,26 @@ export class OnsenClient {
   watchItemReports(replay: (line: ItemReport) => void, ack: (line: ItemReport, ok: boolean) => void): void {
     this.itemAck = ack
     this.itemReports = 0
+    for (const line of this.pendingLines()) if (line.k === 'ir') { this.itemReports++; replay(line.r) }
+  }
+
+  private *pendingLines(): Generator<SpoolLine> {
     let offset = this.readCursor()
     for (;;) {
       const lines = this.unsent(offset)
       if (!lines.length) break
-      for (const { line } of lines) if (line?.k === 'ir') { this.itemReports++; replay(line.r) }
+      for (const { line } of lines) if (line) yield line
       offset = lines[lines.length - 1]!.end
     }
   }
   hasItemReports(): boolean { return this.itemReports > 0 }
+  onItemCreateSettled?: (key: string, id?: string) => void
+  hasPendingItemCreate(keys: Set<string>): boolean {
+    for (const line of this.pendingLines()) {
+      if ((line.k === 'item' || line.k === 'self') && keys.has(line.r.key) && !line.r.outcome && !line.r.complete) return true
+    }
+    return false
+  }
   writtenItemId(key: string): string | undefined { return this.itemWrites.id(key) }
   recordItemWrite(write: ItemWrite): void {
     if (!this.append({ k: 'item', r: write })) throw new Error('could not record the Onsen Item')
@@ -967,7 +978,9 @@ export class OnsenClient {
         if (r.status >= 200 && r.status < 300) this.stats.posted++
         else if (refusedForGood(r)) this.reject(t.line, `${t.line.r.item.kind} Item: HTTP ${r.status} ${callSaid(r.json)}`, { kind: 'item', path, status: r.status, code: errCode(r.json) })
         else return this.failStatus(r, path)
-        this.writeCursor(t.end); this.ok(); i++; continue
+        this.writeCursor(t.end)
+        if (!t.line.r.outcome && !t.line.r.complete) this.onItemCreateSettled?.(t.line.r.key, r.status < 300 ? r.json?.data?.id : undefined)
+        this.ok(); i++; continue
       }
       if (t.line.k === 'ir') {
         const line = t.line.r, body = line.body

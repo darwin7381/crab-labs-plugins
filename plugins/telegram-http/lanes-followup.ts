@@ -26,6 +26,7 @@ export type Followup = {
   chain?: number; ended?: string
   /** Writer bookkeeping for take members. A follow-up run's receipt decides whether there is another check to publish. */
   onsen?: 'awaiting_receipt' | 'submitted' | 'withdrawn'
+  onsen_item_id?: string
   withdrawn_version?: number
 }
 
