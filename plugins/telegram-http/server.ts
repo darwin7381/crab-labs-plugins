@@ -57,7 +57,7 @@ import {
   registerSelfAsDaemon as roamerRegisterSelfAsDaemon,
   unregisterSelfAsDaemon as roamerUnregisterSelfAsDaemon,
   handleModelCallbackForCurrentTarget,
-  roamerCurrentTranscript, receivingTarget, takeoverStream, pidAlive,
+  roamerCurrentTranscript, receivingTarget, refreshTargetSession, takeoverStream, pidAlive,
 } from './roamer-control.ts'
 import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs, sendOpsAlert} from './system-alert.ts'
 import { opsRecipients } from './ops-recipients.ts'
@@ -4508,7 +4508,7 @@ function startOnsenStatus(onsen: Onsen.OnsenClient): void {
   // WO-165: seen (lanes off) comes from this read; it follows the registry's main session (its <session id>.jsonl) at once, so a new session's first
   // message is not seen only at the next 10 s rescan (registry is set up below: read only once the block has run)
   if (ROAMER && itemReceiver && itemClaims) {
-    roamerItems = new RoamerItems({ receiver: itemReceiver, claims: itemClaims, registry, selected: receivingTarget, alive: pidAlive,
+    roamerItems = new RoamerItems({ receiver: itemReceiver, claims: itemClaims, registry, selected: receivingTarget, refreshSession: refreshTargetSession, alive: pidAlive,
       stream: targetStream, send: notifyStream, watch: { facts, joey: onsenJoeyOf, changed: kick, turnEnded }, revisit: () => itemPeek!.reset() })
   }
   const watch = tap ? null : roamerItems ?? new OnsenStatus.TurnWatch({ dir: () => consumptionCheckAvailable() ? TRANSCRIPT_DIR : null, facts, joey: onsenJoeyOf, changed: kick,

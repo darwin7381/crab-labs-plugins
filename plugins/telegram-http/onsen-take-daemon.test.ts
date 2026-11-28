@@ -704,7 +704,8 @@ test('/roam without a target creates one menu Action; a returned choice is handl
 }, 15000)
 
 async function target(d: Awaited<ReturnType<typeof daemon>>) {
-  const child = Bun.spawn(['sleep', '300']), sid = randomUUID()
+  const child = Bun.spawn(['sleep', '300']), tmux = randomUUID()
+  let sid = tmux
   clean.push(async () => { child.kill(); await child.exited })
   const cwd = join(d.root, 'lab-project')
   const home = join(d.root, 'home', '.claude'), regs = join(home, 'sessions'), project = join(home, 'projects', cwd.replaceAll('/', '-'))
@@ -712,15 +713,21 @@ async function target(d: Awaited<ReturnType<typeof daemon>>) {
   const status = (value: string) => writeFileSync(join(regs, child.pid + '.json'), JSON.stringify({
     pid: child.pid, sessionId: sid, cwd, kind: 'interactive', status: value, statusUpdatedAt: Date.now() }))
   status('idle')
-  const transcript = join(project, sid + '.jsonl')
+  let transcript = join(project, sid + '.jsonl')
   writeFileSync(transcript, '')
   const write = (fields: object) => appendFileSync(transcript, JSON.stringify({ entrypoint: 'cli', timestamp: new Date().toISOString(), ...fields }) + '\n')
-  const select = () => writeFileSync(roamerState(d.root).ROAMER_STATE_FILE, JSON.stringify({ current_target: { tmux: sid, claude_pid: child.pid, cwd, session_id: sid } }))
+  const select = () => writeFileSync(roamerState(d.root).ROAMER_STATE_FILE, JSON.stringify({ current_target: { tmux, claude_pid: child.pid, cwd, session_id: sid } }))
   const client = new Client({ name: 'lab', version: '1' }), got: any[] = []
   client.fallbackNotificationHandler = async n => { if (n.method === 'notifications/claude/channel') got.push(n.params) }
   await client.connect(new StreamableHTTPClientTransport(new URL(d.base + '/mcp'), { requestInit: { headers: { 'x-test-claude-pid': String(child.pid) } } }))
   clean.push(() => client.close())
-  return { child, sid, cwd, transcript, select, status, client, got, accept: (msg: any) => write({ type: 'user', message: { content:
+  function switchSession() {
+    sid = randomUUID()
+    transcript = join(project, sid + '.jsonl')
+    writeFileSync(transcript, '')
+    status('idle')
+  }
+  return { child, get sid() { return sid }, cwd, get transcript() { return transcript }, switchSession, select, status, client, got, accept: (msg: any) => write({ type: 'user', message: { content:
     `<channel source="telegram" chat_id="1" message_id="${msg.meta.message_id}" onsen_claims="${msg.meta.onsen_claims}">hello</channel>` } }),
     stop: () => write({ type: 'system', subtype: 'turn_duration' }) }
 }
@@ -772,6 +779,31 @@ test('roamer switches between two live streams in one cwd, binds on intake and c
   expect(d.f.history.filter(h => h.item_id === dying.id && h.body.outcome === 'cut')).toHaveLength(1)
   expect(a.got).toHaveLength(1)
 }, 45000)
+
+test('a session change inside the same target PID cuts the old claim and delivers to the new UUID', async () => {
+  const d = await daemon(roamerEnv, 200, roamerState), a = await target(d)
+  a.select()
+  const first = d.f.add('before-clear')
+  await waitFor(() => a.got.length === 1)
+  a.accept(a.got[0])
+  await waitFor(() => first.claim?.session_id === a.sid)
+  first.not_before = new Date(Date.now() + 60_000).toISOString()
+  const old = a.sid, oldTranscript = a.transcript
+  a.switchSession()
+  const second = d.f.add('after-clear')
+  await waitFor(() => a.got.length === 2)
+  expect(JSON.parse(readFileSync(roamerState(d.root).ROAMER_STATE_FILE, 'utf8')).current_target).toEqual({
+    tmux: old, claude_pid: a.child.pid, cwd: a.cwd, session_id: a.sid })
+  expect(d.f.history.filter(h => h.item_id === first.id).map(h => h.body.outcome)).toEqual(['in_session', 'cut'])
+  a.accept(a.got[1])
+  await waitFor(() => second.claim?.session_id === a.sid)
+  appendFileSync(oldTranscript, JSON.stringify({ type: 'system', subtype: 'turn_duration' }) + '\n')
+  await Bun.sleep(300)
+  expect(second.state).toBe('claimed')
+  a.stop()
+  await waitFor(() => second.state === 'completed', 9000)
+  expect(second.session_id).toBe('main')
+}, 16000)
 
 test('after a daemon restart a long turn still ends on its original target transcript', async () => {
   const d = await daemon(roamerEnv, 200, roamerState), a = await target(d), b = await target(d)

@@ -1437,6 +1437,17 @@ export function receivingTarget() {
   return { session_id: t.session_id, claude_pid: t.claude_pid, tmux: t.tmux, transcript: transcriptPath(t.cwd, t.session_id) }
 }
 
+/** /clear and /resume replace the session inside the live takeover process. */
+export function refreshTargetSession(previous: NonNullable<ReturnType<typeof receivingTarget>>, sessionId: string): void {
+  const state = readState(), target = state.current_target
+  if (!target || target.claude_pid !== previous.claude_pid || target.tmux !== previous.tmux || target.session_id !== previous.session_id) return
+  const own = readRegistry()[ROAMER_BOT_NAME]
+  if (own?.daemon_pid === process.pid && own.claude_pid === target.claude_pid && own.tmux === target.tmux)
+    writeRegistryEntry(ROAMER_BOT_NAME, { ...own, session_id: sessionId, updated_at: Date.now() })
+  target.session_id = sessionId
+  writeState(state)
+}
+
 /** A stream claimed by this tmux takeover. Unmapped reconnects must prove their peer PID. */
 export const takeoverStream = (tmux: string) => tmuxToMcpSession.get(tmux)
 

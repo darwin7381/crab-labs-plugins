@@ -15,6 +15,7 @@ export class RoamerItems {
   private busyTurns = new Map<string, string>()
   constructor(readonly o: {
     selected(): ReceivingTarget | null
+    refreshSession(target: ReceivingTarget, sessionId: string): void
     alive(pid: number): boolean
     stream(t: ReceivingTarget): string | undefined
     send(sid: string, notification: Notification): Promise<boolean>
@@ -62,7 +63,12 @@ export class RoamerItems {
     for (const t of all) {
       const sid = t.session_id
       const reg = entries.find(e => e.pid === t.claude_pid)
-      if (!this.o.alive(t.claude_pid) || (reg && reg.sessionId !== sid)) { this.o.claims.cutTarget(t); continue }
+      if (!this.o.alive(t.claude_pid)) { this.o.claims.cutTarget(t); continue }
+      if (reg && reg.sessionId !== sid) {
+        this.o.claims.cutTarget(t)
+        if (t === selected) this.o.refreshSession(t, reg.sessionId)
+        continue
+      }
       if (live.has(sid)) continue
       live.add(sid)
       let watch = this.watches.get(sid)
