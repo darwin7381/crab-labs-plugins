@@ -237,6 +237,23 @@ test('membership transitions and migration are ordered PUTs; the new chat still 
   expect(tg.callsOf(a, 'setMessageReaction')).toEqual([])
 })
 
+test('disabling access suppresses join, leave and migration reports in an allowlisted group', async () => {
+  const agent = bridge.agents.get('lab-a')!, access = agent.access()!
+  expect(access.groups[String(group.id)]).toBeDefined()
+  writeFileSync(join(agent.stateDir, 'access.json'), JSON.stringify({ ...access, dmPolicy: 'disabled' }))
+  const calls = spyOn(bridge.onsen, 'req')
+  tg.push(a, memberUpdate('left', 'member'))
+  tg.push(a, memberUpdate('member', 'left'))
+  tg.push(a, { message: { chat: group, message_id: 5, migrate_to_chat_id: supergroup.id } })
+  await confirmed()
+  expect(calls.mock.calls.filter(c => c[1].startsWith('/bridge/chats/'))).toHaveLength(0)
+  expect(onsen.messages).toHaveLength(0)
+  writeFileSync(join(agent.stateDir, 'access.json'), JSON.stringify(access))
+  tg.push(a, memberUpdate('left', 'member'))
+  await confirmed()
+  expect(onsen.chatWrites).toHaveLength(1)
+})
+
 test('membership and migration from an unlisted group make no Onsen request even when the destination is allowed', async () => {
   const req = spyOn(bridge.onsen, 'req')
   const chat = { type: 'group', id: -404 }

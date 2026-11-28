@@ -116,7 +116,9 @@ function membership(member: any): 'in' | 'left' | undefined {
 export function chatWrite(a: Agent, u: any): ChatWrite | undefined {
   const cm = u.my_chat_member
   const chat = (cm ?? u.message)?.chat
-  if (!isGroup(chat) || !a.access()?.groups?.[String(chat.id)]) return
+  if (!isGroup(chat)) return
+  const access = a.access()
+  if (!access || access.dmPolicy === 'disabled' || !access.groups?.[String(chat.id)]) return
   if (!cm && u.message.migrate_to_chat_id != null)
     return { kind: 'migration', path: `/bridge/chats/${chat.id}`, body: { moved_to: String(u.message.migrate_to_chat_id) } }
   if (String(cm?.new_chat_member?.user?.id) !== a.botId) return
