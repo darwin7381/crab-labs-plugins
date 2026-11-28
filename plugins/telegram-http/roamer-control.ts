@@ -156,7 +156,7 @@ function runCommand(
   })
 }
 
-function pidAlive(pid: number): boolean {
+export function pidAlive(pid: number): boolean {
   if (!pid || pid < 2) return false
   try { process.kill(pid, 0); return true } catch { return false }
 }
@@ -1432,6 +1432,15 @@ export async function getRoamerWatchTargets(): Promise<Array<{ label: string; tm
 // session and never the merely-newest jsonl in the dir (a cwd can hold several
 // sessions; an idle target loses the newest-mtime race to a sibling and its
 // alerts would be attributed to the wrong session). Moves with /roam. (issue #6)
+export function receivingTarget() {
+  const t = readState().current_target
+  if (!t?.claude_pid || !t.session_id || !t.cwd || !t.tmux) return null
+  return { session_id: t.session_id, claude_pid: t.claude_pid, tmux: t.tmux, transcript: transcriptPath(t.cwd, t.session_id) }
+}
+
+/** A stream claimed by this tmux takeover. Unmapped reconnects must prove their peer PID. */
+export const takeoverStream = (tmux: string) => tmuxToMcpSession.get(tmux)
+
 export function roamerCurrentTranscript(): string | null {
   if (!isRoamerEnabled()) return null
   const state = readState()

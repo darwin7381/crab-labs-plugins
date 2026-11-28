@@ -18,6 +18,10 @@ if (process.env.C1_COMMAND_FAILURE === '1') {
   const lanes = await import('../lanes.ts')
   spyOn(lanes, 'lanesCommand').mockImplementation(async () => { throw new Error('fixture command failed') })
 }
+if (process.env.ROAMER_MODE === '1') {
+  const lanes = await import('../lanes.ts')
+  spyOn(lanes, 'claudePidOf').mockImplementation(req => Number(req.headers['x-test-claude-pid']) || null)
+}
 const transport = globalThis.fetch
 globalThis.fetch = Object.assign((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
   const url = new URL(input instanceof Request ? input.url : String(input))

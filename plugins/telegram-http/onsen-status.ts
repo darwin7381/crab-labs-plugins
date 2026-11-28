@@ -764,7 +764,7 @@ export class TurnWatch {
   /** WO-172: a colleague's items the open turn took in (their msg ids), for its bound */
   private peerIds: string[] = []
   constructor(readonly o: { dir: () => string | null; facts: DeliveryFacts; joey: JoeyOf; changed: () => void; tailBytes?: number; rescanMs?: number; now?: Now
-    session?: () => string | null; turnEnded?: (t: TurnEnded) => void }) {
+    session?: () => string | null; exact?: boolean; channel?: (attrs: Record<string, string>, turn: string) => void; turnEnded?: (t: TurnEnded) => void }) {
     this.bornMs = this.now()
   }
   private now(): number { return (this.o.now ?? Date.now)() }
@@ -777,6 +777,7 @@ export class TurnWatch {
     // once, not at the next rescan (up to rescanMs after it; the bench, 11-25 18:45Z: 4.1 s); while it is read, no rescan takes another file
     const sid = this.o.session?.() ?? null, own = sid ? join(dir, `${sid}.jsonl`) : null
     if (own && own !== this.file && existsSync(own)) { this.scannedAt = this.now(); this.switchTo(own) }
+    else if (this.o.exact && own !== this.file) return
     else if (!this.file || (own !== this.file && this.now() - this.scannedAt >= (this.o.rescanMs ?? 10_000))) {
       this.scannedAt = this.now()
       const f = newestJsonl(dir)
@@ -862,6 +863,7 @@ export class TurnWatch {
   private takeIn(text: string, at: string): void {
     const t = Date.parse(at)
     for (const a of channelTags(text)) {
+      if (this.turnAt) this.o.channel?.(a, turnIdOf(this.turnAt))
       if (!/telegram/.test(a.source ?? '')) { if (a.btcc_msg_id && this.inTurn && !this.peerIds.includes(a.btcc_msg_id)) this.peerIds.push(a.btcc_msg_id); continue }   // WO-172
       const j = this.o.joey(a)
       if (!j) continue
@@ -1153,6 +1155,7 @@ export class Streams {
   private anyAt = -Infinity
   constructor(readonly o: { open: () => Iterable<[string, boolean]>; graceMs?: number; now?: Now }) {}
   note(sid: string, pid: number | null): void { this.peer.set(sid, pid) }
+  peerPid(sid: string): number | null { return this.peer.get(sid) ?? null }
   connected(pid: number): boolean {
     const now = (this.o.now ?? Date.now)(), open = new Set<string>()
     for (const [sid, up] of this.o.open()) {
@@ -1187,6 +1190,7 @@ export class Registry implements StatusSource {
    *  changed: a registry file changed (the watch); firstCheckMs: the first comparison after start (default 10–70 s at random, so a fleet that starts
    *  at once does not compare at once); checkMs: then every checkMs ± 20 %; cliPollMs: the CLI's reading read again while it is in force */
   constructor(readonly o: { dir: string; workspace: string; transcripts: () => string | null; tmux?: string | null; sessionId?: () => string | null
+    target?: () => { session_id: string; claude_pid: number } | null
     connected: (pid: number) => boolean; cli?: (notBefore: number) => Promise<string | null>; changed?: () => void; log?: (m: string) => void
     alive?: (pid: number) => boolean; procStart?: (pid: number) => string | null; now?: Now; firstCheckMs?: number; checkMs?: number; cliPollMs?: number
     retryMs?: number }) {}
@@ -1317,6 +1321,10 @@ export class Registry implements StatusSource {
   mode(): Via { return this.v }
 
   private pick(entries: RegEntry[]): RegEntry | null {
+    if (this.o.target) {
+      const t = this.o.target()
+      return t ? entries.find(e => e.pid === t.claude_pid && e.sessionId === t.session_id) ?? null : null
+    }
     return pickMain(entries, { workspace: this.o.workspace, tmux: this.o.tmux, sessionId: this.o.sessionId?.(), alive: p => this.alive(p) })
   }
   main(): RegEntry | null { return (this.lastMain = this.pick(this.entries())) }
@@ -1349,8 +1357,7 @@ export class Registry implements StatusSource {
    *  (<sessionId>/subagents/*.jsonl, where 2.1.322 writes them; an older Claude Code wrote sidechains into the main file), ISO; null = none found */
   /** WO-157 (Chiron 12112, A): the main's background sub-agents still working: their transcripts (<session>/subagents/agent-*.jsonl, launched in the
    *  background per the .meta.json, or with no meta) written in the last BG_AGENT_ACTIVE_MS; null when the folder cannot be read */
-  backgroundAgents(sid: string | null): number | null {
-    const dir = this.o.transcripts()
+  backgroundAgents(sid: string | null, dir = this.o.transcripts()): number | null {
     const f = dir ? (sid ? join(dir, `${sid}.jsonl`) : newestJsonl(dir)) : null
     if (!dir || !f) return null
     const sub = join(dir, basename(f, '.jsonl'), 'subagents'), since = this.now() - BG_AGENT_ACTIVE_MS

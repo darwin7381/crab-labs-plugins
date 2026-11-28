@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
 import { dirname } from 'path'
-import type { InboxItem, ItemRef } from './onsen-items.ts'
+import type { InboxItem, ItemRef, ReceivingTarget } from './onsen-items.ts'
 import type { ClaimStore, ItemReport, Outcome, ReportFields } from './onsen-receive.ts'
 
 const intermediate = new Set<Outcome>(['in_session', 'owed', 'background', 'stuck'])
@@ -8,6 +8,7 @@ const week = 7 * 86400_000
 type Claim = {
   claim_id: string; taken_at: string; session_id?: string; in_session_at?: string; last_outcome?: Outcome
   turn?: string; registry_session?: string; conversation?: string; replies?: string[]
+  target?: ReceivingTarget
   stop?: { turn: string; at: number }
 }
 type Done = { item_id: string; claim_id: string; at: number }
@@ -71,8 +72,22 @@ export class Claims implements ClaimStore {
   taken(row: InboxItem, ref: ItemRef): void {
     const claim = row.claim!
     if (this.rows[row.id]?.claim_id === claim.id) return
-    this.rows[row.id] = { claim_id: claim.id, taken_at: claim.taken_at, conversation: ref.conversation }
+    this.rows[row.id] = { claim_id: claim.id, taken_at: claim.taken_at, conversation: ref.conversation, target: ref.target }
     this.save(); this.clock(row.id); this.changed()
+  }
+  /** Only an observed claim from the transcript of the offered target can bind a row. */
+  targets(): ReceivingTarget[] {
+    return Object.entries(this.rows).flatMap(([id, r]) => this.owns(id) && r.target ? [r.target] : [])
+  }
+  receipt(id: string): string { return this.rows[id]!.claim_id }
+  accept(session: string, receipts: string[], turn: string): void {
+    for (const [id, r] of Object.entries(this.rows))
+      if (r.target?.session_id === session && !r.in_session_at && receipts.includes(r.claim_id)) this.bind(id, session, turn)
+  }
+  cutTarget(t: ReceivingTarget): void {
+    for (const [id, r] of Object.entries(this.rows)) {
+      if (r.target?.session_id === t.session_id && r.target.claude_pid === t.claude_pid) this.report(id, 'cut')
+    }
   }
   bind(id: string, session: string, turn: string): void {
     if (!this.owns(id)) return

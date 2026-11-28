@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from 'bun:test'
 import { randomUUID } from 'crypto'
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
@@ -625,6 +625,83 @@ for (const [name, mode, named] of [['not selected', 200, false], ['409', 409, tr
     expect(d.f.calls.filter(c => c.path.endsWith('/items'))).toHaveLength(named ? 1 : 0)
     expect(d.f.calls.some(c => c.path.endsWith('/commands') || c.path.endsWith('/observation'))).toBe(false)
   })
+
+async function target(d: Awaited<ReturnType<typeof daemon>>) {
+  const child = Bun.spawn(['sleep', '300']), sid = randomUUID()
+  clean.push(async () => { child.kill(); await child.exited })
+  const home = join(d.root, 'home', '.claude'), regs = join(home, 'sessions'), project = join(home, 'projects', d.root.replaceAll('/', '-'))
+  for (const dir of [regs, project]) mkdirSync(dir, { recursive: true })
+  writeFileSync(join(regs, child.pid + '.json'), JSON.stringify({ pid: child.pid, sessionId: sid, cwd: d.root, kind: 'interactive', status: 'idle' }))
+  const transcript = join(project, sid + '.jsonl')
+  writeFileSync(transcript, '')
+  const write = (fields: object) => appendFileSync(transcript, JSON.stringify({ timestamp: new Date().toISOString(), ...fields }) + '\n')
+  const select = () => writeFileSync(roamerState(d.root).ROAMER_STATE_FILE, JSON.stringify({ current_target: { tmux: sid, claude_pid: child.pid, cwd: d.root, session_id: sid } }))
+  const client = new Client({ name: 'lab', version: '1' }), got: any[] = []
+  client.fallbackNotificationHandler = async n => { if (n.method === 'notifications/claude/channel') got.push(n.params) }
+  await client.connect(new StreamableHTTPClientTransport(new URL(d.base + '/mcp'), { requestInit: { headers: { 'x-test-claude-pid': String(child.pid) } } }))
+  clean.push(() => client.close())
+  return { child, sid, select, client, got, accept: (msg: any) => write({ type: 'user', message: { content:
+    `<channel source="telegram" chat_id="1" message_id="${msg.meta.message_id}" onsen_claims="${msg.meta.onsen_claims}">hello</channel>` } }),
+    stop: () => write({ type: 'system', subtype: 'turn_duration' }) }
+}
+
+test('roamer switches between two live streams in one cwd, binds on intake and completes only the receiving UUID', async () => {
+  const d = await daemon({ ...roamerEnv, ONSEN_BRIDGE_WAIT_MS: '10' }, 200, roamerState)
+  const one = d.f.add('first', 'message', { session_id: 'main' })
+  const a = await target(d), b = await target(d)
+  await Bun.sleep(350)
+  expect(one.claim).toBeNull()
+  expect(a.got).toHaveLength(0); expect(b.got).toHaveLength(0)
+  a.select()
+  await waitFor(() => a.got.length === 1)
+  expect(one.claim!.session_id).toBeNull()
+  b.accept(a.got[0]); b.stop()
+  await Bun.sleep(350)
+  expect(one.claim!.session_id).toBeNull()
+  a.accept(a.got[0])
+  await waitFor(() => one.claim?.session_id === a.sid)
+  expect(one.session_id).toBe('main')
+  b.select()
+  const two = d.f.add('second')
+  await waitFor(() => b.got.length === 1)
+  b.accept(b.got[0])
+  await waitFor(() => two.claim?.session_id === b.sid)
+  expect(two.session_id).toBe(b.sid)
+  expect(a.got.map(n => n.content)).toEqual(['first'])
+  expect(b.got.map(n => n.content)).toEqual(['second'])
+  const reply = await a.client.callTool({ name: 'reply', arguments: { chat_id: '1', text: 'first received' } })
+  expect(reply.isError).not.toBe(true)
+  b.stop()
+  await waitFor(() => two.state === 'completed', 9000)
+  expect(two.response_message_ids).toEqual([])
+  expect(one.claim?.session_id).toBe(a.sid)
+  a.stop()
+  await waitFor(() => one.state === 'completed', 9000)
+  expect(one.response_message_ids).toHaveLength(1)
+  expect(one.session_id).toBe('main')
+  const dying = d.f.add('kill target', 'mail')
+  await waitFor(() => b.got.length === 2)
+  b.accept(b.got[1])
+  await waitFor(() => dying.claim?.session_id === b.sid)
+  b.child.kill(); await b.child.exited
+  await waitFor(() => dying.state === 'waiting' && dying.reason === 'cut')
+  expect(d.f.history.filter(h => h.item_id === dying.id && h.body.outcome === 'cut')).toHaveLength(1)
+  expect(a.got).toHaveLength(1)
+}, 45000)
+
+test('changing target during take releases that attempt before writing either stream', async () => {
+  const d = await daemon(roamerEnv, 200, roamerState)
+  const a = await target(d), b = await target(d)
+  a.select()
+  d.f.delayTake(500)
+  const row = d.f.add('moves')
+  await waitFor(() => !!row.claim)
+  b.select()
+  await waitFor(() => d.f.history.some(h => h.item_id === row.id && h.body.outcome === 'not_taken'))
+  expect(a.got).toHaveLength(0)
+  await waitFor(() => b.got.length === 1)
+  expect(b.got[0].content).toBe('moves')
+}, 12000)
 
 function command(d: Awaited<ReturnType<typeof daemon>>, id: string, text: string, tgId: string) {
   return d.f.add(id, 'control', { message_id: 'm-' + id, payload: { message_id: 'm-' + id, from: 'joey', conversation_id: 'conv',

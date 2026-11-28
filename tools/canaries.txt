@@ -114,7 +114,7 @@ plugins/telegram-http/lanes-wake-rules.json::"id": "unverified"
 plugins/telegram-http/onsen-wake.ts::decided_by: row.decided_by === 'new'
 plugins/telegram-http/server.ts::wakeFactsOf(body as unknown as Record<string, unknown>)
 plugins/telegram-http/lanes.ts::export function mainNowWords
-plugins/telegram-http/onsen-status.ts::backgroundAgents(sid: string | null)
+plugins/telegram-http/onsen-status.ts::backgroundAgents(sid: string | null, dir = this.o.transcripts())
 plugins/telegram-http/lanes-main.ts::function statusIdle(isIdle: boolean
 plugins/telegram-http/lanes-wake-rules.json::"id": "peer-no-reply"
 plugins/telegram-http/lanes-main.ts::export const INTERRUPTED_LINE = '〔這一則你做到一半被中斷了

@@ -57,16 +57,17 @@ import {
   registerSelfAsDaemon as roamerRegisterSelfAsDaemon,
   unregisterSelfAsDaemon as roamerUnregisterSelfAsDaemon,
   handleModelCallbackForCurrentTarget,
-  roamerCurrentTranscript,
+  roamerCurrentTranscript, receivingTarget, takeoverStream, pidAlive,
 } from './roamer-control.ts'
 import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs, sendOpsAlert} from './system-alert.ts'
 import { opsRecipients } from './ops-recipients.ts'
 import { newestGenuineAssistantAtIn, genuineAssistantAtFile } from './liveness.ts'
 import { DEFAULT_LIMITS, DutyOfficer, askModelCli, hourlyCapFor, isClaudeCmd, isRateLimitMenu, optionIdOf, realTmux, type ActionRef, type Limits, type MenuActions } from './duty-officer.ts'
 import { ScreenStatus, Since, composeRecord, isVerdictMenu, judgeFor, screenJudgeName, snapPane, type Observation, type RecordFacts } from './screen-status.ts'
+import { RoamerItems } from './roamer-items.ts'
 import { Claims } from './onsen-claims.ts'
 import { ItemReceiver } from './onsen-receive.ts'
-import { ItemPeek, itemRef, type ItemRef, type InboxItem } from './onsen-items.ts'
+import { ItemPeek, itemRef, type ItemRef, type InboxItem, type ReceivingTarget } from './onsen-items.ts'
 import { machineName, takeRefusal, TakeMode } from './onsen-take.ts'
 import { ObservationPut } from './onsen-observation.ts'
 import { MentionCards, mentionItemText } from './onsen-mentions.ts'
@@ -343,6 +344,7 @@ const ONSEN_TAKE_ON = switchOn(process.env.ONSEN_TAKE, ONSEN_AGENT)
 let takeMode: TakeMode | undefined
 let itemPeek: ItemPeek | undefined
 let itemReceiver: ItemReceiver | undefined
+let roamerItems: RoamerItems | undefined
 let itemClaims: Claims | undefined
 let registryStatusChanged: (() => void) | undefined
 let connectorReady = false
@@ -429,7 +431,7 @@ const connectorSay: Connector.ConnectorSay | null = connectorIds ? new Connector
  *  files stored in Onsen first (always: the bridge takes them from there), then the bridge's report waited for (3 s). Throws 「Onsen 沒收下…」 when Onsen
  *  did not take it (or one of its files). A Telegram topic has no Onsen thread known here yet (segment 2: threads): written without one */
 async function connectorReply(o: { chat: string; sender: string; text: string; redact: Array<[string, string]>; rich: boolean; files: string[]
-  replyTo?: string | number | null; topic?: number; silent?: boolean; turn_id?: string | null }): Promise<Connector.Said> {
+  replyTo?: string | number | null; topic?: number; silent?: boolean; turn_id?: string | null; session?: string | null }): Promise<Connector.Said> {
   if (!connectorSay) throw new Error(`${Connector.NOT_TAKEN}（connector mode: this daemon has no Onsen client）`)
   const body = Onsen.redactText(o.text, o.redact)
   const ids: string[] = [], rows: Array<{ name: string; mime?: string; size?: number }> = []
@@ -449,7 +451,7 @@ async function connectorReply(o: { chat: string; sender: string; text: string; r
   const kind = body.trim() || !o.files.length ? (o.rich ? 'rich' : 'text') : PHOTO_EXTS.has(extname(o.files[0]!).toLowerCase()) ? 'photo' : 'document'
   const said = await connectorSay.say({ chat: o.chat, sender: o.sender, text: body, kind, turn_id: o.turn_id, replyTo: o.replyTo != null ? String(o.replyTo) : null,
     silent: o.silent, ...(o.topic != null ? { thread: String(o.topic) } : {}), ...(ids.length ? { fileIds: ids, attachments: rows } : {}) })
-  if (o.turn_id && said.onsenId) itemClaims?.reply(o.turn_id, said.conversationId, said.onsenId, mainTurnNow?.() === o.turn_id ? Lanes.mainSessionId() : undefined)
+  if (o.turn_id && said.onsenId) itemClaims?.reply(o.turn_id, said.conversationId, said.onsenId, o.session ?? (mainTurnNow?.() === o.turn_id ? Lanes.mainSessionId() : undefined))
   return said
 }
 // ---- WO-197 segment 2 (Chiron; CONTRACT §7d 「連接器這一頭」, the rulings of mesh 12869): what the daemon still said on Telegram goes through Onsen ----
@@ -594,7 +596,7 @@ async function connectorCommand(text: string, chat: string, ref: string, userId:
   const name = user || userId
   if (item) {
     const control = isControlEnabled() && (sharedTuiCommands().includes(cmd) || controlCommandsForBotApi().some(c => '/' + c.command === cmd) || ['/kill-stuck', '/sessions', '/list'].includes(cmd))
-    const roamer = isRoamerEnabled() && roamerCommandsForBotApi().some(c => '/' + c.command === cmd)
+    const roamer = isRoamerEnabled() && (roamerCommandsForBotApi().some(c => '/' + c.command === cmd) || ['/list', '/whoami', '/sessions', '/kill-stuck'].includes(cmd))
     if (!control && !roamer && !['/start', '/help', '/status', '/main', '/lanes'].includes(cmd)) return false
     if (!itemReceiver || !(await itemReceiver.receive([item])).given.has(item.onsen_item_id)) throw new Error('command item not available')
   }
@@ -2813,9 +2815,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         if (!tg) {
           // WO-197 (a connector): the whole reply and its files written into Onsen (conversation_id); the bridge draws it on Telegram (parts, files,
           // reply, silence) and reports its numbers: answered as before. None within 3 s: said all the same (Onsen has it; the Stop check does not hold)
+          const target = roamerItems?.replyFrom(serverSessionId.get(mcp))
           const r = await connectorReply({ chat: chat_id, sender: 'main', text: fl.text, redact: fl.redact, rich: useRich, files,
             replyTo: formRef ? String(args.reply_to) : args.reply_to != null ? String(args.reply_to) : null, topic: topicF.message_thread_id,
-            silent: !!handoffTier?.silent, turn_id: mainTurnNow() })
+            silent: !!handoffTier?.silent, turn_id: roamerItems ? target?.turn : mainTurnNow(), session: target?.session })
           if (r.held || !r.ids.length) {
             if (Lanes.LANES_ON && !INBOX_ONLY) Lanes.mainReplied(handoffTier, `onsen:${r.onsenId}`, lanesReplyTo, text, chat_id)
             return { content: [{ type: 'text', text: r.held ? Connector.HELD : `sent (id: onsen:${r.onsenId})` }] }
@@ -3519,6 +3522,14 @@ async function finishInbound(f: OnsenInbound.Facts, how: 'local' | 'onsen', got?
 let editEventSeq = 0
 /** `routeTopic` (WO-197 segment 2): the topic the router and the lanes know the message by, when it is not the tag's (a connector: Onsen's thread) */
 async function dispatchInbound(chat_id: string, notification: { method: string; params: unknown }, routeTopic?: string, personIds?: string[], refs?: ItemRef[]): Promise<void> {
+  if (roamerItems) {
+    if (refs?.length) await roamerItems.offer(refs, notification)
+    else {
+      const t = receivingTarget(), stream = t && pidAlive(t.claude_pid) && targetStream(t)
+      if (stream) await notifyStream(stream, notification)
+    }
+    return
+  }
   // 002: the router decides (quoted lane message → that lane; worker topic → that worker;
   // everything else → the registered main only). Never a broadcast.
   if (Lanes.LANES_ON) {
@@ -4021,6 +4032,14 @@ function forgetIssuedSession(sid: string): void {
 
 /** the session's GET stream is open AND the SDK transport holds it: a notification written now reaches the client's stream. The SDK's send() returns
  *  without error when it has no GET stream (before handleRequest mapped it, or after the client cancelled it), so sseOpen alone does not say this. */
+async function notifyStream(sid: string, notif: { method: string; params: unknown }): Promise<boolean> {
+  if (!streamLive(sid)) return false                     // the SDK drops a notification silently when it has no GET stream: not written = not offered
+  for (const s of activeServers) if (serverSessionId.get(s) === sid) {
+    try { await s.notification(notif as Parameters<Server['notification']>[0]); return true } catch (err) { log('warn', `lanes: offer to ${sid} failed: ${err}`); return false }
+  }
+  return false
+}
+
 function streamLive(sid: string): boolean {
   const t = transports.get(sid) as any
   return !!sseOpen.get(sid) && !!t?._webStandardTransport?._streamMapping?.has?.('_GET_stream')
@@ -4120,10 +4139,23 @@ const mentionCards: MentionCards | null = INBOX_ONLY || !onsen ? null : new Ment
 // which claude process holds each MCP stream: the socket lookup (lanes-proc: lsof on a Mac, /proc on Linux), once per stream. ONSEN_PEER_LOOKUP=0: none
 // (every open stream counts as the main's)
 const streams = new OnsenStatus.Streams({ open: () => sseOpen.entries() })
+// Retain the peer identity of already-open streams if the next mode probe switches a local roamer.
+if (ROAMER && takeMode && process.env.ONSEN_PEER_LOOKUP !== '0') onsenPeer = (sid, req) => streams.note(sid, Lanes.claudePidOf(req, HTTP_PORT!))
+function targetStream(t: ReceivingTarget): string | undefined {
+  const mapped = takeoverStream(t.tmux)
+  if (mapped && streamLive(mapped) && (streams.peerPid(mapped) ?? t.claude_pid) === t.claude_pid) return mapped
+  for (const sid of sseOpen.keys()) if (streamLive(sid) && streams.peerPid(sid) === t.claude_pid) return sid
+}
 const registry = new OnsenStatus.Registry({
-  dir: process.env.ONSEN_SESSIONS_DIR || join(homedir(), '.claude', 'sessions'), workspace: AGENT_WORKSPACE_DIR, transcripts: () => TRANSCRIPT_DIR,
+  dir: process.env.ONSEN_SESSIONS_DIR || join(homedir(), '.claude', 'sessions'), workspace: AGENT_WORKSPACE_DIR,
+  transcripts: () => { if (!ROAMER) return TRANSCRIPT_DIR; const t = receivingTarget(); return t ? dirname(t.transcript) : null },
+  ...(ROAMER ? { target: receivingTarget } : {}),
   tmux: process.env.CHANNEL_BOT_TMUX_SESSION || null, sessionId: Lanes.LANES_ON ? () => Lanes.mainSessionId() : undefined,
-  connected: pid => streams.connected(pid), changed: () => { registryStatusChanged?.(); Lanes.mainRegistryChanged() }, log: m => log('info', m),
+  connected: pid => {
+    if (!ROAMER) return streams.connected(pid)
+    const t = receivingTarget()
+    return !!t && t.claude_pid === pid && !!targetStream(t)
+  }, changed: () => { registryStatusChanged?.(); Lanes.mainRegistryChanged() }, log: m => log('info', m),
   // the first comparison: 10–70 s after start at random (a fleet that starts at once does not compare at once); ONSEN_REGISTRY_FIRST_CHECK_MS fixes it
   ...(Number(process.env.ONSEN_REGISTRY_FIRST_CHECK_MS) >= 0 && process.env.ONSEN_REGISTRY_FIRST_CHECK_MS ? { firstCheckMs: Number(process.env.ONSEN_REGISTRY_FIRST_CHECK_MS) } : {}),
   // the documented read of the same registry, for the comparison (~1 min after start, then every ~10 min) and the fallback (every 30 s while the
@@ -4158,13 +4190,7 @@ if (Lanes.LANES_ON) {
     httpPort: HTTP_PORT as number,
     log,
     stateDir: STATE_DIR,
-    notifySession: async (sid: string, notif: { method: string; params: unknown }): Promise<boolean> => {
-      if (!streamLive(sid)) return false                     // the SDK drops a notification silently when it has no GET stream: not written = not offered
-      for (const s of activeServers) if (serverSessionId.get(s) === sid) {
-        try { await s.notification(notif as Parameters<Server['notification']>[0]); return true } catch (err) { log('warn', `lanes: offer to ${sid} failed: ${err}`); return false }
-      }
-      return false
-    },
+    notifySession: notifyStream,
     streamOpen: streamLive,
     authOk: tokOk,
     toolsChanged: (sid: string) => {      // 002m (LG1)
@@ -4461,7 +4487,7 @@ function startOnsenStatus(onsen: Onsen.OnsenClient): void {
     const edge = `${member}|${pub.state}|${pub.detail?.interrupted === true}`
     // WO-172 (Chiron 02:43Z) / WO-177: a normal turn's turn_end goes when this record shows the turn over (not busy, stuck or compacting), not 60 s later
     try { facts.statusRecord(member) } catch {}
-    itemClaims?.statusRecord(registry.mainSessionId(), member, sid => registry.backgroundAgents(sid), OnsenStatus.REGISTRY_SETTLE_MS)
+    if (!roamerItems) itemClaims?.statusRecord(registry.mainSessionId(), member, sid => registry.backgroundAgents(sid), OnsenStatus.REGISTRY_SETTLE_MS)
     try { calls?.statusRecord(member) } catch {}                          // WO-175: a main turn's Calls end with it, the same way
     if (edge !== lastEdge) { lastEdge = edge; if (Lanes.LANES_ON) { try { Lanes.mainStatusChanged() } catch {} } }
   }
@@ -4469,12 +4495,16 @@ function startOnsenStatus(onsen: Onsen.OnsenClient): void {
   // the fact's detail); a turn with no Joey message in it (a colleague's call alone) has no fact to ride: Onsen takes delivery facts for Telegram
   // messages only, so this line is its record here
   const turnEnded = (t: OnsenStatus.TurnEnded): void => log('info', `onsen: turn_end ${t.session} ${t.turn_id} ${t.outcome} bound=[${t.bound.join(',')}] facts=${t.facts}`)
-  const tap = Lanes.LANES_ON ? new OnsenStatus.LanesTap({ facts, joey: onsenJoeyOf, gen: () => Lanes.mainGenRow(), changed: kick, trigger: row => Lanes.triggerOfItem(row), turnEnded,
+  const tap = Lanes.LANES_ON && !ROAMER ? new OnsenStatus.LanesTap({ facts, joey: onsenJoeyOf, gen: () => Lanes.mainGenRow(), changed: kick, trigger: row => Lanes.triggerOfItem(row), turnEnded,
     calls, callOf: id => Lanes.callOfEvent(id) }) : null
   if (tap) Lanes.observeLanes({ journal: (r, l) => tap.journal(r, l), mainEvent: b => tap.mainEvent(b), calls })
   // WO-165: seen (lanes off) comes from this read; it follows the registry's main session (its <session id>.jsonl) at once, so a new session's first
   // message is not seen only at the next 10 s rescan (registry is set up below: read only once the block has run)
-  const watch = tap ? null : new OnsenStatus.TurnWatch({ dir: () => consumptionCheckAvailable() ? TRANSCRIPT_DIR : null, facts, joey: onsenJoeyOf, changed: kick,
+  if (ROAMER && itemReceiver && itemClaims) {
+    roamerItems = new RoamerItems({ receiver: itemReceiver, claims: itemClaims, registry, selected: receivingTarget, alive: pidAlive,
+      stream: targetStream, send: notifyStream, watch: { facts, joey: onsenJoeyOf, changed: kick, turnEnded }, revisit: () => itemPeek!.reset() })
+  }
+  const watch = tap ? null : roamerItems ?? new OnsenStatus.TurnWatch({ dir: () => consumptionCheckAvailable() ? TRANSCRIPT_DIR : null, facts, joey: onsenJoeyOf, changed: kick,
     session: () => { try { return registry.mainSessionId() } catch { return null } }, turnEnded })
   mainTurnNow = () => { try { return (tap ? tap.turnFacts()?.id : watch?.turnFacts()?.id) ?? null } catch { return null } }   // WO-172
   onsenPeer = process.env.ONSEN_PEER_LOOKUP === '0' ? null : (sid, req) => streams.note(sid, Lanes.claudePidOf(req, HTTP_PORT!))
@@ -4639,7 +4669,7 @@ async function deliverFormAnswer(it: OnsenVisible.FormItem, route: 'main' | 'rul
   // Onsen step 3: the daemon took it in (Onsen keys a page answer's delivery facts by form-<id>); seen / turn_end come from the same taps as Joey's messages
   if (onsenFacts) { try { onsenFacts.delivered(chat, ref) } catch {} }
   // WO-194: a page message that came as a person_message with ONSEN_INBOUND on goes the way a Telegram message goes (the router's rules)
-  if (Lanes.LANES_ON && route === 'main') {
+  if (Lanes.LANES_ON && route === 'main' && !(roamerItems && refs?.length)) {
     const ev: Lanes.InEvent = { id: `tg-${chat}-${ref}`, source: 'telegram', from: uid, text: String(notification.params.content), meta, notif: notification, verified: true, person_message_ids: personIds, ...(refs ? { onsen_items: refs } : {}) }
     if (Lanes.toMainForm(ev)) return true
   }
@@ -4842,7 +4872,7 @@ async function deliverInbound(body: InboundBody | null, verdict: Verdict, o: { h
     return { code: 200, json: { injected: false, held: true } }
   }
   // WO-151: delivered already by the other path (or being delivered right now): dropped here, counted
-  const key = onsenInbox ? dedupeKeyOf(body?.dedupe, body?.msg_id) : null
+  const key = onsenInbox && !(roamerItems && o.item) ? dedupeKeyOf(body?.dedupe, body?.msg_id) : null
   if (key && onsenInbox!.seen(key)) {
     if (o.src === 'inject') onsenInbox!.stats.inject_dup_dropped++
     log('info', `onsen inbox: ${o.src === 'inject' ? '/inject' : 'Onsen item'} from ${verdict.sender} (${key}) already delivered by the ${o.src === 'inject' ? 'Onsen' : '/inject'} path: dropped`)
@@ -4877,7 +4907,7 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
   // Receiver-side comms logging (Joey 4616: one-sided threads): EVERY inbound
   // delivery gets a BTCC row unless the sender declares logged:true (senders
   // that already log with richer context: fleet call, BTCC /send, Argus wake).
-  if ((INBOX_ONLY || item) && body?.logged !== true && (BTCC_API_BASE || item) && !ring) {
+  if ((INBOX_ONLY || (item && !roamerItems)) && body?.logged !== true && (BTCC_API_BASE || item) && !ring) {
     // PARSE rather than strip (codex r3): wake handoffs keep their priority
     // and get kind='wake' so BTCC history/UI retain the on-call semantics;
     // only bare legacy identity prefixes (【a → b】) are dropped as noise.
@@ -4904,7 +4934,7 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
   // Default chat_id = first allowFrom (the owner): if the agent finishes and
   // reports via the reply tool, the report lands with the boss per contract.
   const chatId = String(body?.chat_id ?? loadAccess().allowFrom[0] ?? 'local-inject')
-  if (Lanes.LANES_ON) {
+  if (Lanes.LANES_ON && !(roamerItems && item)) {
     // 002: thread / hop / sender-lane marker. The marker is only believed from a verified
     // sender (it is stamped by the sender's own daemon, never by message text).
     const b2 = body as unknown as { thread?: unknown; hop?: unknown; lane?: unknown }
@@ -4944,7 +4974,7 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
     }
     return { code: 200, json: { injected: true, routed: d?.target ?? 'main', lane: d?.lane ?? null, rule: d?.rule ?? 'router-unreachable' } }
   }
-  if (ring) {
+  if (ring && !(item && roamerItems)) {
     log('info', `ring from ${from} dropped: lanes off here (no mail lane to wake; the mailbox stays as it is, the watchdog reminds): ${text.slice(0, 60)}`)
     return { code: 200, json: { injected: false, ignored: 'ring: lanes off here; the mailbox stays as it is' } }
   }
@@ -4968,7 +4998,7 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
       },
     },
   }
-  await dispatchInbound(chatId, notif)
+  await dispatchInbound(chatId, notif, undefined, undefined, item ? [item] : undefined)
   return { code: 200, json: { injected: true, active_sessions: activeServers.size } }
 }
 /** WO-151 3a: one item taken from Onsen, handed to the same delivery as /inject (deliverInbound). Its sender is Onsen's authenticated caller, or the name

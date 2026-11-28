@@ -10,7 +10,9 @@ export type InboxItem = {
 }
 
 /** Only references travel in the M1 and lane journals. A waiting reference owns no claim. */
+export type ReceivingTarget = { session_id: string; claude_pid: number; tmux: string; transcript: string }
 export type ItemRef = {
+  target?: ReceivingTarget
   onsen_item_id: string; onsen_version: number; kind: string; from: string; deadline?: string; main?: true
   note?: string; reason?: string; half_done?: true; conversation?: string
 }
