@@ -63,7 +63,7 @@ The bridge registers as the extension `telegram-bridge-<machine>`, kind `bridge`
 
 ## Out: Onsen → Telegram (`outbound.ts`)
 
-One long poll of `GET /v1/bridge/feed?after=<cursor>&wait=50&limit=100`. The cursor and the seqs of a half-drawn batch are kept in `state.json`, so a restart goes on from there. Items are drawn in order within each member and chat; different chats are drawn in parallel.
+One long poll of `GET /v1/bridge/feed?after=<cursor>&wait=50&limit=100`. The cursor and the seqs of a half-drawn batch are kept in `state.json`, so a restart goes on from there. Each group has one drawing queue shared by its bots. Each DM has a queue per bot. Different chats can draw in parallel.
 
 - **message**
   - **Text.** The text is split into parts (`access.json` `textChunkLimit` ≤ 4096). Each part is sent as a Rich Message, falling back to plain `sendMessage` when that fails. `author_label` is the first line.
@@ -115,7 +115,7 @@ One long poll of `GET /v1/bridge/feed?after=<cursor>&wait=50&limit=100`. The cur
 | `GET /api/onsen/v1/bridge/feed?after=&wait=50&limit=100` | answer `{items, next}` (no envelope; `next` kept as an opaque string) |
 | `POST /api/onsen/v1/messages/<id>/delivery` | `{client:"telegram", state:"sent"/"failed", client_msg_ids, at, error}` (`error` null when sent; `timeout…` when Telegram didn't answer) |
 | `POST /api/onsen/v1/bridge/actions/<id>/delivery` | `{client_user_id, client_msg_ids}` (after an Action's buttons are drawn; Onsen 0.35.1) |
-| `PUT /api/onsen/v1/bridge/threads` | `{member, chat, thread, client_thread}` (stage two) |
+| `PUT /api/onsen/v1/bridge/threads` | `{member, chat, thread, client_thread}`. In groups, `(chat, client_thread)` identifies the topic across bots. |
 | `POST /api/onsen/v1/bridge/restart-lines/<id>/lift` | `{client_user_id}` (stage two) |
 
 ## Readings of §7d

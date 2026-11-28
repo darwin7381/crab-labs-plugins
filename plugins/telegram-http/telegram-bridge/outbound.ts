@@ -22,7 +22,7 @@
 //   restart_line, thread, commands: stage-two.ts (DrawDeps.extra)
 import type { Agent } from './agent.ts'
 import { retryable, errSaid, type OnsenClient } from './onsen.ts'
-import type { Progress, RetryRec, StateStore } from './state.ts'
+import { chatScope, type Progress, type RetryRec, type StateStore } from './state.ts'
 import { editText, labelParts, MAX_CHUNK_LIMIT, sendTextParts, type Button } from './tg-format.ts'
 import { errText, TgError, TgTimeout } from './tg.ts'
 
@@ -64,7 +64,7 @@ export class Drawer {
   private now(): number { return (this.d.now ?? Date.now)() }
   private get st() { return this.d.state.data }
 
-  /** run `fn` after everything queued for the same member and chat (Telegram order within a chat); never rejects */
+  /** Run after everything queued for the same Telegram chat, including other bots in the group. */
   lane(key: string, fn: () => Promise<void>): Promise<void> {
     const prev = this.lanes.get(key) ?? Promise.resolve()
     const p = prev.then(fn).catch(e => this.d.log('error', `drawing in ${key}: ${errText(e)}`))
@@ -75,7 +75,7 @@ export class Drawer {
   /** one feed item, in its chat's order; resolves when its first try is over (sent, failed, or waiting for a retry) */
   enqueue(item: any): Promise<void> {
     this.stats.items++
-    return this.lane(`${item?.member}:${item?.chat}`, () => this.draw(item))
+    return this.lane(chatScope(String(item?.member), String(item?.chat)), () => this.draw(item))
   }
   /** the items of one feed batch to draw: every observation but the newest of its member and chat goes */
   static coalesce(items: any[]): any[] {
@@ -238,7 +238,7 @@ export class Drawer {
       r.due = Infinity                       // taken: not picked again while it runs
       const a = this.d.agentOf(String(r.item.member))
       if (!a) { this.st.retries = this.st.retries.filter(x => x !== r); this.d.state.dirty(); continue }
-      void this.lane(`${r.item.member}:${r.item.chat}`, () => this.drawMessage(a, r.item, r))
+      void this.lane(chatScope(a.member, String(r.item.chat)), () => this.drawMessage(a, r.item, r))
     }
     for (const x of [...this.st.reports]) {
       if (x.due > t) continue

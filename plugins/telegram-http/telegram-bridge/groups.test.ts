@@ -142,3 +142,57 @@ test('supergroup edits share their version key; basic group edits address the bo
   expect(keys).toEqual(['tg:-100212:7:edit:1700000001', 'tg:lab-a:-23:7:edit:1700000001',
     'tg:-100212:7:edit:1700000001', 'tg:lab-b:-23:7:edit:1700000001'])
 })
+
+const feedMessage = (member: string, id: string, text: string) => ({
+  type: 'message', seq: id, at: new Date().toISOString(), member, chat: String(supergroup.id),
+  message: { id, from: member, body: { text }, attachments: [] },
+})
+
+test('the speaker draws its message once, only the receiving bot draws in_session, and the chosen bot draws the web echo', async () => {
+  const chat = String(supergroup.id), line = feedMessage('lab-a', 'line', 'from A')
+  await bridge.drawBatch([line, { ...line, seq: 'replay' },
+    { type: 'receipt', seq: 'receipt', member: 'lab-b', chat, state: 'in_session', client_msg_id: '63', at: line.at },
+    { ...feedMessage('lab-b', 'echo', 'from web'), message: { id: 'echo', from: 'guest', body: { text: 'from web' } }, origin_client: 'onsen' }])
+  await until(() => tg.callsOf(b, 'setMessageReaction').length > 0, 1000, 'recipient reaction')
+  expect(tg.sentTo(a, chat).map(r => r.markdown)).toEqual(['from A'])
+  expect(tg.sentTo(b, chat).map(r => r.markdown)).toEqual(['〔guest 在 Onsen 傳的〕\n\nfrom web'])
+  expect(tg.callsOf(b, 'setMessageReaction')).toEqual([{ chat_id: chat, message_id: 63, reaction: [{ type: 'emoji', emoji: '✍' }] }])
+  expect(tg.callsOf(a, 'setMessageReaction')).toEqual([])
+  expect(onsen.reports.map(r => r.id)).toEqual(['line', 'echo'])
+  await bridge.drawBatch([])
+  expect(tg.sent).toHaveLength(2)
+})
+
+test('one group topic serves both bots in feed order, including its inbound Telegram rename', async () => {
+  const chat = String(supergroup.id), thread = 'thread-7'
+  const open = { type: 'thread', member: 'lab-b', seq: 'open', chat, client_thread: null, thread, name: '原名', state: 'open' }
+  await bridge.drawBatch([open, { ...feedMessage('lab-a', 'first', 'first'), thread }, { ...open, seq: 'again', member: 'lab-a' }])
+  const ct = onsen.threads[0]?.client_thread
+  expect(ct).toBeTruthy()
+  expect(onsen.threads).toEqual([{ member: 'lab-b', chat, thread, client_thread: ct }, { member: 'lab-a', chat, thread, client_thread: ct }])
+  expect(tg.sentTo(a)[0]?.params.message_thread_id).toBe(Number(ct))
+  expect(tg.callsOf(a, 'createForumTopic')).toEqual([])
+  tg.push(b, { message: { chat: supergroup, message_thread_id: Number(ct), forum_topic_edited: { name: '新名' } } })
+  await confirmed()
+  tg.push(a, { message: { chat: supergroup, from, date, message_id: 55, message_thread_id: Number(ct), text: 'after rename',
+    reply_to_message: { forum_topic_created: { name: '原名' } } } })
+  await confirmed()
+  expect(onsen.messages[0]).toMatchObject({ client_thread: ct, topic_name: '新名' })
+  expect(Object.keys(bridge.state.data.topics)).toEqual([chat + ':' + ct])
+})
+
+test('restart reads legacy topic keys, keeps the newest shared group name and isolates DMs', () => {
+  const chat = String(supergroup.id), ct = '42', thread = 't'
+  const record = { member: 'lab-a', chat, client_thread: ct, thread, name: 'old', state: 'open', at: 1 }
+  writeFileSync(bridge.state.file, JSON.stringify({ topics: {
+    ['lab-b:' + chat + ':t']: { ...record, member: 'lab-b', at: 2, name: 'shared' },
+    ['lab-a:' + chat + ':t']: record,
+    'lab-a:123:t': { ...record, chat: '123', name: 'private' },
+  } }))
+  const restarted = new Bridge(bridge.cfg)
+  expect(restarted.two.threadOf('lab-a', chat, thread).client_thread).toBe(ct)
+  expect(restarted.two.topicName('lab-a', chat, ct)).toBe('shared')
+  expect(restarted.two.topicName('lab-a', '123', ct)).toBe('private')
+  expect(restarted.two.topicName('lab-b', '123', ct)).toBeNull()
+  restarted.state.flush()
+})

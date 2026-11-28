@@ -425,7 +425,7 @@ export class Poller {
         reply_to_text: rt ? ((t => t ? metaExcerpt(t) : null)(rt.text ?? rt.caption ?? (rt.rich_message ? richToMarkdown(rt.rich_message) || undefined : undefined) ?? mediaKindLabel(rt))) : null,
         reply_to_user: rt ? (rt.from ? displayName(rt.from) : rt.sender_chat ? (safeName(rt.sender_chat.title ?? rt.sender_chat.username) || String(rt.sender_chat.id)) : null) : null,
         client_thread: thread,
-        topic_name: thread ? (m.reply_to_message?.forum_topic_created?.name ?? this.d.topicName?.(a.member, chat, thread) ?? null) : null,
+        topic_name: thread ? (this.d.topicName?.(a.member, chat, thread) ?? m.reply_to_message?.forum_topic_created?.name ?? null) : null,
         forward_from: tagForwardFrom(m),                                   // the daemon tag's value (Chiron 15:40Z ruling, §7d)
         forward_date: fo?.date || m.forward_date ? new Date(Number(fo?.date ?? m.forward_date) * 1000).toISOString() : null,
         media_group_id: m.media_group_id ? String(m.media_group_id) : null,

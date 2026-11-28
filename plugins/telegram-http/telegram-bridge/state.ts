@@ -11,7 +11,7 @@
 //   retries   feed `message` items whose send failed, waiting for their next try (10 s, 30 s, 2 min; a 429's retry_after)
 //   reports   delivery reports Onsen did not take yet (sent again every 10 s)
 //   sorry     the messages that got the Onsen-down sentence (once each, across restarts)
-//   topics    stage two: a thread → its Telegram topic (member:chat:thread)
+//   topics    a Telegram topic and its Onsen thread, shared by the bots of a group
 //   lines     stage two: a restart line → its message with the lift button (member:line id)
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -22,7 +22,12 @@ export type KeyRec = { member: string; action: string; option: string; label: st
 export type Progress = { text: number[]; files: number[] }
 export type RetryRec = { item: any; attempt: number; due: number; progress: Progress; lastError: string }
 export type ReportRec = { message_id: string; body: Record<string, unknown>; tries: number; due: number }
-export type TopicRec = { member: string; chat: string; thread: string; client_thread: string; name: string; state: string; at: number }
+export type TopicRec = { member: string; chat: string; thread: string | null; client_thread: string; name: string; state: string; at: number }
+/** Telegram group chats are shared. A person's positive chat number identifies a different DM at each bot. */
+export function chatScope(member: string, chat: string): string { return chat.startsWith('-') ? chat : `${member}:${chat}` }
+export function topicKey(t: Pick<TopicRec, 'member' | 'chat' | 'thread' | 'client_thread'>): string {
+  return `${chatScope(t.member, t.chat)}:${t.client_thread || 'thread:' + t.thread}`
+}
 export type LineRec = { member: string; chat: string; msg: number; lift_until: number | null; lifted: boolean; at: number; id: string; pressed?: boolean }
 
 /** WO-199: the ⚠️ line a bridge put under a person's message blocked by a usage limit (removed once the message is taken in again) */
@@ -62,6 +67,13 @@ export class StateStore {
     try {
       const j = JSON.parse(readFileSync(this.file, 'utf8'))
       if (j && typeof j === 'object') this.data = { ...empty(), ...j, feed: { ...empty().feed, ...(j.feed ?? {}) } }
+      // Older bridges stored member:chat:thread. When two bots knew the same topic keep its newest record.
+      const topics = Object.entries(this.data.topics)
+      if (topics.some(([key, t]) => key !== topicKey(t))) {
+        this.data.topics = {}
+        for (const [, t] of topics.sort((a, b) => a[1].at - b[1].at)) this.data.topics[topicKey(t)] = t
+        this.dirty()
+      }
     } catch {}
   }
   /** something changed: written within 500 ms */

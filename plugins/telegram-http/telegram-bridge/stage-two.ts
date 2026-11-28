@@ -17,7 +17,7 @@ import { orderBotMenu } from '../bot-menu.ts'
 import { plainTopicName } from '../lanes-topics.ts'
 import type { Agent } from './agent.ts'
 import { errCode, errSaid, retryable, type OnsenClient } from './onsen.ts'
-import type { StateStore } from './state.ts'
+import { chatScope, topicKey, type StateStore, type TopicRec } from './state.ts'
 import { errText } from './tg.ts'
 
 type Log = (level: 'info' | 'warn' | 'error', msg: string) => void
@@ -49,18 +49,34 @@ export class StageTwo {
   private iconId: string | null | undefined
   /** member:chat → when a topic could not be opened there */
   private noTopicAt = new Map<string, number>()
-  private names = new Map<string, string>()              // member:chat:client_thread → the topic's name
-  constructor(readonly d: { onsen: OnsenClient; state: StateStore; log: Log; now?: () => number; tick?: number }) {
-    for (const t of Object.values(d.state.data.topics)) this.names.set(`${t.member}:${t.chat}:${t.client_thread}`, t.name)
-  }
+  constructor(readonly d: { onsen: OnsenClient; state: StateStore; log: Log; now?: () => number; tick?: number }) {}
   private now(): number { return (this.d.now ?? Date.now)() }
   private get st() { return this.d.state.data }
-  noteTopic(member: string, chat: string, clientThread: string, name: string): void { this.names.set(`${member}:${chat}:${clientThread}`, name); if (this.names.size > 5000) this.names.delete(this.names.keys().next().value!) }
-  topicName(member: string, chat: string, clientThread: string): string | null { return this.names.get(`${member}:${chat}:${clientThread}`) ?? null }
+  noteTopic(member: string, chat: string, ct: string, name: string): void {
+    const rec = this.st.topics[`${chatScope(member, chat)}:${ct}`]
+    if (rec?.name !== name) this.saveTopic({ member, chat, thread: null, state: '', ...rec, client_thread: ct, name, at: this.now() })
+  }
+  topicName(member: string, chat: string, ct: string): string | null {
+    return this.st.topics[`${chatScope(member, chat)}:${ct}`]?.name ?? null
+  }
+
+  private byThread(member: string, chat: string, thread: string): TopicRec | undefined {
+    let newest: TopicRec | undefined
+    for (const t of Object.values(this.st.topics)) {
+      if (t.chat === chat && (chat.startsWith('-') || t.member === member) && t.thread === thread && (!newest || t.at > newest.at)) newest = t
+    }
+    return newest
+  }
+  private saveTopic(t: TopicRec, previous?: TopicRec): void {
+    const key = topicKey(t)
+    if (previous && topicKey(previous) !== key) delete this.st.topics[topicKey(previous)]
+    this.st.topics[key] = t
+    this.d.state.dirty()
+  }
 
   /** a message of a thread: its topic, or, for a thread with no topic in that chat, the label it is drawn under */
   threadOf(member: string, chat: string, thread: string): { client_thread: string | null; label: string | null } {
-    const r = this.st.topics[`${member}:${chat}:${thread}`]
+    const r = this.byThread(member, chat, thread)
     if (!r) return { client_thread: null, label: null }
     return r.client_thread ? { client_thread: r.client_thread, label: null } : { client_thread: null, label: `〔串：${r.name}〕` }
   }
@@ -82,10 +98,10 @@ export class StageTwo {
   }
 
   async drawThread(a: Agent, item: any): Promise<void> {
-    const chat = String(item.chat), thread = String(item.thread ?? ''), key = `${a.member}:${chat}:${thread}`
+    const chat = String(item.chat), thread = String(item.thread ?? '')
     if (!thread) return
     const name = plainTopicName(item.name, '工作')
-    const rec = this.st.topics[key]
+    const rec = this.byThread(a.member, chat, thread)
     let ct: string | null = item.client_thread != null ? String(item.client_thread) : rec?.client_thread ?? null
     if (item.state === 'open' && !ct) {
       // a chat that could not open a topic (no topics mode, createForumTopic refused) is not asked again for an hour (or until a restart);
@@ -98,30 +114,27 @@ export class StageTwo {
           return null
         })
       if (!r?.message_thread_id) {
-        this.st.topics[key] = { member: a.member, chat, thread, client_thread: '', name, state: 'open', at: this.now() }
-        this.d.state.dirty()
+        this.saveTopic({ member: a.member, chat, thread, client_thread: '', name, state: 'open', at: this.now() }, rec)
         return
       }
       ct = String(r.message_thread_id)
-      this.st.topics[key] = { member: a.member, chat, thread, client_thread: ct, name, state: 'open', at: this.now() }
-      this.d.state.dirty()
-      this.noteTopic(a.member, chat, ct, name)
+      this.saveTopic({ member: a.member, chat, thread, client_thread: ct, name, state: 'open', at: this.now() }, rec)
       await this.report(a, chat, thread, ct)
       this.d.log('info', `${a.member}: thread ${thread} opened as topic ${ct} 「${name}」 in chat ${chat}`)
       return
     }
     if (!ct) return
-    const was = rec ?? { member: a.member, chat, thread, client_thread: ct, name: '', state: '', at: 0 }
-    if (name && name !== was.name && item.name) await a.tg.call('editForumTopic', { chat_id: chat, message_thread_id: Number(ct), name }).catch(e => this.d.log('warn', `${a.member}: renaming topic ${ct}: ${errText(e)}`))
-    if (item.state === 'closed' && was.state !== 'closed') {
+    const was = this.st.topics[`${chatScope(a.member, chat)}:${ct}`]
+    if (name && name !== was?.name && item.name) await a.tg.call('editForumTopic', { chat_id: chat, message_thread_id: Number(ct), name }).catch(e => this.d.log('warn', `${a.member}: renaming topic ${ct}: ${errText(e)}`))
+    if (item.state === 'closed' && was?.state !== 'closed') {
       this.iconId ??= await a.tg.call('getForumTopicIconStickers', {}).then((xs: any[]) => xs.find(s => String(s?.emoji ?? '').replace(/️/g, '') === '✅')?.custom_emoji_id ?? null).catch(() => null)
       if (this.iconId) await a.tg.call('editForumTopic', { chat_id: chat, message_thread_id: Number(ct), icon_custom_emoji_id: this.iconId }).catch(e => this.d.log('warn', `${a.member}: the ✅ on topic ${ct}: ${errText(e)}`))
       else this.d.log('warn', `${a.member}: getForumTopicIconStickers has no ✅: topic ${ct} keeps its icon`)
-    } else if (item.state === 'open' && was.state === 'closed') {
+    } else if (item.state === 'open' && was?.state === 'closed') {
       await a.tg.call('editForumTopic', { chat_id: chat, message_thread_id: Number(ct), icon_custom_emoji_id: '' }).catch(e => this.d.log('warn', `${a.member}: clearing the icon of topic ${ct}: ${errText(e)}`))
     }
-    this.st.topics[key] = { ...was, client_thread: ct, name: item.name ? name : was.name, state: String(item.state ?? was.state), at: this.now() }
-    this.d.state.dirty()
+    this.saveTopic({ member: a.member, chat, thread, client_thread: ct, name: item.name ? name : was?.name ?? '',
+      state: String(item.state ?? was?.state ?? ''), at: this.now() }, rec)
     if (item.client_thread == null) await this.report(a, chat, thread, ct)
   }
   /** PUT /v1/bridge/threads: which topic a thread is (tried twice; a later item for the thread sends it again) */
