@@ -188,7 +188,9 @@ describe('chat_history shows the line', () => {
     expect(ls[0]).toMatch(/^Joey 在 \d\d-\d\d \d\d:\d\dZ 叫你重新開始：線之前的對話不顯示（他引用的那則照樣看得到）$/)
     expect(out).toContain('線之後 Joey 說的'); expect(out).not.toContain('線之前 main 回的'); expect(out).not.toContain('/clear')
     expect(ls.at(-1)).toBe('共 2 則，顯示 2 則')
-    expect(await c.queryHistory({ id: 'tg:11' })).toMatch(/^這一則在 Joey 叫你重新開始（\d\d-\d\d \d\d:\d\dZ）之前，看不到$/)
+    const [reason, hint] = (await c.queryHistory({ id: 'tg:11' })).split('\n')
+    expect(reason).toBe(behindLine(new Date((T0 + 12) * 1000 + 300).toISOString()))
+    expect(hint).toMatch(/message_id.*tg:N.*#N/)
     expect(await c.queryHistory({ id: 'tg:10' })).toContain('線之前 Joey 說的')         // quoted after the line
     // lifted: no line, everything back
     await c.liftLine({ chat: JOEY, lineId: line!.id, clientMsgId: 12, by: `tg:${JOEY}` })

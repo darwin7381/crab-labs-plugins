@@ -30,6 +30,7 @@ import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSyn
 import { randomUUID } from 'crypto'
 import { basename, join } from 'path'
 import { OnsenIds } from './onsen-connector.ts'
+import { HISTORY_ID_HINT } from './onsen-tool.ts'
 import type { WakeItem } from './onsen-wake.ts'
 
 // ------------------------------------------------------------------ records (the contract posted on WO-139)
@@ -1250,10 +1251,20 @@ export class OnsenClient {
           const r = telegramId && chat
             ? await this.getTelegramMessage(telegramId, chat, cred, via, tmo)
             : await this.get(`/messages/${encodeURIComponent(onsenId)}`, cred, via, tmo)
-          if (r?.status === 404 && r.json?.detail?.restart_line) return behindLine(r.json.detail.restart_line)
-          if (!r || r.status === 404 || r.status === 400) return `Onsen 裡找不到 ${id}${telegramId ? `（chat ${chat}）` : ''}。`
-          if (r.status !== 200 || !r.json) throw new Error(`HTTP ${r.status}`)
-          return formatFull(r.json.message ?? r.json, joey)
+          if (r?.status === 200 && r.json && typeof r.json === 'object') return formatFull(r.json.message ?? r.json, joey)
+          if (r && (r.status === 408 || r.status >= 500)) throw new Error(`HTTP ${r.status}`)
+
+          const ref = telegramId ? `${id}，chat ${chat}` : id
+          let reason: string
+          if (!r || r.status === 404) {
+            const line = r?.json?.detail?.restart_line
+            reason = line ? behindLine(line) : `找不到這一則（${ref}）。`
+          } else if (r.status === 403) {
+            reason = `這一則（${ref}）不在你看得到的對話裡。`
+          } else {
+            reason = `Onsen 回 HTTP ${r.status}，無法查這一則（${ref}）。`
+          }
+          return `${reason}\n${HISTORY_ID_HINT}。`
         }
         const p = new URLSearchParams({ agent: this.cfg.agent, limit: String(limit) })
         if (chat) p.set('chat', chat)
@@ -1270,7 +1281,11 @@ export class OnsenClient {
         }
         why = `Onsen 回 HTTP ${r.status}`
       } catch (e) {
-        why = e instanceof Error && /timeout|abort/i.test(`${e.name} ${e.message}`) ? `Onsen ${Math.round(tmo / 1000)} 秒內沒回應` : `Onsen 連不上（${errText(e).slice(0, 80)}）`
+        if (e instanceof Error && /timeout|abort/i.test(`${e.name} ${e.message}`)) {
+          why = id ? `Onsen 連不上（${tmo / 1000} 秒內沒回應）` : `Onsen ${Math.round(tmo / 1000)} 秒內沒回應`
+        } else {
+          why = `Onsen 連不上（${errText(e).slice(0, 80)}）`
+        }
       }
     }
     return this.localHistory({ limit, since, until, q, id, telegramId, chat, cut, inbound: o.inbound }, why, joey)
@@ -1278,7 +1293,9 @@ export class OnsenClient {
   private async get(path: string, cred: string, via: 'tool' | 'hook' = 'tool', timeoutMs = this.cfg.queryTimeoutMs ?? 4000): Promise<{ status: number; json: any }> {
     const r = await this.f(`${this.cfg.base}${path}`, { headers: this.headers(cred, { 'X-Onsen-Via': via }), signal: AbortSignal.timeout(timeoutMs) })
     let json: any = null
-    try { json = await r.json() } catch {}
+    try { json = await r.json() } catch (e) {
+      if (r.ok && !(e instanceof SyntaxError)) throw e   // a successful lookup can still time out reading the body
+    }
     return { status: r.status, json }
   }
   /** The scoped alias returns either the full message or its Onsen id. */
@@ -1299,8 +1316,11 @@ export class OnsenClient {
       if (!existsSync(p)) continue
       try { for (const raw of readFileSync(p, 'utf8').split('\n')) { if (!raw) continue; try { lines.push(JSON.parse(raw)) } catch {} } } catch {}
     }
+    const records = o.id
+      ? lines.filter(l => (l.k === 'm' || l.k === 'e') && l.r.agent === this.cfg.agent && l.r.chat === o.chat)
+      : lines
     const msgs = new Map<string, any>()
-    for (const l of lines) {
+    for (const l of records) {
       if (l.k === 'm') {
         const m = l.r
         msgs.set(m.idem_key, { id: null, at: m.sent_at, direction: m.direction, sender: m.sender, kind: m.kind, body: m.body, client_msg_id: m.client_msg_id ?? null,
@@ -1309,7 +1329,7 @@ export class OnsenClient {
     }
     const byTg = new Map<string, any>()
     for (const m of msgs.values()) if (m.client_msg_id) byTg.set(`${m.chat}:${m.client_msg_id}`, m)
-    for (const l of lines) {
+    for (const l of records) {
       if (l.k !== 'e') continue
       const m = byTg.get(`${l.r.chat}:${l.r.target_client_msg_id}`)
       if (!m) continue

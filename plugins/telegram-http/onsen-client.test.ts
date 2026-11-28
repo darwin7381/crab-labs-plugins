@@ -17,6 +17,7 @@ const JOEY = '1828'
 function fakeOnsen() {
   const store = new Map<string, any>()            // idem_key → row
   const events = new Map<string, any>()
+  const readErrors = new Map<string, number>()
   const calls: Array<{ method: string; path: string; headers: Record<string, string>; body: any }> = []
   const st = { down: false, status5xx: false, hang: false, refuseKey: '' as string, batch400: false }
   let next = 1
@@ -48,6 +49,8 @@ function fakeOnsen() {
       if (events.has(body.idem_key)) return json(200, { id: events.get(body.idem_key).id, duplicate: true })
       const id = next++; events.set(body.idem_key, { ...body, id }); return json(200, { id, duplicate: false, message_id: 1 })
     }
+    const readError = readErrors.get(path)
+    if (readError != null) return json(readError, {})
     if (path.startsWith('/messages?')) {
       const rows = [...store.values()].filter(r => !url.searchParams.get('chat') || r.chat === url.searchParams.get('chat'))
         .filter(r => !url.searchParams.get('q') || r.body.includes(url.searchParams.get('q')!))
@@ -69,7 +72,7 @@ function fakeOnsen() {
     }
     return json(404, { error: 'no route' })
   }) as typeof fetch
-  return { f, store, events, calls, st }
+  return { f, store, events, calls, st, readErrors }
 }
 
 function client(dir: string, f: typeof fetch, o: { cred?: string | null; logs?: string[]; queryTimeoutMs?: number } = {}) {
@@ -347,6 +350,49 @@ describe('chat_history', () => {
     expect(await c.queryHistory({ id: '10' })).toContain('chat_id')
     expect(on.calls).toHaveLength(0)
     expect(await c.queryHistory({ id: '10', chat: '-10042' })).toContain('cached group message')
+  })
+
+  test.each([403, 404])('HTTP %i on the alias, its target or an explicit Onsen id explains the refusal without showing a cached copy', async status => {
+    const on = fakeOnsen(), c = client(tmp(), on.f)
+    c.recordMessage(inboundItem(AGENT, tgMsg(3114, 'cached copy'), 'cached copy'))
+    await c.syncNow(true)
+    const alias = `/alias/telegram/${AGENT}/${JOEY}/3114`
+    const start = on.calls.length
+    on.readErrors.set('/messages/1', status)
+    const direct = await c.queryHistory({ id: '#1' })
+    const target = await c.queryHistory({ id: '3114' })
+    on.readErrors.set(alias, status)
+    const scoped = await c.queryHistory({ id: 'tg:3114' })
+
+    for (const answer of [direct, target, scoped]) {
+      expect(answer).toContain(status === 403 ? '不在你看得到的對話裡' : '找不到這一則')
+      expect(answer).toMatch(/message_id.*純數字.*tg:N.*#N/)
+      expect(answer).not.toMatch(/Onsen 連不上|本機暫存|cached copy/)
+    }
+    expect(on.calls.slice(start).map(x => x.path)).toEqual(['/messages/1', alias, '/messages/1', alias])
+  })
+
+  test('a timed-out id lookup reports the timeout and shows the cached message from the selected chat', async () => {
+    const on = fakeOnsen(), c = client(tmp(), on.f, { queryTimeoutMs: 50 })
+    c.recordMessage(inboundItem(AGENT, tgMsg(3114, 'group', { chat: { id: -10042, type: 'supergroup' } }), 'group'))
+    c.recordMessage(inboundItem(AGENT, tgMsg(3114, 'DM'), 'DM'))
+    const other = new OnsenClient({ ...c.cfg, agent: 'eve' })
+    other.recordMessage(inboundItem('eve', tgMsg(3114, 'another agent’s DM'), 'another agent’s DM'))
+    other.recordEvent(outboundRecord('eve', { sender: 'main' }, 'editMessageText', { chat_id: JOEY, message_id: 3114, text: 'another edit' }, {})!.r as OnsenEvent)
+    on.st.hang = true
+    const answer = await c.queryHistory({ id: '3114' })
+    expect(answer.split('\n')[0]).toMatch(/Onsen 連不上.*秒內沒回應.*本機暫存/)
+    expect(answer).toEndWith('tg:3114\nDM')
+  })
+
+  test('HTTP 503 fetching a resolved id uses the spool, where only Telegram ids are known', async () => {
+    const on = fakeOnsen(), c = client(tmp(), on.f)
+    c.recordMessage(inboundItem(AGENT, tgMsg(3114, 'cached copy'), 'cached copy'))
+    await c.syncNow(true)
+    on.readErrors.set('/messages/1', 503)
+    expect(await c.queryHistory({ id: '3114' })).toMatch(/Onsen 連不上（HTTP 503）.*本機暫存[\s\S]*tg:3114\ncached copy$/)
+    on.st.status5xx = true
+    expect(await c.queryHistory({ id: '#3114' })).toMatch(/Onsen 連不上（HTTP 503）.*本機暫存[\s\S]*找不到 #3114。$/)
   })
 
   test('Onsen silent (no answer in time, down, or no credential): the local spool answers and says so', async () => {
