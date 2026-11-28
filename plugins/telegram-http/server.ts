@@ -4976,6 +4976,11 @@ async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
     if (edit && row.reason !== 'reassigned') { Lanes.editWaitingItem(item, String(payload.text ?? ''), row.updated_at); return }
     const arrived = await personArrived({ item, kind: 'person_message', seq: row.number, dedupe: 'item:' + row.id, payload })
     if (arrived.code !== 200) throw new Error('person delivery: HTTP ' + arrived.code)
+    if (arrived.json.dropped) {
+      const { given, gone } = await itemReceiver!.receive([item], false, true)
+      if (given.has(row.id)) itemReceiver!.report([item], 'completed', { response_message_ids: [] })
+      else if (!gone.has(row.id)) throw new Error('dropped person item not available: ' + row.id)
+    }
     return
   }
   if (row.kind === 'control') {

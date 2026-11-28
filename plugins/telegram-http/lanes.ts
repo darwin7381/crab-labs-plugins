@@ -2633,6 +2633,7 @@ function threadGate(t: Thread | null, ev: InEvent): { why: 'hop' | 'budget'; not
 // (341k tokens) and a second handoff after the stop. When a thread is stopped, its queued peer events become one ledger fyi each (they ride
 // the main's next digest, nobody is woken) and get no run. startRun checks it too, for what is restored from disk or comes back from a retry.
 function dropQueued(it: QItem, thread: string, why: string): void {
+  itemReceiver?.report(runEvents(it).flatMap(ev => ev.onsen_items ?? []), 'reassigned', { note: `對話線 ${thread} 已關閉（${why}），請主線接手。` })
   endRun(it, 'dropped', { why: `thread stopped (${why})` })
   events?.settleUnrun(it.ev.id, 'dropped', `router: thread stopped (${why})`)      // PL2: dropped, not met: nobody answered
   const more = it.extra?.length ? `（連同同時排進來的另外 ${it.extra.length} 則）` : ''
@@ -2646,6 +2647,8 @@ export function drainStoppedThread(thread: string, why: string): number {
   let n = 0
   for (const it of [...queue.values()]) {
     if (it.state !== 'queued' || !peerEventOf(it) || S.lanes[it.lane]?.thread !== thread) continue
+    // Item runs stay queued until startRun can take them for the hand-back.
+    if (runEvents(it).some(ev => ev.onsen_items?.length)) continue
     dropQueued(it, thread, why); n++
   }
   if (n) saveState()
@@ -5055,50 +5058,52 @@ function receivedRun(it: QItem, given: Set<string>, gone: Set<string>, receiver:
 }
 function startRun(it: QItem, acquired = false): void {
   const lane = S.lanes[it.lane]
-  if (!lane) {                                                             // 002w (A, gap 22): what its event set owes goes to the main
-    endRun(it, 'died', { why: 'lane gone' })
-    runEnded(undefined, it, { reason: 'gone', said: `車道 ${it.lane} 已經不在，事件 ${it.ev.id} 沒有車道處理。` })
-    saveState(); return
-  }
-  const th = S.threads[lane.thread]
+  const th = lane && S.threads[lane.thread]
   // WO-131: a mail lane's event is never refused for the budget (that refusal escalated nothing and the reminders after it vanished): a mail lane renewed by
   // its rule, or due for it now (its thread or its last run over a threshold, or the thread over the budget), hands the event to the current mail lane
-  if (lane.kind === 'mail' && (lane.rotated || (lane.status !== 'closed' && mailRotateWhy(lane)))) {
+  if (lane?.kind === 'mail' && (lane.rotated || (lane.status !== 'closed' && mailRotateWhy(lane)))) {
     const why = lane.rotated?.why ?? mailRotateWhy(lane)!
     endRun(it, 'moved', { why: `mail lane renewed: ${why}` })
     moveToMailLane(it, lane, why)
     return
   }
+  if (lane?.status === 'closed' && releaseClosedQueue(it)) return
+  const refs = runEvents(it).flatMap(ev => ev.onsen_items ?? [])
+  if (refs.length && !acquired) {
+    if (!itemReceiver?.mode.active) return
+    const receiver = itemReceiver
+    startingItems.add(it.lane)
+    void receiver.receive(refs, false, !lane || !!th?.stopped || !!th && threadFresh(th) >= THREAD_BUDGET).then(({ given, gone }) => {
+      if (it.state === 'queued' && !sessionBusy(it)) {
+        const received = receivedRun(it, given, gone, receiver)
+        if (received) startRun(received, true)
+      } else {
+        const taken = refs.filter(ref => given.has(ref.onsen_item_id))
+        if (!lane || lane.status === 'closed' || th?.stopped) receiver.report(taken, 'reassigned', { note: `${it.lane} 在收下這件事之前已關閉。` })
+        else receiver.report(taken, 'not_taken')
+      }
+    }).catch(e => D.log('warn', 'lanes: item take: ' + e)).finally(() => { startingItems.delete(it.lane) })
+    return
+  }
+  if (!lane) {                                                             // 002w (A, gap 22): what its event set owes goes to the main
+    itemReceiver?.report(refs, 'reassigned', { note: `車道 ${it.lane} 已不存在，請主線接手。` })
+    endRun(it, 'died', { why: 'lane gone' })
+    runEnded(undefined, it, { reason: 'gone', said: `車道 ${it.lane} 已經不在，事件 ${it.ev.id} 沒有車道處理。` })
+    saveState(); return
+  }
   if (th && threadFresh(th) >= THREAD_BUDGET) {
-    endRun(it, 'budget', { why: 'thread budget spent before the run', budget: budgetOf(lane.thread) })
     const text = `thread ${lane.thread} 已用 ${threadFresh(th)} token（新的輸入、快取寫入與輸出；快取重讀不算），超過預算 ${THREAD_BUDGET}；事件 ${it.ev.id} 不再開車道處理，升級主線。`
+    itemReceiver?.report(refs, 'reassigned', { note: text })
+    endRun(it, 'budget', { why: 'thread budget spent before the run', budget: budgetOf(lane.thread) })
     ledger({ lane: lane.id, thread: lane.thread, event: it.ev.id, kind: 'stop', text })
     runEnded(lane, it, { reason: 'budget', said: text })
     saveState(); return
   }
   if (th?.stopped && peerEventOf(it)) { dropQueued(it, th.id, th.stopped); saveState(); return }     // 002k (C5): the thread was stopped while this waited
   if (lane.status === 'closed') {                                          // PL7 (P21): its lane was closed while it waited: closed, and the one end
-    if (releaseClosedQueue(it)) return
     endRun(it, 'closed', { why: 'its lane was closed before it ran' })
     runEnded(lane, it, { reason: 'closed', said: `${lane.id} 在這件事開始處理之前被關閉了` })
     saveState(); return
-  }
-  const refs = runEvents(it).flatMap(ev => ev.onsen_items ?? [])
-  if (refs.length && !acquired) {
-    if (!itemReceiver?.mode.active) return
-    const receiver = itemReceiver
-    startingItems.add(lane.id)
-    void receiver.receive(refs).then(({ given, gone }) => {
-      if (it.state === 'queued' && lane.status !== 'closed' && !th?.stopped && !sessionBusy(it)) {
-        const received = receivedRun(it, given, gone, receiver)
-        if (received) startRun(received, true)
-      } else {
-        const taken = refs.filter(ref => given.has(ref.onsen_item_id))
-        if (lane.status === 'closed' || th?.stopped) receiver.report(taken, 'reassigned', { note: `${lane.id} 在收下這件事之前已關閉。` })
-        else receiver.report(taken, 'not_taken')
-      }
-    }).catch(e => D.log('warn', 'lanes: item take: ' + e)).finally(() => { startingItems.delete(lane.id) })
-    return
   }
   const runId = `${lane.id}.r${lane.runs + 1}`
   const token = randomBytes(24).toString('base64url')

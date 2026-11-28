@@ -3,6 +3,8 @@ import { randomUUID } from 'crypto'
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { Journal } from './lanes-state.ts'
+import { itemRef } from './onsen-items.ts'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
 import { startBotApiMock } from './test-fixtures/tg-bot-api-mock.ts'
 import { freePort, until } from './test-fixtures/tg-daemon.ts'
@@ -39,7 +41,7 @@ async function waitFor(ok: () => boolean | Promise<boolean>, ms = 5000) {
   while (!await ok() && Date.now() < end) await Bun.sleep(15)
   expect(await ok()).toBe(true)
 }
-async function daemon(env: Record<string, string> = {}, initialMode = 200, setup?: (root: string) => Record<string, string>) {
+async function daemon(env: Record<string, string> = {}, initialMode = 200, setup?: (root: string, f: ReturnType<typeof fakeItems>) => Record<string, string>) {
   const f = fakeItems(), root = mkdtempSync(join(tmpdir(), 'take-daemon-')), state = join(root, 'tg'), lanes = join(root, '.lanes')
   clean.push(async () => { try { await f.stop() } finally { rmSync(root, { recursive: true, force: true }) } })
   f.mode(initialMode)
@@ -47,7 +49,7 @@ async function daemon(env: Record<string, string> = {}, initialMode = 200, setup
   writeFileSync(join(state, 'access.json'), JSON.stringify({ dmPolicy: 'allowlist', allowFrom: ['1'], groups: {}, pending: {}, ackReaction: '' }))
   copyFileSync(join(import.meta.dir, 'lanes-router.fleet.json'), join(lanes, 'router.json'))
   const port = await freePort()
-  const settings = setup?.(root)
+  const settings = setup?.(root, f)
   const childEnv: Record<string, string | undefined> = {
     PATH: process.env.PATH, GIT_ALLOW_PROTOCOL: 'file', TMPDIR: root, HOME: join(root, 'home'), TELEGRAM_HTTP_PORT: String(port), TELEGRAM_STATE_DIR: state,
     AGENT_WORKSPACE_DIR: root, GENESIS_LANES: '1', LANES_AGENT: 'adam', ONSEN_HOST: 'Mac-Mini', ONSEN_TAKE: '*',
@@ -135,6 +137,43 @@ test('real daemon routes one unclaimed notification per album at count or 1.5 s 
   await waitFor(() => d.journal().some(l => l.edited_in_queue && l.notif.params.content === 'new content'))
   expect(d.f.calls.filter(c => c.path.endsWith('/take'))).toHaveLength(0)
 }, 10000)
+
+test('stopped and over-budget threads and a missing lane hand their queued items back', async () => {
+  const ids = ['stopped', 'budget', 'gone']
+  const d = await daemon({}, 200, (root, f) => {
+    const journal = new Journal(join(root, 'tg', 'lanes', 'state.jsonl'))
+    const lanes: Record<string, any> = {}, threads: Record<string, any> = {}
+    for (const id of ids) {
+      const row = f.add(id, 'call', { from: 'eve' }), lane = 'adam.worker.' + row.number
+      if (id !== 'gone') {
+        lanes[lane] = { id: lane, kind: 'worker', status: 'idle', thread: id, session_id: randomUUID(), runs: 0 }
+        threads[id] = { id, lane, fresh: id === 'budget' ? 1000 : 0, stopped: id === 'stopped' ? 'closed' : null }
+      }
+      journal.write('run', 'run-' + id, 'queued', { lane, event: id, attempt: 1, ev: { id, source: 'mesh', from: 'eve', text: id,
+        onsen_items: [itemRef(row)], notif: { method: 'notifications/claude/channel', params: {} } } })
+    }
+    writeFileSync(join(root, '.lanes', 'state.json'), JSON.stringify({ lanes, threads }))
+    return { LANES_THREAD_BUDGET: '500' }
+  })
+  for (const id of ids) {
+    await waitFor(() => d.f.history.some(h => h.item_id === id && h.body.outcome === 'reassigned'), 12000)
+    expect(d.f.rows.get(id)?.note).toBeTruthy()
+    expect(d.f.calls.filter(c => c.path.endsWith('/take') && c.body.item_ids.includes(id))).toHaveLength(1)
+  }
+}, 18000)
+
+test('a person item with no chat or a disallowed chat completes with no reply', async () => {
+  const d = await daemon()
+  const noChat = d.f.add('no-chat', 'message', { payload: {} })
+  const denied = d.f.add('denied')
+  denied.payload.client.chat = '12345'
+  for (const row of [noChat, denied]) {
+    await waitFor(() => row.state === 'completed')
+    expect(d.f.history.filter(h => h.item_id === row.id).map(h => h.body.response_message_ids)).toEqual([[]])
+  }
+  expect(d.log()).toContain('no Telegram chat')
+  expect(d.log()).toContain('not allowlisted')
+})
 
 test('daemon handles a control at dispatch and immediately completes a re-served done id', async () => {
   const d = await daemon({ C1_COMMAND_FAILURE: '1' })
