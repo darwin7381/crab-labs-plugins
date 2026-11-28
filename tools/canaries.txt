@@ -402,3 +402,6 @@ plugins/telegram-http/server.ts::/api/fleet/main-registry
 plugins/telegram-http/lanes-main.ts::resume_sent: cut.at
 plugins/telegram-http/lanes-main.ts::const probe = g?.state === 'walled' && (clear ?? 0) > Number(g.uw_clear_used ?? 0)
 plugins/telegram-http/lanes-main.ts::undelivered_since: previous?.undelivered_since ?? null
+# WO-215 (Sonn): /resume <n> from the daemon is an announced switch; the chosen session becomes the main
+plugins/telegram-http/lanes-main.ts::switchAnnounced(g.id)
+plugins/telegram-http/channel-bot-control.ts::if (!tmuxOverride) markSessionSwitch()

@@ -574,6 +574,28 @@ test('002v (/clear, Joey TG 7645): the main role belongs to the process: /clear 
   await killed({ ...g, sid: sid2 })
 })
 
+test('WO-215: /resume <n> from the daemon is an announced switch: the chosen session in the same process becomes the main; without the announcement an end is an end; a stray session is still refused', async () => {
+  await drained()
+  const g = await startMain()
+  const sid2 = randomUUID()
+  L.markSessionSwitch()                                                                    // channel-bot-control resumePickerInlineSwitch, before it drives the picker
+  await hook(g, 'SessionEnd', { reason: 'other' })                                         // /resume ends the session with reason other ...
+  expect(M().mainPhase()).toBe('idle')                                                     // ... which ends no gen while the switch is announced
+  const r = await L.__mainEvent({ event: 'SessionStart', pid: g.pid, session_id: sid2, source: 'resume' })
+  expect(r.accepted).toBe(true)
+  expect(M().mainSession()!.session_id).toBe(sid2)
+  expect(readFileSync(join(dir, 'main-expected'), 'utf8').trim()).toBe(sid2)              // the next launch resumes the chosen session
+  const id = await joey('切過去之後還收得到嗎？')
+  expect(state(id)).toBe('offered')                                                         // Joey's message reaches the chosen session
+  // the announcement is spent by that SessionStart: a later end of this process's session is an end, with no grace
+  await hook({ ...g, sid: sid2 }, 'SessionEnd', { reason: 'other' })
+  expect(M().mainPhase()).toBe('gone')
+  // a session from another process that nobody announced or expects is refused, as before
+  const r2 = await L.__mainEvent({ event: 'SessionStart', pid: g.pid + 7, session_id: randomUUID(), source: 'resume' })
+  expect(r2.accepted).toBe(false)
+  await killed({ ...g, sid: sid2 })
+})
+
 test('RBU2: a turn ends at its last Stop. After a Stop the gen is idle with stopped_prompt; a later event of that prompt (another Stop hook blocked it) puts it back in_turn; a new prompt is a new turn, nothing interrupted', async () => {
   await drained()
   const g = await startMain()

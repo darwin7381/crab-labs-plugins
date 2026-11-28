@@ -34,7 +34,7 @@ import {
   writeSync, fsyncSync, renameSync, unlinkSync, realpathSync,
 } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
-import { markDeliberateRestart } from './lanes.ts'
+import { markDeliberateRestart, markSessionSwitch } from './lanes.ts'
 import { homedir } from 'node:os'
 import { spawn } from 'node:child_process'
 
@@ -1750,6 +1750,8 @@ export async function resumePickerInlineSwitch(pickerIdx: number, tmuxOverride?:
   //
   // Sequence: Escape (dismiss any open dialog/picker) → wait → Ctrl-C
   // (interrupt any active turn) → wait → drive picker.
+  // WO-215: this process is about to end its session and start the chosen one: announce the switch so the main follows it (lanes off: nothing)
+  if (!tmuxOverride) markSessionSwitch()
   await runCommand(['tmux', 'send-keys', '-t', tmuxName, 'Escape'])
   await new Promise(r => setTimeout(r, 200))
   await runCommand(['tmux', 'send-keys', '-t', tmuxName, 'C-c'])

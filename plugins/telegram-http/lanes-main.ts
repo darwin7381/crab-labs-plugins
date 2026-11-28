@@ -236,6 +236,11 @@ export function createMain(E: MainEnv) {
   }
   /** the main's process is about to end for this reason (/restart and /kill_stuck: asked; /main renew: replaced) */
   function markEnd(reason: EndReason): void { if (cur) pendingEnd.set(cur, reason) }
+  // WO-215 (Chiron): a switch the daemon makes for a person (/resume <n> drives the picker in the same process): its SessionEnd ends no gen, like /clear's
+  const switching = new Map<string, number>()
+  function markSwitch(): void { if (cur) switching.set(cur, Date.now()) }
+  const SWITCH_MS = 60_000
+  const switchAnnounced = (id: string): boolean => Date.now() - (switching.get(id) ?? -Infinity) < SWITCH_MS
 
   // ------------------------------------------------------------------ WO-177 一: can the main take an item now (the status record)
   /** the status record's member state now (null: no record here) */
@@ -964,7 +969,8 @@ export function createMain(E: MainEnv) {
         // one (SessionStart source clear, a new session id). The process is the main ("a SessionStart from the process of the live gen is accepted").
         // Ending the gen here left no live gen: the new session was refused ("not the registered main") and nobody was the main until the TUI
         // restarted. A session that ends while its process goes on ends no gen; the end of an older session of this process is ignored.
-        if (String(b.reason ?? '') === 'clear' || (b.session_id && g.session_id && String(b.session_id) !== String(g.session_id))) return {}
+        // WO-215: the process going on is known from the hook (/clear: reason clear) or from the daemon itself (/resume <n>: it announced the switch)
+        if (String(b.reason ?? '') === 'clear' || switchAnnounced(g.id) || (b.session_id && g.session_id && String(b.session_id) !== String(g.session_id))) return {}
         endGen(g, pendingEnd.get(g.id) ?? 'exited'); return {}
       }
     }
@@ -998,6 +1004,7 @@ export function createMain(E: MainEnv) {
     // another session in the same process while a turn was open (a /clear, a /resume): the turn is over; its items are settled as at a gen's end
     if (same && same.state === 'in_turn' && same.prompt_id && !goesOn) capped = settle(same, items(r => (r.state === 'offered' || r.state === 'bound') && r.gen === same.id && r.prompt_id === same.prompt_id), 'session_start').capped
     const id = String(pid)
+    switching.delete(id)                                                    // WO-215: the announced switch has its session
     if (b.source === 'clear') work.delete(id)                               // 002w (B, 24a): the new session never saw that work
     // 002w (E, gap 13): the main's wall is an episode of the AGENT: a gen that ended walled hands its open episode to this one, whose first final Stop
     // ends it with the one wall-down notice (2a936a7: the episode ended with the gen, and Joey heard main-wall-up and never the recovery)
@@ -1207,7 +1214,7 @@ export function createMain(E: MainEnv) {
     return rs.map(r => r.id)
   }
 
-  return { wallDelivery, initMain, currentGen, mainPid, mainPhase, mainUp, mainSession, markEnd, enqueue, pump, renderPulled, mainEvent, streamOpened, tick, registryChanged, statusIdle, turnWork, turnStart, openTool,
+  return { wallDelivery, initMain, currentGen, mainPid, mainPhase, mainUp, mainSession, markEnd, markSwitch, enqueue, pump, renderPulled, mainEvent, streamOpened, tick, registryChanged, statusIdle, turnWork, turnStart, openTool,
     replaceQueued, mainCanTake, deliveryNow, statusChanged, items: (pred: (r: Row) => boolean = () => true) => items(pred) }
 }
 
