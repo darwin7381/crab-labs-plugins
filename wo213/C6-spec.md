@@ -4,7 +4,7 @@
 
 ## Epeius 的註冊清單
 
-下表是請註冊的固定成員代號。§2 規定小寫英數與連字號。代號取自 bot 名稱，去除 Telegram 的 bot 尾碼、轉小寫、底線轉連字號。部署時將表內代號明確配給各自的 daemon 和 bridge，沿用現有成員設定。每一列需要一個 `kind=agent` 成員、正確的 `machine`，以及只代表該成員的一份 mesh 憑證。
+下表是請註冊的固定成員代號。§2 規定小寫英數與連字號。代號取自 bot 名稱，去除 Telegram 的 bot 尾碼、轉小寫、底線轉連字號。部署時將表內代號明確配給該支 tg daemon（現有 `LANES_AGENT` 身分設定，與 `GENESIS_LANES` 分開）；bridge 從同一個安裝單元取得名稱。每一列需要一個 `kind=agent` 成員、正確的 `machine`，以及只代表該成員的一份 mesh 憑證。
 
 | 主機 | Telegram bot | 請註冊的成員 | 憑證交付對象 |
 |---|---|---|---|
@@ -13,7 +13,7 @@
 | MBP | `@SpaceX_Roamer_bot` | `spacex-roamer` | 該機 roamer-mbp 的 tg daemon |
 | MBP | `@SpaceY_Roamer_bot` | `spacey-roamer` | 該機 roamer2-mbp 的 tg daemon |
 
-Mac mini 的對照來自 `tg-dialogue/roamer-facts.md` §2。MBP 的兩組對照來自 `tg-dialogue/backfill/_other_machines.md:13`，daemon 名稱亦見 `CHANGELOG.md:87`。MBP 的目前 plist 與埠須在該機核對。每支 daemon 用現有的 `ONSEN_CREDENTIAL_FILE` 指向自己的檔案，以自己的身分讀 Items、take、report、送 observation、訊息、指令與 Action。Joey 的 Telegram 帳號已有 `joey` 對應。橋接用自己的橋接憑證，沿用每支 bot 現有的 token 和 access allowlist。成員註冊與切換是兩個步驟。
+Mac mini 的對照來自 `tg-dialogue/roamer-facts.md` §2。MBP 的兩組對照來自 `tg-dialogue/backfill/_other_machines.md:13`，daemon 名稱亦見 `CHANGELOG.md:87`。MBP 的目前 plist 與埠須在該機核對。每支 daemon 用現有的 `ONSEN_CREDENTIAL_FILE` 指向自己的檔案，以自己的身分讀 Items、take、report、送 observation、訊息、指令與 Action。Joey 的 Telegram 帳號已有 `joey` 對應，沿用 `ONSEN_OWNER` 與該帳號的對應。橋接用自己的橋接憑證，沿用每支 bot 現有的 token 和 access allowlist。成員註冊與切換是兩個步驟。
 
 ## 模式與交接
 
@@ -43,3 +43,13 @@ Mac mini 的對照來自 `tg-dialogue/roamer-facts.md` §2。MBP 的兩組對照
 > 漫遊者的 `in_session.session_id` 應報 Claude target UUID，還是報 `main` 並由兩段實際收到的內容驗證路由？寄件方預填 `main` 時，台架應查哪個欄位？
 
 `TICKET-connector-facts.md:115` 和 §5 的台架要能在 Onsen 的列上辨認 target A 和 B。`CONTRACT.md:217`、`CONTRACT.md:243` 對整份契約限定主線為 `main`、分身為完整編號。已定 14 把收件身分放在 `in_session`，已定 48 只在 Item 的原值為 null 時填入，已定 51 記錄人的訊息往往預填 `main`。因此即使採用 UUID，預填列也只能從當次 claim 或其事件核對實際去處。這是可觀察的 API 行為，會決定回報、observation 的身分對照與台架斷言。
+
+### 在基底重現
+
+| 本機實驗（同一個 target UUID） | `ef79d7a` 的結果 |
+|---|---|
+| 對 loopback fake 送 `POST …/items/take` 並帶 `session_id` | HTTP 400。省略該欄位後 HTTP 200。 |
+| 對預填 `main` 的列回報 `in_session` 並帶 UUID | fake 把 `Item.session_id` 和 `claim.session_id` 一起改為 UUID。這個 fake 的行為和已定 48 有差異。 |
+| 交給 C1 的 `Claims.bind`，登記同一個實際 UUID 與 turn，最後觸發 `finalStop` 並回報 idle、背景數 0 | 對外編號傳 `main` 時得到 `in_session → completed`。傳 UUID 時只有 `in_session`。 |
+
+這兩個編號在 C1 已經分開存。呼叫點 `lanes-main.ts:627` 傳 `main` 和 registry 的 session UUID；`onsen-claims.ts:114` 用兩者比對收工。若採 UUID，驗收還要核對 A 的 Stop 只能結束 A 收下的列。
