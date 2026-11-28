@@ -333,6 +333,50 @@ test('C4 a take recovered by its idempotency key reports the intervening auto-re
   expect(r.offers).toEqual([])
 })
 
+test.each(['PreToolUse', 'Stop'])('C4 the first %s binds the offered resume claim when UserPromptSubmit was lost', async first => {
+  const r = await accountCut()
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 }); await r.m.pump()
+  const did = r.offers[0].params.meta.did
+  expect(r.claims.owns(r.row.id)).toBe(true)
+  await r.hook(first, { prompt_id: 'by-claim', tool_name: 'Read', phase: 'final' })
+  await r.sync()
+  expect(r.outcomes(r.row.id)).toEqual(['in_session'])
+  expect(r.journal.get('msg', did)?.prompt_id).toBe('by-claim')
+  if (first !== 'Stop') await r.hook('Stop', { prompt_id: 'by-claim', phase: 'final' })
+  r.f.advance(REGISTRY_SETTLE_MS + 1); r.status('idle'); await r.sync()
+  expect(r.outcomes(r.row.id)).toEqual(['in_session', 'completed'])
+})
+
+test('C4 a late did whose re-take is blocked preserves the unrelated waiting resume', async () => {
+  const r = await accountCut()
+  r.client.stop()
+  r.mode.writeItem = write => r.client.recordItemWrite(write)
+  const prior = r.f.add('prior-claim')
+  await r.receiver.receive([itemRef(prior)])
+  r.claims.report(prior.id, 'cut')
+  const late = r.f.add('late-work', 'call'), did = r.enqueue(late)
+  expect(r.claims.blocked()).toBe(true)
+  await r.hook('UserPromptSubmit', { prompt_id: 'late', dids: [did] })
+  await r.sync(); await r.m.pump(); await r.sync()
+  expect(r.journal.get('msg', did)?.state).toBe('queued')
+  expect(r.outcomes(late.id)).toEqual([])
+  expect(r.row.state).toBe('waiting')
+  expect(r.f.calls.some(c => c.body.outcome === 'superseded')).toBe(false)
+})
+
+test.each(['item id', 'earlier did'])('C4 a prompt naming the %s binds the current receipt for that Item', async name => {
+  const r = await accountCut()
+  const row = r.f.add('named-work', 'call')
+  const old = r.enqueue(row)
+  r.journal.write('msg', old, 'done', { reason: 'old receipt' })
+  const current = r.enqueue(row)
+  await r.hook('UserPromptSubmit', { prompt_id: 'named', dids: [name === 'item id' ? row.id : old] })
+  await r.sync()
+  expect(r.outcomes(row.id)).toEqual(['in_session'])
+  expect(r.journal.get('msg', current)).toMatchObject({ state: 'bound', prompt_id: 'named' })
+  expect(r.row.state).toBe('waiting')
+})
+
 test('C4 a claimed offer without its did is superseded, while a turn opened by another item leaves the resume waiting', async () => {
   const claimed = await accountCut()
   claimed.setWall({ walled: false, clearedMs: Date.now() + 1000 })

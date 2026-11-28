@@ -10,7 +10,7 @@
 
 ## Claude Code 自己繼續
 
-`lanes-main.ts:857,914` 能分辨主線開了回合，以及哪一列實際交入。對同一段對話，沒有交入 item 的新回合會作廢還沒做完的 resume。子代理的 hook、session 註冊、重複錯誤通知都不足以證明主線自己繼續。claim 已有 in_session_at，或 M1 有 bound、done 記錄的 resume 已交入。背景通知回合與 final Stop 後等待 registry 結算的幾秒，都讓原 claim 正常完成。以 delivery id 辨認 resume 自己開的回合。
+`lanes-main.ts:857,914` 能分辨主線開了回合，以及哪一列實際交入。對同一段對話，沒有交入 item 的新回合會作廢還沒做完的 resume。子代理的 hook、session 註冊、重複錯誤通知都不足以證明主線自己繼續。claim 已有 in_session_at，或 M1 有 bound、done 記錄的 resume 已交入。背景通知回合與 final Stop 後等待 registry 結算的幾秒，都讓原 claim 正常完成。prompt 帶的 delivery id 可追到同一個 Onsen item id。補領失敗時仍能辨認是哪一列開的回合。若第一個 hook 是工具或 Stop，則以該代已交出的列和持有的 claim 綁定。
 
 保留中斷與 Onsen 列的關聯，以及尚未送達的寫入意圖。等待中的列用 `DELETE /v1/items/<id>`，送 `expected_version` 與 `outcome:"superseded"`。版本衝突時重讀該列。已領的用 C1 的 claim 與 report spool 送同一 outcome。兩者都成為 `cancelled/superseded`。建立、領走與 hook 可以交錯，重連後仍要保留作廢的決定。已定 55 的失敗數由 Onsen 計算，逾期後才到的中途回報只記事件。
 

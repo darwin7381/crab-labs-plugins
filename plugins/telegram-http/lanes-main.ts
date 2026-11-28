@@ -901,22 +901,32 @@ export function createMain(E: MainEnv) {
     tellCut(capped, 'gen_end')
     try { E.genChanged(null) } catch {}
   }
-  function beginTurn(g: Row, prompt: string, dids?: string[], failed = false): void {
+  function promptRefs(dids: string[]): Set<string> {
+    const ids = new Set(dids.flatMap(d => String(d).split(',')).map(s => s.trim()).filter(Boolean))
+    if (ids.size) for (const r of items(r => ids.has(r.id))) {
+      for (const ref of r.onsen_items ?? []) ids.add(ref.onsen_item_id)
+    }
+    return ids
+  }
+  function identifies(ids: Set<string>, r: Row): boolean {
+    return ids.has(r.id) || !!r.onsen_items?.some((ref: ItemRef) => ids.has(ref.onsen_item_id))
+  }
+  function beginTurn(g: Row, prompt: string, ids?: Set<string>, failed = false): void {
     if (g.prompt_id === prompt) return
     if (g.stopped_prompt === prompt) return continueTurn(g, prompt)
-    const ids = new Set((dids ?? []).flatMap(d => String(d).split(',')).map(s => s.trim()).filter(Boolean))
     const receiver = E.itemReceiver?.()
     const canBind = (r: Row) => {
-      const named = ids.has(r.id), resume = isResume(r)
-      if (resume && ((!named && !failed) || resumes.cancelling(r.onsen_items[0].onsen_item_id))) return false
+      const named = ids && identifies(ids, r), resume = isResume(r)
+      if (resume && (ids && !named || resumes.cancelling(r.onsen_items[0].onsen_item_id))) return false
       const offered = r.state === 'offered' && r.gen === g.id
-      const queued = r.state === 'queued' && forGen(r, g) && (named || failed && resume && inFlight.has(r.id))
+      const queued = r.state === 'queued' && forGen(r, g) && (named || !ids && resume && inFlight.has(r.id))
       return (offered || queued) && (!r.onsen_items || r.onsen_items.every((ref: ItemRef) => receiver?.claims.owns(ref.onsen_item_id)))
     }
     if (!failed && receiver) {
       syncResumes()
-      // An offered resume can still be in Claude's input queue while it starts its own turn.
-      if (g.resume_items && !items(r => canBind(r) && r.kind !== 'digest' && (!dids || ids.has(r.id))).length) resumes.supersede(g.session_id)
+      // A named delivery identifies this turn even when re-taking it failed. Without a prompt hook,
+      // an offered Item with its current claim identifies the delivery that reached this generation.
+      if (g.resume_items && !items(r => r.kind !== 'digest' && (ids ? identifies(ids, r) : canBind(r))).length) resumes.supersede(g.session_id)
     }
     if (g.prompt_id) cutTurn(g)                                     // a turn that never got Stop or StopFailure: its items ride this turn (pull, WO-157c)
     outputs.clear(); calls.clear(); openTools.delete(g.id)                                          // the aids look at this prompt's calls only
@@ -966,12 +976,14 @@ export function createMain(E: MainEnv) {
     if (p && (ev === 'PreToolUse' || ev === 'PostToolUse' || ev === 'Stop')) noteOutput(g, p, ev)
     switch (ev) {
       case 'UserPromptSubmit': {
-        if (p && b.dids?.length) {
-          const ids = new Set(b.dids.flatMap(id => String(id).split(',')))
-          const late = items(r => ids.has(r.id) && r.onsen_items && r.state === 'queued')
-          if (late.length) await receiveRows(late, true, () => currentGen() === g, true)
+        if (p) {
+          const ids = promptRefs(b.dids ?? [])
+          if (ids.size) {
+            const late = items(r => r.state === 'queued' && r.onsen_items && identifies(ids, r))
+            if (late.length) await receiveRows(late, true, () => currentGen() === g, true)
+          }
+          beginTurn(g, p, ids)
         }
-        if (p) beginTurn(g, p, b.dids)
         // lanes-golive (Chiron line8-delivery-20261122: on --resume a SessionStart hook's context reached the conversation in 25 of 334 resumes; startup, clear
         // and compact do get it): the main-only rules go with the session's first prompt (a typed one, or a delivered item's) when its SessionStart could
         // not carry them, and again after a compaction (PreCompact clears the mark). Once per session.
