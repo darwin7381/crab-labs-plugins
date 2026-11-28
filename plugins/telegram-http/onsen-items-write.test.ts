@@ -40,6 +40,19 @@ test('member creates one waiting item with its body, sender, times and refs; a r
   expect(f.rows.size).toBe(1)
 })
 
+test('rulings 8–9: omitted and null request fields yield the same nullable columns and flat formatted payload', async () => {
+  const { path, send } = member()
+  const required = { kind: 'resume', refs: [], body: { format: 'markdown', text: '**接著做**' } }
+  const optional = { session_id: null, waiter: null, not_before: null, deadline: null, expires_at: null }
+  for (const [key, fields] of [['omitted', {}], ['nulls', optional]] as const) {
+    const result = await send('POST', path, { ...required, ...fields }, key)
+    expect(result.status).toBe(201)
+    expect(result.data).toMatchObject({ ...optional, waiter: 'adam' })
+    expect(result.data.payload).toEqual({ format: 'markdown', text: '**接著做**' })
+    expect((await send('GET', '/v1/items/' + result.data.id)).data.payload).toEqual(result.data.payload)
+  }
+})
+
 test('the new item displays same-year and next-year deadlines in Taipei time', async () => {
   const { path, send } = member()
   const year = Number(new Intl.DateTimeFormat('en', { timeZone: 'Asia/Taipei', year: 'numeric' }).format(f.now()))
