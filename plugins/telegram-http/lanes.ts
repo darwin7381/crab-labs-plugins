@@ -2777,15 +2777,16 @@ export function effectiveClass(trigger: string, askedCls: string | undefined | n
   return row?.inherit === 'asking_run' && askedCls ? askedCls : trigger
 }
 
-function toThreadOwner(ev: InEvent, o: ThreadOwner, base: { rule: string }, mainThread = o.thread): Decision {
+function toThreadOwner(ev: InEvent, o: ThreadOwner, base: Pick<Decision, 'rule' | 'thread'>): Decision {
   const t = o.thread ? S.threads[o.thread] ?? null : null
   const quiet = stoppedQuiet(ev, t, o.owner)
   if (quiet) return quiet
   const gate = threadGate(t, ev)
   if (gate) return stopThread(ev, t, gate, o.owner)
   if (o.owner === 'main') {
+    const thread = o.thread ?? base.thread
     saveState()
-    return { ...base, target: 'main', note: `thread ${mainThread ?? '-'} belongs to main`, thread: mainThread ?? undefined }
+    return { ...base, target: 'main', note: `thread ${thread ?? '-'} belongs to main`, thread }
   }
   ev.cls = effectiveClass(ev.trigger!, o.cls)
   return dispatch(ev, S.lanes[o.owner], base)
@@ -2833,7 +2834,7 @@ async function applyRule(r: Rule, ev: InEvent): Promise<Decision> {
         text: `${ev.from}${o ? `（回覆 ${o.owner} 的提問）` : ''}：${ev.text.slice(0, 300)}`,
         refs: { btcc_msg_id: ev.btcc_msg_id ?? null, ...(o ? { answers: o.owner } : {}) } })
       if (o && ev.urgency !== 'silent') {
-        const d = toThreadOwner(ev, o, base, thread)
+        const d = toThreadOwner(ev, o, { ...base, thread: thread ?? undefined })
         // M1 offers an item while its delivery is open. Finishing the main turn meets it without a reply.
         if (d.target === 'main' && record && !record.obligations?.some((ob: Ob) => ob.kind === 'main')) {
           events.add(ev.id, { kind: 'main', level: 'handed', owner: 'main' })

@@ -71,18 +71,23 @@ test('Codex’s first answer supplies its thread and wakes the idle main with no
 test('a peer answer to an open lane’s call is queued for that lane with nothing owed', async () => {
   const { lane, thread, reply_to_id } = laneCall(1, 'idle')
   const ev = answer('open', { reply_to_id })
-  expect(await L.routeEvent(ev)).toMatchObject({ rule: 'mesh-no-reply', target: 'lane', lane })
+  expect(await L.routeEvent(ev)).toMatchObject({ rule: 'mesh-no-reply', target: 'lane', lane, thread })
   expect(L.__journal().rows('run', r => r.event === ev.id)).toMatchObject([{ state: 'queued', lane, ev: { no_reply: true } }])
   expect(L.__events().get(ev.id)).toMatchObject({ answers: lane, thread, obligations: [] })
   expect(items(ev.id)).toHaveLength(0)
 })
 
 test('a peer answer to a closed lane’s call goes to the main', async () => {
-  const { reply_to_id } = laneCall(2, 'closed')
+  const { reply_to_id, thread } = laneCall(2, 'closed')
   const ev = answer('closed', { reply_to_id })
-  expect(await L.routeEvent(ev)).toMatchObject({ target: 'main', note: 'lane missing/closed → main' })
+  expect(await L.routeEvent(ev)).toMatchObject({ target: 'main', note: 'lane missing/closed → main', thread })
   expect(items(ev.id)).toHaveLength(1)
   expect(L.__events().mainObs(ev.id)).toEqual([])
+  state.outbound[reply_to_id].thread = null
+  const later = answer('closed-fresh-thread', { reply_to_id, thread: 'eve#t-de03' })
+  expect(await L.routeEvent(later)).toMatchObject({ target: 'main', thread: later.thread })
+  expect(state.threads[later.thread!]).toBeUndefined()
+  expect(state.outbound[reply_to_id].thread).toBeNull()
 })
 
 test('a no_reply notice with no thread or reply_to_id stays in the ledger', async () => {
