@@ -576,15 +576,25 @@ async function reportCommands(): Promise<void> {
   if (r && r.status >= 200 && r.status < 300) { commandsPut = key; log('info', `connector: ${commands.length} command(s) reported to Onsen (the client's command menu)`) }
   else log('warn', `connector: the command list was not taken by Onsen (${Connector.why(r)}); tried again in a minute`)
 }
+const failedCommandChats = new Set<string>()
 /** Telegram identifies groups by chat id. An Onsen-only chat can also be a direct conversation. */
 async function authorizedCommandChat(chat: string, sender?: string, target?: string): Promise<'direct' | 'group' | undefined> {
   const web = Connector.ONSEN_CHAT.exec(chat)
   if (!web && !chat.startsWith('-')) return 'direct'
   if (web) {
     const r = await onsen?.request('GET', `/v1/conversations/${encodeURIComponent(web[1]!)}`, undefined, 3000).catch(() => null)
-    const kind = r?.status === 200 && r.json?.data?.kind
+    const kind = r?.status === 200 ? r.json?.data?.kind : undefined
+    if (!['direct', 'group', 'channel', 'call'].includes(kind)) {
+      if (!failedCommandChats.has(chat)) {
+        failedCommandChats.add(chat)
+        const why = r?.status === 200 ? 'unknown conversation kind' : r ? Connector.why(r) : 'no response'
+        log('warn', `connector: could not determine the kind of ${chat} (${why}). Delivering as text and retrying the lookup on the next command`)
+      }
+      return
+    }
+    failedCommandChats.delete(chat)
     if (kind === 'direct') return 'direct'
-    if (kind !== 'group' && kind !== 'channel') return
+    if (kind === 'call') return
   }
   if (target && sender && sender === connectorOwner() && target.toLowerCase() === (await bridgeBotName()).toLowerCase()) return 'group'
 }

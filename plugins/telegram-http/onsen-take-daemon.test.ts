@@ -221,18 +221,43 @@ test('a group /clear reaches the control handler only from the owner and address
   expect(ordinary.map(row => row.state)).toEqual(ordinary.map(() => 'waiting'))
 })
 
+function webCommand(d: Awaited<ReturnType<typeof daemon>>, id: string, cid: string, from: string, text: string) {
+  return d.f.add(id, 'message', { from, message_id: id, payload: {
+    conversation_id: cid, message_id: id, from, via: 'web', kind: 'command', text, client: null,
+  } })
+}
+
 test('an Onsen group requires the owner and its bot name, while a direct chat keeps its command handler', async () => {
   const d = await daemon({ ONSEN_OWNER: 'joey' })
   d.f.conversations.set('51', 'group'); d.f.conversations.set('52', 'direct')
-  const command = (id: string, cid: string, from: string, text: string) => d.f.add(id, 'message', { from, message_id: id, payload: {
-    conversation_id: cid, message_id: id, from, via: 'web', kind: 'command', text, client: null,
-  } })
-  const guest = command('101', '51', 'tg-42', '/help@lab_a_bot'), bare = command('102', '51', 'joey', '/help')
-  const owner = command('103', '51', 'joey', '/help@lab_a_bot'), direct = command('104', '52', 'tg-42', '/help')
+  const guest = webCommand(d, '101', '51', 'tg-42', '/help@lab_a_bot'), bare = webCommand(d, '102', '51', 'joey', '/help')
+  const owner = webCommand(d, '103', '51', 'joey', '/help@lab_a_bot'), direct = webCommand(d, '104', '52', 'tg-42', '/help')
   await waitFor(() => owner.state === 'completed' && direct.state === 'completed')
   expect([guest.state, bare.state]).toEqual(['waiting', 'waiting'])
   expect(d.journal().filter(r => r.onsen_items && r.notif).map(r => r.notif.params.content)).toEqual(['/help@lab_a_bot', '/help'])
   expect(d.f.calls.filter(c => c.path === '/v1/messages').map(c => c.body.conversation_id)).toEqual(['51', '52'])
+})
+
+test('web command lookup failures log once and the next command runs after recovery', async () => {
+  const d = await daemon()
+  const cid = '51', path = '/v1/conversations/' + cid
+  const command = (id: string) => webCommand(d, id, cid, 'joey', '/help')
+  const plain = () => d.journal().filter(r => r.rec === 'msg' && r.notif && r.onsen_items)
+  const warnings = () => d.log().split('\n').filter(l => l.includes('could not determine the kind of onsen:51'))
+  command('first'); command('second')
+  await waitFor(() => plain().length === 2)
+  expect(plain().map(r => r.notif.params.content)).toEqual(['/help', '/help'])
+  expect(warnings()).toHaveLength(1)
+  expect(warnings()[0]).toContain('HTTP 404')
+  expect(d.f.calls.filter(c => c.path === path)).toHaveLength(2)
+  expect(d.f.calls.filter(c => c.path === '/v1/messages')).toHaveLength(0)
+  d.f.conversations.set(cid, 'direct')
+  const third = command('third')
+  await waitFor(() => third.state === 'completed')
+  expect(d.f.calls.filter(c => c.path === path)).toHaveLength(3)
+  expect(d.f.calls.filter(c => c.path === '/v1/messages')).toHaveLength(1)
+  expect(plain()).toHaveLength(2)
+  expect(warnings()).toHaveLength(1)
 })
 
 test('a missing owner and a missing group sender cannot authorize an addressed command', async () => {
