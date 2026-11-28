@@ -128,7 +128,8 @@ async function activePerson(id: string) {
   expect(row.state).toBe('claimed')
   const offer = offers.find(n => n.content.includes(row.id))
   await hook('UserPromptSubmit', { dids: [offer.meta.did] })
-  await waitFor(() => row.claim?.session_id === 'main')
+  await waitFor(() => row.claim?.session_id === sid)
+  expect(row.session_id).toBe('main')
   const stop = async () => {
     await hook('Stop', { phase: 'final' })
     await Bun.sleep(3100)
@@ -741,7 +742,7 @@ test('roamer switches between two live streams in one cwd, binds on intake and c
   await waitFor(() => one.claim?.session_id === a.sid)
   expect(one.session_id).toBe('main')
   b.select()
-  const two = d.f.add('second')
+  const two = d.f.add('second', 'message', { session_id: null })
   await waitFor(() => b.got.length === 1)
   b.accept(b.got[0])
   await waitFor(() => two.claim?.session_id === b.sid)
@@ -775,7 +776,7 @@ test('roamer switches between two live streams in one cwd, binds on intake and c
 test('after a daemon restart a long turn still ends on its original target transcript', async () => {
   const d = await daemon(roamerEnv, 200, roamerState), a = await target(d), b = await target(d)
   a.select()
-  const row = d.f.add('carry turn')
+  const row = d.f.add('carry turn', 'message', { session_id: null })
   await waitFor(() => a.got.length === 1)
   a.accept(a.got[0])
   await waitFor(() => row.claim?.session_id === a.sid)

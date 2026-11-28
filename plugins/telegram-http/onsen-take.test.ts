@@ -295,7 +295,7 @@ test('a main session with no subagents directory completes at its settled Stop',
   await r.bind(row)
   await r.hook('Stop', { phase: 'final' })
   r.f.advance(REGISTRY_SETTLE_MS)
-  r.claims.statusRecord('idle', sid => registry.backgroundAgents(sid), REGISTRY_SETTLE_MS)
+  r.claims.statusRecord(r.sid, 'idle', sid => registry.backgroundAgents(sid), REGISTRY_SETTLE_MS)
   await r.sync()
   expect(r.outcomes(row.id)).toEqual(['in_session', 'completed'])
 })
@@ -336,7 +336,7 @@ test('claim invariant after every idle, busy and walled main transition', async 
     const held = [...r.f.rows.values()].filter(row => row.state === 'claimed')
     expect(r.claims.held().sort()).toEqual(held.map(row => row.id).sort())
     for (const row of held) {
-      if (row.in_session_at) expect(row.claim!.session_id).toBe('main')
+      if (row.in_session_at) expect(row.claim!.session_id).toBe(r.sid)
       else {
         const offered = r.m.items(it => it.state === 'offered' && it.onsen_items?.some((ref: any) => ref.onsen_item_id === row.id))
         expect(offered).toHaveLength(1)

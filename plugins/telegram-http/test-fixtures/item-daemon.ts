@@ -37,7 +37,7 @@ if (process.env.C6_FAST_PROBE === '1') {
   const { TakeMode } = await import('../onsen-take.ts')
   const pause = TakeMode.prototype.pause
   spyOn(TakeMode.prototype, 'pause').mockImplementation(function (reason, ms) {
-    return pause.call(this, reason, reason === 'mode probe did not return 200' ? 1500 : ms)
+    return pause.call(this, reason, reason.startsWith('mode probe:') ? 1500 : ms)
   })
 }
 const transport = globalThis.fetch
