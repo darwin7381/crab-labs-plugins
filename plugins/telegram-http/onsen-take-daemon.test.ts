@@ -393,6 +393,100 @@ function scriptedLane(root: string) {
 import capturedPage from './test-fixtures/onsen-0.40.0/list-completed.json'
 const capturedPerson = capturedPage.items.find(it => it.kind === 'message')!
 const worker = 'adam.worker.1'
+test('C5 bench: the main reply tool writes one timed promise for the test account and a report at minute five produces no waiter notice', async () => {
+  const jev = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => Response.json({ answers: { promises: { type: 'noul', noul: 0.99 } } }) })
+  clean.push(async () => { await jev.stop(true) })
+  const chat = '6736970916', said = '10 分鐘後回報'
+  const d = await daemon({ TYPESAFE_API_KEY: 'test', TYPESAFE_BASE_URL: 'http://127.0.0.1:' + jev.port }, 200, root => {
+    writeFileSync(join(root, 'tg', 'access.json'), JSON.stringify({ allowFrom: [chat], groups: {}, pending: {} }))
+    return {}
+  })
+  await waitFor(() => d.log().includes('onsen take: started'))
+  const client = new Client({ name: 'c5-test-main', version: '1' }, { capabilities: {} })
+  clean.push(() => client.close())
+  await client.connect(new StreamableHTTPClientTransport(new URL(d.base + '/mcp')))
+  const at = Date.now()
+  const r = await client.callTool({ name: 'reply', arguments: { chat_id: chat, text: said } })
+  expect(r.isError).not.toBe(true)
+  expect(d.f.calls.filter(c => c.path === '/v1/messages' && c.body.body === said)).toHaveLength(1)
+  await waitFor(() => [...d.f.rows.values()].some(r => r.kind === 'self'))
+  const promises = [...d.f.rows.values()].filter(r => r.kind === 'self')
+  expect(promises).toHaveLength(1)
+  const row = promises[0]!
+  expect(row).toMatchObject({ from: 'adam', waiter: 'joey-test', session_id: 'main', deadline: null, state: 'waiting' })
+  const due = Date.parse(row.not_before!)
+  expect(due).toBeGreaterThanOrEqual(at + 600_000)
+  expect(due).toBeLessThanOrEqual(Date.now() + 600_000)
+  d.f.advance(due - d.f.now() - 300_000)
+  const report = await client.callTool({ name: 'reply', arguments: { chat_id: chat, text: '已經完成，這是結果。' } })
+  expect(report.isError).not.toBe(true)
+  d.f.advance(300_001); d.f.advance(60_000)
+  const notices = [...d.f.rows.values()].filter(r => r.about_item_id === row.id)
+  expect(notices).toHaveLength(0)
+})
+
+test('C5 routes self text only from payload.text', async () => {
+  const d = await daemon({})
+  const fields = { from: 'adam', session_id: 'main' }
+  d.f.add('top-level', 'self', { ...fields, payload: { text: 'visible item text', body: { text: 'nested decoy' } } })
+  d.f.add('nested-only', 'self', { ...fields, payload: { body: { text: 'nested decoy' } } })
+  const deliveries = () => d.journal().filter(r => r.rec === 'msg' && r.onsen_items?.some((i: any) => ['top-level', 'nested-only'].includes(i.onsen_item_id)))
+  await waitFor(() => new Set(deliveries().flatMap(r => r.onsen_items.map((i: any) => i.onsen_item_id))).size === 2)
+  const contents = JSON.stringify(deliveries().map(r => r.notif))
+  expect(contents).toContain('visible item text')
+  expect(contents).not.toContain('nested decoy')
+})
+
+test('C5 active connector schedules its own keepwarm with the legacy local switch off, including across restart', async () => {
+  const at = Date.now() - 120_000, sid = randomUUID(), ts = (ms: number) => new Date(at + ms).toISOString()
+  const d = await daemon({}, 200, root => {
+    writeFileSync(join(root, '.lanes', 'main-expected'), sid)
+    writeFileSync(join(root, sid + '.jsonl'), [
+      { type: 'user', timestamp: ts(0), message: { content: '做這件事' } },
+      { type: 'api-request', timestamp: ts(1000), querySource: 'repl_main_thread' },
+      { type: 'assistant', timestamp: ts(2000), message: { model: 'fixture', usage: { cache_read_input_tokens: 1000 } } },
+      { type: 'system', subtype: 'turn_duration', timestamp: ts(3000) },
+    ].map(entry => JSON.stringify(entry)).join('\n'))
+    return { KEEPWARM_PROJECTS_DIR: root }
+  })
+  await waitFor(() => [...d.f.rows.values()].some(r => r.kind === 'keepwarm'))
+  const [row] = d.f.rows.values()
+  expect(row).toMatchObject({ kind: 'keepwarm', from: 'adam', session_id: 'main', not_before: ts(1000 + 50 * 60_000), deadline: null })
+  await d.restart()
+  await waitFor(() => d.f.calls.filter(c => c.query.get('kind') === 'keepwarm').length >= 2)
+  expect(d.f.calls.filter(c => c.body.kind === 'keepwarm')).toHaveLength(1)
+  expect(row!.state).toBe('waiting')
+})
+
+test('C5 converts a saved followup and delivers its self Item once to the original worker', async () => {
+  const thread = 'adam#check', event = 'prior-run', id = 'fu-old', due = Date.now() + 3500
+  const d = await daemon({}, 200, root => {
+    const last = new Date().toISOString()
+    writeFileSync(join(root, '.lanes', 'state.json'), JSON.stringify({
+      lanes: { [worker]: { id: worker, kind: 'worker', n: 1, session_id: randomUUID(), thread, status: 'idle',
+        created: last, last, transcript: join(root, 'worker.jsonl'), runs: 0, tokens_in: 0, tokens_out: 0 } },
+      threads: { [thread]: { id: thread, lane: worker, peer: 'eve', hops: 0, tokens: 0, created: last, last } },
+      followups: { [id]: { id, thread, lane: worker, event, from: 'eve', cls: 'peer', trigger: 'peer', run_id: null,
+        after_minutes: 10, note: '重查狀態', created: last, due, due_iso: new Date(due).toISOString(), state: 'pending', chain: 1 } },
+    }))
+    return scriptedLane(root)
+  })
+  await waitFor(() => [...d.f.rows.values()].some(r => r.kind === 'self'))
+  const rows = [...d.f.rows.values()].filter(r => r.kind === 'self')
+  expect(rows).toHaveLength(1)
+  const row = rows[0]!
+  expect(d.f.calls.find(c => c.key === id)!.body).not.toHaveProperty('waiter')
+  expect(row.refs).toEqual([])
+  await d.restart()
+  expect(row).toMatchObject({ session_id: worker, waiter: 'adam', not_before: new Date(due).toISOString(), deadline: null, state: 'waiting' })
+  d.f.advance(due - d.f.now() + 1)
+  await waitFor(() => d.f.history.some(h => h.item_id === row.id && h.body.outcome === 'in_session'))
+  expect(d.journal().filter(r => r.rec === 'run' && r.state === 'queued' && r.ev?.followup === id)).toHaveLength(1)
+  writeFileSync(join(d.root, 'release-lane'), '')
+  await waitFor(() => row.state === 'completed')
+  expect(d.f.history.filter(h => h.item_id === row.id).map(h => h.body.outcome)).toEqual(['in_session', 'completed'])
+}, 15000)
+
 async function laneHook(root: string, n: number, event: string) {
   const file = join(root, 'hook-' + n)
   writeFileSync(file, event)

@@ -26,7 +26,8 @@ export type ClaimStore = {
 export class ItemReceiver {
   private refused = new Map<string, { version: number; rides: boolean }>()
   private requesting = new Set<string>()
-  constructor(readonly mode: TakeMode, readonly claims: ClaimStore, readonly dueAt: (time: string) => void, readonly revisit?: () => void) {}
+  constructor(readonly mode: TakeMode, readonly claims: ClaimStore, readonly dueAt: (time: string) => void, readonly revisit?: () => void,
+    readonly currentKeepwarm?: (due?: string) => boolean) {}
 
   report(refs: ItemRef[], outcome: Outcome, fields?: ReportFields): void {
     for (const ref of refs) this.claims.report(ref.onsen_item_id, outcome, fields)
@@ -49,7 +50,12 @@ export class ItemReceiver {
       const ref = byId.get(id)!, refusal = this.refused.get(id)
       if (refusal && ref.onsen_version <= refusal.version && !(refusal.rides && leads.has(ref.from))) return false
       this.refused.delete(id)
-      return !this.claims.owns(id)
+      if (this.claims.owns(id)) return false
+      if (ref.kind === 'keepwarm' && this.currentKeepwarm && !this.currentKeepwarm(ref.not_before)) {
+        result.gone.add(id)
+        return false
+      }
+      return true
     }).slice(0, 100)
     if (!need.length) return result
     for (const id of need) this.requesting.add(id)

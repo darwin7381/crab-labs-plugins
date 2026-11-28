@@ -85,6 +85,7 @@ export type StatusFact = { idem_key: string; agent: string; state: StatusState; 
 export type FormAck = { ids: number[]; at: string }
 /** fw (WO-190, local only, never posted): this message's files are being stored in Onsen; the sync joins their ids when it sends the line */
 import type { ItemReport } from './onsen-receive.ts'
+import { ItemWrites, type ItemWrite } from './onsen-item-writes.ts'
 export type SpoolLine = { k: 'm'; r: OnsenItem; fw?: 1 } | { k: 'e'; r: OnsenEvent } | { k: 'l'; r: RestartLineDraw } | { k: 'u'; r: RestartLineLift }
   | { k: 'd'; r: DeliveryFact } | { k: 's'; r: StatusFact } | { k: 'a'; r: FormAck } | { k: 'w'; r: WakeItem }
   /** WO-164: one thread event (lanes-threads.ts OnsenThreadEvent), POST /threads/events */
@@ -92,11 +93,12 @@ export type SpoolLine = { k: 'm'; r: OnsenItem; fw?: 1 } | { k: 'e'; r: OnsenEve
   /** WO-175: one moment of a Call this agent received (onsen-status.ts CallFacts), PUT /v1/calls/<id>/state */
   | { k: 'c'; r: CallStateLine | ScheduledResultLine }
   | { k: 'ir'; r: ItemReport }
+  | { k: 'item' | 'self'; r: ItemWrite } // self = spool entries written before the shared Item writer
   | { k: 'blocked'; r: BlockedReceipt }
   /** WO-192: what Telegram did with a reply written into Onsen first (onsen-first.ts), POST /messages/<message_id>/delivery */
   | { k: 'r'; r: DeliveryReportLine }
 type BlockedReceipt = ({ message_id: string } | { chat: string; client_msg_id: string }) & { retry_after: string | null }
-const SPOOL_KINDS = new Set(['ir', 'blocked', 'm', 'e', 'l', 'u', 'd', 's', 'a', 'w', 't', 'c', 'r'])
+const SPOOL_KINDS = new Set(['item', 'self', 'ir', 'blocked', 'm', 'e', 'l', 'u', 'd', 's', 'a', 'w', 't', 'c', 'r'])
 /** WO-192 (Onsen 0.31.0, WO-191 B): one delivery report: the Onsen message A wrote, and the body Onsen takes */
 export type DeliveryReportLine = { message_id: number
   body: { client: 'telegram'; state: 'sent' | 'failed'; client_msg_ids: string[]; at: string; error?: string } }
@@ -415,7 +417,7 @@ const headerName = (name: string): string => encodeURIComponent(name.replace(/[\
 /** a spool line's key for a log line: its record's idem_key (a Call state's `idem`; a delivery report's Onsen message), never its content */
 function lineKey(line: unknown): string {
   const l = line as any
-  return String(l?.r?.idem_key ?? l?.r?.idem ?? (l?.r?.message_id != null ? `delivery:${l.r.message_id}` : '?')).slice(0, 200)
+  return String(l?.r?.idem_key ?? l?.r?.idem ?? l?.r?.key ?? (l?.r?.message_id != null ? `delivery:${l.r.message_id}` : '?')).slice(0, 200)
 }
 /** what Onsen said in an error answer ({error: {code, message}}, or older shapes) */
 function callSaid(j: any): string {
@@ -427,6 +429,7 @@ export class OnsenClient {
   readonly spoolOld: string
   readonly cursorFile: string
   readonly rejected: string
+  private readonly itemWrites: ItemWrites
   readonly linesFile: string
   private running = false
   private again = false
@@ -465,7 +468,50 @@ export class OnsenClient {
       offset = lines[lines.length - 1]!.end
     }
   }
+
+  private *pendingLines(): Generator<SpoolLine> {
+    let offset = this.readCursor()
+    for (;;) {
+      const lines = this.unsent(offset)
+      if (!lines.length) break
+      for (const { line } of lines) if (line) yield line
+      offset = lines[lines.length - 1]!.end
+    }
+  }
   hasItemReports(): boolean { return this.itemReports > 0 }
+  mayWithdrawKeepwarm?: (row: import('./onsen-items.ts').InboxItem) => boolean
+  onItemCreateSettled?: (key: string, id?: string) => void
+  hasPendingItemCreate(keys: Set<string>): boolean {
+    for (const line of this.pendingLines()) {
+      if ((line.k === 'item' || line.k === 'self') && keys.has(line.r.key) && !line.r.outcome && !line.r.complete) return true
+    }
+    return false
+  }
+  *rejectedSelfCreates(): Generator<string> {
+    let lines: string
+    try { lines = readFileSync(this.rejected, 'utf8') }
+    catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return; throw e }
+    for (const raw of lines.split('\n')) {
+      if (!raw) continue
+      let line: SpoolLine | undefined
+      try { line = JSON.parse(raw).line } catch { continue }
+      if ((line?.k === 'item' || line?.k === 'self') && line.r.item.kind === 'self' && !line.r.outcome && !line.r.complete) yield line.r.key
+    }
+  }
+  writtenItemId(key: string): string | undefined { return this.itemWrites.id(key) }
+  recordItemWrite(write: ItemWrite): void {
+    if ((write.outcome || write.complete) && !write.id) {
+      const id = this.writtenItemId(write.key)
+      if (id) write = { ...write, id }
+      else if (this.hasPendingItemCreate(new Set([write.key]))) write = { ...write, pending_create: true }
+    }
+    if (write.id && write.outcome === 'withdrawn' && write.item.kind === 'keepwarm') {
+      for (const line of this.pendingLines()) {
+        if (line.k === 'item' && line.r.id === write.id && line.r.outcome === write.outcome && line.r.expected_version === write.expected_version) return
+      }
+    }
+    if (!this.append({ k: 'item', r: write })) throw new Error('could not record the Onsen Item')
+  }
   recordItemReport(line: ItemReport): boolean {
     if (!this.append({ k: 'ir', r: line })) return false
     if (!this.itemReports) this.nextTryAt = 0 // let the first report past a non-report's backoff
@@ -494,6 +540,7 @@ export class OnsenClient {
     this.reportedThrough = this.readCursor('reportedThrough')
     this.rejected = join(cfg.dir, 'rejected.jsonl')
     this.linesFile = join(cfg.dir, 'lines.json')
+    this.itemWrites = new ItemWrites(join(cfg.dir, 'item-ids'), cfg.agent, this.request.bind(this))
   }
   private get f(): typeof fetch { return this.cfg.fetch ?? fetch }
 
@@ -812,13 +859,14 @@ export class OnsenClient {
   }
   /** WO-145: one call to Onsen with this agent's credential (null: no credential); throws on a network error or the timeout. `headers` (WO-176): extra
    *  request headers (an Idempotency-Key) */
-  async request(method: 'GET' | 'POST' | 'PUT', path: string, body?: unknown, timeoutMs = 15_000, headers?: Record<string, string>, cancel?: AbortSignal): Promise<{ status: number; json: any } | null> {
+  async request(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown, timeoutMs = 15_000, headers?: Record<string, string>, cancel?: AbortSignal): Promise<{ status: number; json: any } | null> {
     const cred = this.cfg.credential()
     if (!cred) return null
     if (method === 'POST') return this.post(path, body ?? {}, cred, timeoutMs, headers)
     if (method === 'PUT') return this.put(path, body ?? {}, cred, timeoutMs)      // WO-197: the connector's edit (PUT /v1/messages/<id>)
     const timeout = AbortSignal.timeout(timeoutMs)
-    const r = await this.f(`${this.cfg.base}${path}`, { headers: this.headers(cred, headers), signal: cancel ? AbortSignal.any([cancel, timeout]) : timeout })
+    const r = await this.f(`${this.cfg.base}${path}`, { method, headers: this.headers(cred, headers), body: method === 'DELETE' ? JSON.stringify(body) : undefined,
+      signal: cancel ? AbortSignal.any([cancel, timeout]) : timeout })
     let json: any = null
     try { json = await r.json() } catch {}
     return { status: r.status, json }
@@ -896,7 +944,11 @@ export class OnsenClient {
   private async pass(): Promise<void> {
     const fifo = this.unsent()
     const todo = this.itemReports ? [...this.pendingReports(), ...fifo] : fifo
-    if (!todo.length) { this.rotateIfDrained(); return }
+    if (!todo.length) {
+      this.rotateIfDrained()
+      if (this.interval) await this.itemWrites.reconcile()
+      return
+    }
     const cred = this.cfg.credential()
     if (!cred) {
       if (Date.now() - this.credWarnAt > HOUR) {
@@ -967,6 +1019,17 @@ export class OnsenClient {
         this.writeCursor(t.end); this.ok(); i++
         continue
       }
+      if (t.line.k === 'item' || t.line.k === 'self') {
+        const path = '/v1/members/' + encodeURIComponent(this.cfg.agent) + '/items'
+        const r = await this.itemWrites.sync(path, t.line.r, this.mayWithdrawKeepwarm).catch(e => ({ status: 0, json: { error: errText(e) } }))
+        if (!r) return
+        if (r.status >= 200 && r.status < 300) this.stats.posted++
+        else if (refusedForGood(r)) this.reject(t.line, `${t.line.r.item.kind} Item: HTTP ${r.status} ${callSaid(r.json)}`, { kind: 'item', path, status: r.status, code: errCode(r.json) })
+        else return this.failStatus(r, path)
+        if (!t.line.r.outcome && !t.line.r.complete) this.onItemCreateSettled?.(t.line.r.key, r.status < 300 ? r.json?.data?.id : this.itemWrites.id(t.line.r.key))
+        this.writeCursor(t.end)
+        this.ok(); i++; continue
+      }
       if (t.line.k === 'ir') {
         // The FIFO cursor can now pass a report acknowledged ahead of a stuck record.
         if (t.end <= this.reportedThrough) { this.writeCursor(t.end); i++; continue }
@@ -981,6 +1044,7 @@ export class OnsenClient {
           else if (refusedForGood(r)) this.reject(t.line, `PUT ${path}: HTTP ${r.status} ${callSaid(r.json)}`, { kind: 'ir', path, status: r.status, code })
           else return this.failStatus(r, path)
         }
+        if (ok) this.itemWrites.observe(r.json?.data)
         this.itemAck?.(line, ok)
         this.writeCursor(this.readCursor(), t.end)
         this.itemReports = Math.max(0, this.itemReports - 1)
