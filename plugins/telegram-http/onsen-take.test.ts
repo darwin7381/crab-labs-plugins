@@ -90,7 +90,7 @@ test('agent-inbox reports a pause once, including first start, and can resume pu
   expect(r.logs.filter(s => s.includes('on pull again'))).toHaveLength(1)
 })
 
-test('peek uses server time, waits without claiming and reads a gated row again on release', async () => {
+test('peek waits without claiming and reads a gated row again on release', async () => {
   const r = rig(), row = r.f.add('gate', 'call'), index = new Map<string, number>(), seen: string[] = []
   let held = true
   await r.mode.probe()
@@ -99,11 +99,37 @@ test('peek uses server time, waits without claiming and reads a gated row again 
   }, () => !r.claims.blocked())
   clean.push(() => { r.mode.stop(); peek.stop() })
   peek.reset(); await until(() => r.f.calls.some(c => c.query.has('changed_after')))
-  expect(r.f.calls.find(c => c.query.has('changed_after'))!.query.get('changed_after')).toBe(new Date(r.f.now()).toISOString())
   expect(index.size).toBe(0); expect(row.claim).toBeNull()
   held = false; peek.reset(); await until(() => index.has(row.id))
   r.f.change(row, 'edited'); await until(() => seen.includes('edit'))
   expect(r.f.calls.filter(c => c.path.endsWith('/take'))).toHaveLength(0)
+})
+
+test('peek echoes Onsen’s token and sees a transaction that commits after the previous as_of', async () => {
+  const r = rig(), seen: string[] = []
+  r.f.add('old')
+  r.f.advance(2000)
+  const startedAt = new Date(r.f.now()).toISOString()
+  r.f.advance(250)
+  await r.mode.probe()
+  const path = r.mode.path + '?connector=' + encodeURIComponent(r.mode.connector)
+  const page = (await r.mode.req('GET', path))!.json
+  expect(Date.parse(page.changed_after)).toBeLessThan(Date.parse(startedAt))
+  expect(Date.parse(startedAt)).toBeLessThan(Date.parse(page.as_of))
+  const peek = new ItemPeek(r.mode, () => new Map(), async it => { seen.push(it.id + '/' + it.version) }, () => true)
+  clean.push(() => { r.mode.stop(); peek.stop() })
+  const polls = () => r.f.calls.filter(c => c.query.has('wait') && c.query.has('changed_after'))
+  peek.reset()
+  await until(() => polls().length > 0)
+  expect(polls()[0].query.get('changed_after')).toBe(page.changed_after)
+  const late = r.f.add('late', 'message', { updated_at: startedAt })
+  expect(r.f.now()).toBeGreaterThan(Date.parse(page.as_of))
+  const overlap = (await r.mode.req('GET', path + '&' + new URLSearchParams({ changed_after: page.changed_after })))!.json
+  expect(overlap.items.map((it: InboxItem) => it.id)).toEqual(['late'])
+  await until(() => seen.includes('late/1') && polls().length >= 2)
+  r.f.change(late, 'edited')
+  await until(() => seen.includes('late/2'))
+  expect(seen).toEqual(['old/1', 'late/1', 'late/2'])
 })
 
 test('idle main takes before offer, binds, completes only after final Stop and idle with the conversation reply', async () => {
@@ -321,9 +347,15 @@ test('an inclusive timestamp shared by two pages does not route unchanged gated 
   const at = new Date(r.f.now()).toISOString()
   for (const row of rows) row.updated_at = at
   await r.mode.probe()
-  const peek = new ItemPeek(r.mode, () => new Map(), async row => { versions.push(row.id) }, () => true)
+  const first = (await r.mode.req('GET', r.mode.path + '?connector=' + encodeURIComponent(r.mode.connector)))!.json
+  const peek = new ItemPeek(r.mode, () => new Map(), async row => {
+    if (!versions.length) r.f.advance(100)
+    versions.push(row.id)
+  }, () => true)
   clean.push(() => { r.mode.stop(); peek.stop() })
   peek.reset()
   await until(() => r.f.calls.filter(c => c.query.has('changed_after') && c.query.has('cursor')).length >= 2)
+  expect(r.f.calls.filter(c => c.query.has('changed_after')).slice(0, 2).map(c => c.query.get('changed_after')))
+    .toEqual([first.changed_after, first.changed_after])
   expect(versions).toEqual(rows.map(row => row.id))
 })

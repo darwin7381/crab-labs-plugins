@@ -15,11 +15,11 @@ export function fakeItems() {
   const issued = new Set<string>(), reports = new Set<string>()
   const history: ItemReport[] = [], waiters = new Set<() => void>()
   let mode = 200, unavailable = false, holdReports = false, delayTake = 0
-  const page = (items: Row[], next_cursor: string | null = null) => Response.json({ api_version: '1', as_of: iso(now), viewer: 'adam', read_by: null, items, next_cursor })
   const detail = (data: unknown) => Response.json({ api_version: '1', as_of: iso(now), viewer: 'adam', read_by: null, data })
   const error = (status: number, code: string, extra = {}) => Response.json({ error: { code, message: code, retryable: status >= 500, ...extra } }, { status })
-  const change = (r: Row, kind: string, note = '') => {
-    r.version++; r.updated_at = iso(++now); r.events!.push({ kind, note })
+  const change = (r: Row, kind: string, note = '', updatedAt?: string) => {
+    now++
+    r.version++; r.updated_at = updatedAt ?? iso(now); r.events!.push({ kind, note })
     for (const wake of waiters) wake()
   }
   const expire = () => {
@@ -40,7 +40,7 @@ export function fakeItems() {
       half_done: false, not_before: null, deadline: null, expires_at: null, failures: 0, released: false, version: 0, events: [], claim: null,
       message_id: kind === 'message' ? 'm' + number : null, action_id: null, call_id: null, mail_id: null,
       answered: null, response_message_ids: [], in_session_at: null, updated_at: iso(now), payload, ...extra }
-    rows.set(id, row); change(row, 'created')
+    rows.set(id, row); change(row, 'created', '', extra.updated_at)
     return row
   }
   const eligible = (r?: Row) => !!r && r.state === 'waiting' && !(Date.parse(r.not_before ?? '') > now) && !(r.reason === 'parked' && !r.released)
@@ -66,7 +66,9 @@ export function fakeItems() {
       owner = connector; seen = now
     }
     if (path === base && req.method === 'GET') {
-      const select = () => [...rows.values()].filter(r => r.state === (q.get('state') ?? 'waiting') && r.updated_at >= (q.get('changed_after') ?? ''))
+      const after = q.get('changed_after')
+      const since = after === null ? -Infinity : Date.parse(after)
+      const select = () => [...rows.values()].filter(r => r.state === (q.get('state') ?? 'waiting') && Date.parse(r.updated_at) >= since)
       const wait = Number(q.get('wait'))
       const until = Date.now() + wait * 1000
       while (!select().length && Date.now() < until && !req.signal.aborted) await new Promise<void>(resolve => {
@@ -75,7 +77,9 @@ export function fakeItems() {
         waiters.add(wake); req.signal.addEventListener('abort', wake, { once: true })
       })
       const all = select(), start = Number(q.get('cursor')), end = start + Number(q.get('limit') ?? 50)
-      return page(all.slice(start, end), end < all.length ? String(end) : null)
+      return Response.json({ api_version: '1', as_of: iso(now), viewer: 'adam', read_by: null, items: all.slice(start, end),
+        next_cursor: end < all.length ? String(end) : null,
+        ...(connector ? { changed_after: iso(now - 1000).replace('Z', '+00:00') } : {}) })
     }
     if (req.method !== 'GET' && !key) return error(400, 'invalid_request')
     const idem = path + '|' + key

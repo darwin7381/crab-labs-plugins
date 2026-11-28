@@ -24,11 +24,11 @@ export function itemRef(it: InboxItem): ItemRef {
 
 export class ItemPeek {
   private generation = 0
-  private cursor?: string
+  private changedAfter?: string
   private page?: string
-  private pageTime?: string
+  private nextChangedAfter?: string
   private previous = new Map<string, number>()
-  private boundary = new Map<string, number>()
+  private seen = new Map<string, number>()
   private wakeAt = Infinity
   private due?: ReturnType<typeof setTimeout>
   private timer?: ReturnType<typeof setTimeout>
@@ -41,9 +41,9 @@ export class ItemPeek {
   reset(): void {
     this.generation++
     this.request?.abort()
-    this.cursor = this.page = this.pageTime = undefined
+    this.changedAfter = this.page = this.nextChangedAfter = undefined
     this.previous.clear()
-    this.boundary.clear()
+    this.seen.clear()
     clearTimeout(this.timer)
     if (this.mode.active && !this.reading) this.schedule(0)
   }
@@ -77,7 +77,7 @@ export class ItemPeek {
     try {
       if (!this.canRead()) { delay = 250; return }
       const q = new URLSearchParams({ state: 'waiting', wait: '25', connector: this.mode.connector, limit: '100' })
-      if (this.cursor) q.set('changed_after', this.cursor)
+      if (this.changedAfter) q.set('changed_after', this.changedAfter)
       if (this.page) q.set('cursor', this.page)
       this.request = new AbortController()
       const r = await this.mode.req('GET', this.mode.path + '?' + q, undefined, 35_000, undefined, this.request.signal)
@@ -89,26 +89,26 @@ export class ItemPeek {
           return
         }
       }
-      if (r?.status !== 200 || !Array.isArray(r.json.items) || !r.json.as_of) { delay = 2000; return }
+      if (r?.status !== 200 || !Array.isArray(r.json.items) || typeof r.json.changed_after !== 'string' || !r.json.changed_after) { delay = 2000; return }
       const known = this.index()
-      const asOf = this.pageTime ?? r.json.as_of
+      // Later pages can miss rows committed since page one. Resume from page one's token.
+      this.nextChangedAfter ??= r.json.changed_after
       for (const it of r.json.items as InboxItem[]) {
         if (g !== this.generation || !this.canRead()) return
         if (it.not_before && Date.parse(it.not_before) > Date.now()) { this.dueAt(it.not_before); continue }
         const version = known.get(it.id)
         if (version === undefined || it.version > version) {
-          if (this.previous.get(it.id) !== it.version && this.boundary.get(it.id) !== it.version) await this.route(it, version !== undefined)
+          if (this.previous.get(it.id) !== it.version && this.seen.get(it.id) !== it.version) await this.route(it, version !== undefined)
         }
         if (g !== this.generation) return
-        if (Date.parse(it.updated_at) >= Date.parse(asOf)) this.boundary.set(it.id, it.version)
+        this.seen.set(it.id, it.version)
       }
       // A dispatched control may lift a gate and reset the cursor while this page is being routed.
       if (g !== this.generation) return
-      this.pageTime = asOf
       this.page = r.json.next_cursor || undefined
       if (!this.page) {
-        this.cursor = asOf; this.pageTime = undefined
-        this.previous = this.boundary; this.boundary = new Map()
+        this.changedAfter = this.nextChangedAfter; this.nextChangedAfter = undefined
+        this.previous = this.seen; this.seen = new Map()
         if (r.json.items.length) delay = 100
       }
     } catch (err) { if (g === this.generation) this.mode.log('onsen take: peek failed: ' + err); delay = 2000 }
