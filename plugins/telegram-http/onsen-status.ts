@@ -51,7 +51,7 @@ export class DeliveryFacts {
    *  (an album: every item), the recipient named; a repeat too (the caller keeps its own once) */
   /** changed (WO-162): the queued count may have changed (a message taken in, written into the stream, into a turn, its turn ended): the status is
    *  computed again now rather than at the next 2 s tick */
-  constructor(readonly o: { agent: string; sink: (f: DeliveryFact) => void; now?: Now; max?: number
+  constructor(readonly o: { agent: string; sink?: (f: DeliveryFact) => void; now?: Now; max?: number
     onSeen?: (chat: string, id: string, by: string) => void; changed?: () => void }) {}
   private now(): number { return (this.o.now ?? Date.now)() }
   private changed(): void { try { this.o.changed?.() } catch {} }
@@ -71,7 +71,7 @@ export class DeliveryFacts {
       this.sent.set(idem, true)
       if (this.sent.size > (this.o.max ?? 20_000)) for (const k of [...this.sent.keys()].slice(0, 5_000)) this.sent.delete(k)
       try {
-        this.o.sink({ idem_key: idem, agent: this.o.agent, client: 'telegram', chat, client_msg_id: mid, state, at: at ?? iso(this.now()),
+        this.o.sink?.({ idem_key: idem, agent: this.o.agent, client: 'telegram', chat, client_msg_id: mid, state, at: at ?? iso(this.now()),
           ...(by ? { by } : {}), ...(detail && Object.keys(detail).length ? { detail } : {}), ...turnFields(turn) })
       } catch {}
     }

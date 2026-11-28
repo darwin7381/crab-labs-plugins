@@ -1,6 +1,4 @@
-// lanes-golive C3: one entrance into the main. With lanes on the router is the only path that writes into the main session (hub sync, which handed its
-// rows to the router, was removed in 1.52.0, WO-158); parked deliveries go back through the router; the main's taking an item (M1 bound) is the one
-// delivery count, and for a scheduler run it sends the start receipt once.
+// The router binds scheduled work and retains the Item claim through delivery.
 import { test, expect, afterAll } from 'bun:test'
 import { mkdtempSync, copyFileSync, readFileSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
@@ -15,13 +13,11 @@ L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, 
   notifySession: async (sid: string, notif: any) => { if (!open.has(sid)) return false; offers.push({ sid, notif }); return true },
   streamOpen: (sid: string) => open.has(sid), sendBot: async () => 1, joeyChatId: () => '1' } as any)
 L.__setWallProbe(3_600_000)
-const acks: string[] = []
-L.__setAckHook(r => acks.push(r))
 const procs: any[] = []
-afterAll(() => { for (const p of procs) { try { p.kill('SIGKILL') } catch {} } L.__setAckHook(null); L.__setWallProbe(300_000) })
+afterAll(() => { for (const p of procs) { try { p.kill('SIGKILL') } catch {} } L.__setWallProbe(300_000) })
 const M = () => L.__main()
 
-test('C3: a scheduler run the router gives the main gets its start receipt when the main\'s turn takes it (M1 bound), once', async () => {
+test('C3: the router binds scheduled work to the main turn', async () => {
   const proc = Bun.spawn(['sleep', '600']); procs.push(proc)
   const sid = randomUUID()
   writeFileSync(join(dir, 'main-expected'), sid)
@@ -36,13 +32,10 @@ test('C3: a scheduler run the router gives the main gets its start receipt when 
   await M().pump()
   const item = M().items(r => r.event === 'mesh-sched-1')[0]
   expect(item.via).toBe('inbox')                                      // a mesh item goes out on the agent-inbox stream (no inbox daemon here: it stays queued)
-  expect(acks).toEqual([])                                            // queued or offered is not taken
   await L.__mainEvent({ event: 'UserPromptSubmit', pid: proc.pid, session_id: sid, prompt_id: 'p-1', dids: [item.id] })
   expect(M().items(r => r.id === item.id)[0].state).toBe('bound')
-  expect(acks).toEqual(['4242'])
   await L.__mainEvent({ event: 'Stop', pid: proc.pid, session_id: sid, prompt_id: 'p-1', phase: 'final' })
   await L.__mainEvent({ event: 'UserPromptSubmit', pid: proc.pid, session_id: sid, prompt_id: 'p-2', dids: [item.id] })
-  expect(acks).toEqual(['4242'])                                      // once per run
   await L.lanesCommand('/lanes on', 'test')
 })
 

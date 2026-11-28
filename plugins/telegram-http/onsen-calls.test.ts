@@ -2,11 +2,8 @@
 // PUT /v1/calls/<id>/state through the spool. Here: the rules (CallFacts), which items are Calls (lanes.ts callRefOf: the call id the pulled item
 // carries, Onsen 0.24.1), and the spool (onsen-client.ts: in order, a refused step not retried, Onsen down retried).
 import { describe, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import { CALL_LEDGER_RESULT, CallFacts } from './onsen-status.ts'
-import { OnsenClient, callStateOn, type CallRef, type CallStateLine } from './onsen-client.ts'
+import { type CallRef, type CallStateLine } from './onsen-client.ts'
 const L = await import('./lanes.ts?onsen-calls-test') as typeof import('./lanes.ts')
 
 const PEER: CallRef = { kind: 'peer_call', id: '344' }
@@ -113,134 +110,6 @@ describe('which items are Calls (callRefOf): the four kinds, by the call id the 
     expect(L.callRefOf(ev({ item_kind: 'peer_mail', call_id: '1' }))).toBeNull()
     expect(L.callRefOf(ev({ source: 'telegram', item_kind: 'peer_call', call_id: '1' }))).toBeNull()
     expect(L.callRefOf(ev({ item_kind: 'peer_call', call_id: '1', synthetic: '[x]' }))).toBeNull()
-  })
-  test('ONSEN_CALL_STATE: on unless 0 / off; a list names agents', () => {
-    expect(callStateOn({}, 'adam')).toBe(true)
-    expect(callStateOn({ ONSEN_CALL_STATE: '0' }, 'adam')).toBe(false)
-    expect(callStateOn({ ONSEN_CALL_STATE: 'lab-relay,chiron' }, 'adam')).toBe(false)
-    expect(callStateOn({ ONSEN_CALL_STATE: 'lab-relay,chiron' }, 'chiron')).toBe(true)
-    expect(callStateOn({ ONSEN_CALL_STATE: '*' }, 'adam')).toBe(true)
-  })
-})
-
-describe('the spool: PUT /v1/calls/<id>/state', () => {
-  const CRED = 'mesh_CALLSTESTsecret'
-  function onsen(o: { put?: (id: string, body: any) => { status: number; json: any } } = {}) {
-    const log: Array<{ m: string; path: string; body: any }> = []
-    const f = (async (u: any, init?: any) => {
-      const url = new URL(String(u)), path = url.pathname.replace(/^\/api\/onsen/, '') + url.search
-      const body = init?.body ? JSON.parse(init.body) : null
-      log.push({ m: init?.method ?? 'GET', path, body })
-      const json = (s: number, j: unknown) => new Response(JSON.stringify(j), { status: s, headers: { 'content-type': 'application/json' } })
-      if (init?.headers?.Authorization !== `Bearer ${CRED}`) return json(401, {})
-      const m = /\/v1\/calls\/(\d+)\/state$/.exec(url.pathname)
-      if (init.method === 'PUT' && m) { const r = o.put?.(m[1]!, body); return json(r?.status ?? 200, r?.json ?? { data: { id: m[1], state: body.state } }) }
-      return json(404, {})
-    }) as typeof fetch
-    return { f, log }
-  }
-  const client = (f: typeof fetch, logs: string[] = []) => new OnsenClient({ dir: mkdtempSync(join(tmpdir(), 'onsen-calls-')), base: 'https://onsen.test/api/onsen', agent: 'lab-relay',
-    record: true, credential: () => CRED, log: (l, m) => logs.push(`${l} ${m}`), fetch: f, intervalMs: 3_600_000 })
-  const line = (o: Partial<CallStateLine> & { state: CallStateLine['body']['state']; at?: string }): CallStateLine => ({ call_id: o.call_id ?? '1', kind: o.kind ?? 'peer_call',
-    event: o.event ?? 'mesh-9001', idem: 'i', body: { state: o.state, session_id: o.body?.session_id ?? 'main', at: o.at ?? new Date().toISOString() } })
-  test('by its id: PUT with the body Onsen takes (state, session_id, result, at), in order', async () => {
-    const o = onsen(), c = client(o.f)
-    c.recordCall(line({ call_id: '344', state: 'accepted' })); c.recordCall(line({ call_id: '344', state: 'running' }))
-    await c.syncNow(true)
-    expect(o.log.map(x => `${x.m} ${x.path} ${x.body?.state ?? ''}`)).toEqual(['PUT /v1/calls/344/state accepted', 'PUT /v1/calls/344/state running'])
-    expect(Object.keys(o.log[0]!.body).sort()).toEqual(['at', 'session_id', 'state'])
-    expect(c.pendingBytes()).toBe(0)
-  })
-  test('a step Onsen refuses (400: past it, or the Call over) is not retried and holds nothing behind it; Onsen down (5xx) is retried', async () => {
-    let put = (id: string, b: any) => ({ status: 400, json: { error: { code: 'invalid_request', message: '呼叫現在是 completed，不能改成 running' } } })
-    const o = onsen({ put: (id, b) => put(id, b) }), logs: string[] = [], c = client(o.f, logs)
-    c.recordCall(line({ call_id: '9', state: 'running' }))
-    c.recordCall(line({ call_id: '10', state: 'accepted', event: 'mesh-other' }))
-    await c.syncNow(true)
-    expect(o.log.filter(x => x.m === 'PUT').map(x => x.path)).toEqual(['/v1/calls/9/state', '/v1/calls/10/state'])
-    const rej = readFileSync(join(c.cfg.dir, 'rejected.jsonl'), 'utf8').trim().split('\n').map(x => JSON.parse(x))
-    expect(rej.map(r => r.why)).toEqual([expect.stringMatching(/^PUT \/v1\/calls\/9\/state running: HTTP 400 呼叫現在是 completed/),
-      expect.stringMatching(/^PUT \/v1\/calls\/10\/state accepted: HTTP 400/)])
-    put = () => ({ status: 503, json: {} })
-    c.recordCall(line({ call_id: '12', state: 'running' }))
-    await c.syncNow(true)
-    expect(c.pendingBytes()).toBeGreaterThan(0)                                    // kept for the next pass
-    put = (id, b) => ({ status: 200, json: { data: { id, state: b.state } } })
-    await c.syncNow(true)
-    expect(c.pendingBytes()).toBe(0)
-  })
-})
-
-// Chiron's WO-175 ruling of 05:55Z: a receipt goes to Onsen only. Onsen not answering or 5xx: the first try and three more, all within 10 s, then
-// not recorded; a refused step: Onsen's sentence (recorded when the Call is already there: a resend); no credential: a broken setup; only a run
-// Onsen has no Call for goes to BTCC (lanes-wo175.test.ts). Here the client's half (what Onsen said to a spooled line; a run's Call) and CallFacts.receipt.
-describe('a receipt goes to Onsen only (Chiron 05:55Z): what Onsen said to the line, a run\'s Call', () => {
-  const CRED = 'mesh_CALLSTESTsecret'
-  function onsen(o: { put?: (id: string, body: any) => { status: number; json?: any }; list?: (q: URLSearchParams) => { status: number; json?: any }
-    one?: (id: string) => { status: number; json?: any } } = {}) {
-    const log: Array<{ m: string; path: string; body: any; at: number }> = []
-    const t0 = Date.now()
-    const f = (async (u: any, init?: any) => {
-      const url = new URL(String(u)), path = url.pathname.replace(/^\/api\/onsen/, '') + url.search
-      const body = init?.body ? JSON.parse(init.body) : null
-      log.push({ m: init?.method ?? 'GET', path, body, at: Date.now() - t0 })
-      const json = (s: number, j: unknown) => new Response(JSON.stringify(j ?? {}), { status: s, headers: { 'content-type': 'application/json' } })
-      if (init?.headers?.Authorization !== `Bearer ${CRED}`) return json(401, {})
-      const m = /\/v1\/calls\/(\d+)\/state$/.exec(url.pathname)
-      if (init?.method === 'PUT' && m) { const r = o.put?.(m[1]!, body); return json(r?.status ?? 200, r?.json ?? { data: { id: m[1], state: body.state } }) }
-      if ((init?.method ?? 'GET') === 'GET' && url.pathname.endsWith('/v1/calls')) { const r = o.list?.(url.searchParams) ?? { status: 200, json: { items: [], next_cursor: null } }; return json(r.status, r.json) }
-      const one = /\/v1\/calls\/(\d+)$/.exec(url.pathname)
-      if ((init?.method ?? 'GET') === 'GET' && one) { const r = o.one?.(one[1]!) ?? { status: 404 }; return json(r.status, r.json) }
-      return json(404, {})
-    }) as typeof fetch
-    return { f, log }
-  }
-  const client = (f: typeof fetch, cred: string | null = CRED) => new OnsenClient({ dir: mkdtempSync(join(tmpdir(), 'onsen-calls-r-')), base: 'https://onsen.test/api/onsen',
-    agent: 'lab-relay', record: true, credential: () => cred, log: () => {}, fetch: f, intervalMs: 3_600_000 })
-  const said = { error: { code: 'invalid_transition', message: '呼叫已經是 failed，不能改成 completed' } }
-  test('took: the PUT answered 2xx (Onsen\'s state); refused: a 4xx with Onsen\'s sentence; a fate is kept for a line asked about again', async () => {
-    let put = (id: string, b: any) => ({ status: 200, json: { data: { id, state: b.state } } }) as { status: number; json: any }
-    const o = onsen({ put: (id, b) => put(id, b) }), c = client(o.f)
-    c.recordCall({ call_id: '350', kind: 'scheduled', event: 'e1', idem: 'k1', body: { state: 'completed', session_id: 'x.reflex.1', at: new Date().toISOString() } })
-    expect(await c.callFate('k1')).toEqual({ fate: 'took', state: 'completed' })
-    expect(await c.callFate('k1')).toEqual({ fate: 'took', state: 'completed' })
-    put = () => ({ status: 400, json: said })
-    c.recordCall({ call_id: '351', kind: 'scheduled', event: 'e2', idem: 'k2', body: { state: 'completed', session_id: 'main', at: new Date().toISOString() } })
-    expect(await c.callFate('k2')).toEqual({ fate: 'refused', status: 400, said: '呼叫已經是 failed，不能改成 completed' })
-    expect(o.log.filter(x => x.m === 'PUT')).toHaveLength(2)                        // a refused step is not tried again
-  })
-  test('Onsen answering 503: the first try and three more within 10 s, whatever the spool\'s backoff; then pending, the line still in the spool', async () => {
-    const o = onsen({ put: () => ({ status: 503, json: {} }) }), c = client(o.f)
-    c.start()
-    c.recordCall({ call_id: '352', kind: 'scheduled', event: 'e3', idem: 'k3', body: { state: 'completed', session_id: 'main', at: new Date().toISOString() } })
-    const t0 = Date.now(), f = await c.callFate('k3')
-    c.stop()
-    expect(f).toEqual({ fate: 'pending', why: expect.stringContaining('HTTP 503') })
-    expect(Date.now() - t0).toBeLessThan(10_500)
-    const puts = o.log.filter(x => x.m === 'PUT')
-    expect(puts.length).toBe(4)
-    expect(puts.at(-1)!.at).toBeLessThan(10_000)
-    expect(c.pendingBytes()).toBeGreaterThan(0)
-  }, 20_000)
-  test('no mesh credential: nocred at once, nothing sent', async () => {
-    const o = onsen(), c = client(o.f, null)
-    c.recordCall({ call_id: '353', kind: 'scheduled', event: 'e4', idem: 'k4', body: { state: 'completed', session_id: 'main', at: new Date().toISOString() } })
-    expect((await c.callFate('k4')).fate).toBe('nocred')
-    expect((await c.findRunCall('7')).fate).toBe('nocred')
-    expect(o.log).toEqual([])
-  })
-  test('a run\'s Call: found, none, a refused lookup, and Onsen not answering (tried again within the wait)', async () => {
-    let list = (q: URLSearchParams) => ({ status: 200, json: { items: q.get('ref_value') === '7221' ? [{ id: 374, state: 'running', result: null }] : [], next_cursor: null } }) as any
-    const o = onsen({ list: q => list(q) }), c = client(o.f)
-    expect(await c.findRunCall('7221')).toEqual({ found: { id: '374', state: 'running', result: null } })
-    expect(o.log[0]!.path).toBe('/v1/calls?ref_kind=run&ref_value=7221&limit=5')
-    expect(await c.findRunCall('7222')).toEqual({ none: true })
-    list = () => ({ status: 403, json: { error: { code: 'forbidden', message: 'not your call' } } })
-    expect(await c.findRunCall('7223')).toEqual({ fate: 'refused', status: 403, said: 'not your call' })
-    list = () => ({ status: 502, json: {} })
-    o.log.length = 0
-    expect(await c.findRunCall('7224', 1_500)).toEqual({ fate: 'pending', why: expect.stringContaining('HTTP 502') })
-    expect(o.log.map(x => x.at >= 900)).toEqual([false, true])                      // the first try and one more inside 1.5 s
   })
 })
 

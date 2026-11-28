@@ -344,9 +344,6 @@ const botName = (): string => tg?.botUsername ?? ''
 // Telegram daemon only. ONSEN_BASE / ONSEN_RECORD / ONSEN_AGENTS / ONSEN_CREDENTIAL_FILE come from the plist or the machine config (fleet-config.ts).
 // The credential is the agent's mesh credential, kept by its agent-inbox daemon (<workspace>/.agent-inbox-state/mesh-credential); never logged.
 const ONSEN_AGENT = Onsen.agentName(process.env, process.env.AGENT_WORKSPACE_DIR ?? dirname(STATE_DIR))
-/** WO-175: this agent's daemons report the moments of the Calls it receives (lanes on, recording on, ONSEN_CALL_STATE not off): the two old start receipts
- *  (the agent-inbox daemon's when a lane takes a scheduled run, the main's M1 bind) are off then: the Call's `running` is the start receipt BTCC reads */
-const CALL_STATE = Lanes.LANES_ON && Onsen.recordFor(process.env, ONSEN_AGENT) && Onsen.callStateOn(process.env, ONSEN_AGENT)
 const ONSEN_CRED_FILE = (process.env.ONSEN_CREDENTIAL_FILE ?? '').trim() || join(process.env.AGENT_WORKSPACE_DIR ?? dirname(STATE_DIR), '.agent-inbox-state', 'mesh-credential')
 const onsen: Onsen.OnsenClient | null = INBOX_ONLY ? null : new Onsen.OnsenClient({ fastStatus: process.env.ONSEN_STATUS_FAST !== '0',
   dir: join(STATE_DIR, 'onsen'), base: Onsen.onsenBase(process.env), agent: ONSEN_AGENT, record: Onsen.recordFor(process.env, ONSEN_AGENT),
@@ -674,8 +671,6 @@ let onsenStep3Stop: (() => void) | null = null
 /** Onsen 1.45.1: an MCP stream opened (sid, its GET): which claude process holds it (the status's not_connected check); null = recording off */
 let onsenPeer: ((sid: string, req: IncomingMessage) => void) | null = null
 let onsenStatusNow: (() => unknown) | null = null
-/** WO-147 (ONSEN_WAKE_LOG): the route tap is attached (set up with step 3) */
-let onsenWakeLog = false
 /** WO-157 (Chiron 13:46Z): the main's status computed now, the one record the daemon reports to Onsen (local reads, no network; WO-169: currentStatus(),
  *  statusOf's view through the screen reader); null: Onsen step 3 off for this agent (no status is computed here, and the lanes keep the old path) */
 let onsenStatusCompute: (() => { state: string; detail?: Record<string, unknown> }) | null = null
@@ -1555,38 +1550,12 @@ function meshAuth(): Record<string, string> {
   return ownCred.value ? { Authorization: `Bearer ${ownCred.value}` } : {}
 }
 
-// ---- Scheduler daemon-level auto-ack (SCHEDULER-MODULE backlog #1) ----------
-// When a BTCC Scheduler wake-up ([scheduled][tag][run:N]) is CONFIRMED written
-// into a live session, the daemon acks the run machine-side — "開工回執" drops
-// from agent discipline to infrastructure, and stalled_no_ack becomes a pure
-// "session never received it" signal. complete stays with the agent (the
-// outcome summary must be authored). Inbox daemons only; fire-and-forget; the
-// ack endpoint 409s on repeats so multi-session broadcast double-acks are noise.
-const autoAckedRuns = new Set<string>()
 /** the fleet's single-session path (not lanes; unchanged): the run id of a scheduler wake-up, from its meta or its [scheduled][tag][run:N] head */
 function fleetRunId(notif: { method: string; params: unknown }): string | undefined {
   const p = (notif?.params ?? {}) as { content?: unknown; meta?: Record<string, string> }
   if (p.meta?.run_id) return String(p.meta.run_id)
   return typeof p.content === 'string' ? p.content.match(/^\[scheduled\]\[[^\]]*\]\[run:(\d+)\]/)?.[1] : undefined
 }
-function maybeAutoAckScheduled(runId: string | undefined): void {
-  if (!INBOX_ONLY) return
-  try {
-    if (!runId || !/^\d+$/.test(runId)) return
-    const rid = runId
-    if (!BTCC_API_BASE) return
-    if (autoAckedRuns.has(rid)) return
-    autoAckedRuns.add(rid)
-    if (autoAckedRuns.size > 500) autoAckedRuns.clear()  // unbounded-growth guard
-    void fetch(`${BTCC_API_BASE}/api/scheduler/runs/${rid}/ack`, {
-      method: 'POST',
-      headers: meshAuth(),
-      signal: AbortSignal.timeout(6000),
-    }).then(r => log('info', `scheduler auto-ack run ${rid}: ${r.status}`))
-      .catch(err => log('warn', `scheduler auto-ack run ${rid} failed (agent can still ack manually): ${err}`))
-  } catch {}
-}
-
 const ONSEN_SEND_ON = INBOX_ONLY && switchOn(process.env.ONSEN_SEND, INBOX_SELF)
 const ONSEN_INBOX_BASE = Onsen.onsenBase(process.env)
 const onsenReq = ONSEN_SEND_ON ? (() => {
@@ -1858,10 +1827,6 @@ async function laneDeliverMesh(n: { method: string; params: unknown }, verified?
   Lanes.noteInboundThread(ev.btcc_msg_id, ev.thread, ev.hop)
   const d = INBOX_ONLY ? await Lanes.routeRemote(ev)                       // target main: the tg daemon queued it for the main (M1)
     : await Lanes.routeEvent(ev).catch(err => { log('error', `lanes: router failed (${err}) — main`); Lanes.toMainDirect(ev); return { rule: 'router-failed', target: 'main' } as Lanes.Decision })
-  if (d?.target === 'lane' && !CALL_STATE) {
-    if (facts.onsen_items && ev.meta?.run_id) await Lanes.inboxPost('/lanes/scheduler-taken', { run_id: ev.meta.run_id })
-    else maybeAutoAckScheduled(ev.meta?.run_id)
-  }    // 開工回執: a lane took the scheduled run (WO-175: the Call's running, when on)
   return d
 }
 
@@ -3603,15 +3568,6 @@ if (Lanes.LANES_ON) {
     } } : {}),
     registryNames: () => Object.keys(loadInboxRegistry()).filter(n => n !== (process.env.LANES_AGENT ?? INBOX_SELF)),
     checkWaitingCall: onsen ? (id, why, thread) => onsen!.checkWaitingCall(id, why, thread) : undefined,
-    blocked: (item, retryAfter) => {
-      const meta = item.notif?.params?.meta ?? {}
-      const ids = item.person_message_ids as string[] | undefined
-      if (ids?.length) {
-        for (const id of ids) onsen?.recordBlocked({ message_id: id, retry_after: retryAfter })
-      } else if (meta.chat_id && meta.message_id) {
-        onsen?.recordBlocked({ chat: String(meta.chat_id), client_msg_id: String(meta.message_id), retry_after: retryAfter })
-      }
-    },
     wallNoticeOwned: (rule, m) => mainWallNoticeOwned(rule, m.kind),
     ...(mentionCards ? { mentions: () => mentionCards.fetchIfOn(), mentionsRead: (posts: string[]) => mentionCards.read(posts) } : {}),   // WO-181
     // WO-120: M1 asks the usage-wall state before its in-session probe (walled → no offer; cleared after this episode began → offer now)
@@ -3697,7 +3653,7 @@ if (Lanes.LANES_ON) {
       },
       // WO-205 (Chiron mesh-13475): M2's registry disagreement (the tg daemon relays it here) as a BTCC page alert to the connector's maintainer;
       // BTCC names the agent from this daemon's mesh credential
-      inboundLog: logPeerArrival, schedulerTaken: maybeAutoAckScheduled,
+      inboundLog: logPeerArrival,
       registryAlert: async a => {
         if (!BTCC_API_BASE) return 'BTCC_API_BASE not set'
         const machine = machineName()
@@ -3814,11 +3770,7 @@ void takeMode?.probe()
 const jevScreenValue = (): string | undefined => liveSetting('JEV_SCREEN')
 if (!INBOX_ONLY && (Lanes.LANES_ON || onsen?.cfg.record)) registry.start()
 if (onsen && onsen.cfg.record && !INBOX_ONLY) {
-  // WO-175 (ONSEN_CALL_STATE, on unless 0; lanes on): the Calls this agent received (the call id its pulled item carries, Onsen 0.24.1), their moments
-  // as PUT /v1/calls/<id>/state through the spool. The router's and a lane run's end come from lanes.ts, the turn moments from the journal tap
-  const calls = CALL_STATE ? new OnsenStatus.CallFacts({ sink: line => { onsen.recordCall(line) }, client: onsen }) : null   // client: a receipt waits for Onsen's answer (WO-175, Chiron 05:55Z)
-  const facts = new OnsenStatus.DeliveryFacts({ agent: ONSEN_AGENT, sink: f => onsen.recordDelivery(f),
-    changed: () => kick() })                                            // WO-162: the queued count moved: computed now, not at the next tick
+  const facts = new OnsenStatus.DeliveryFacts({ agent: ONSEN_AGENT, changed: () => kick() })
   // WO-162: a detail change is written at once, last_activity_at alone at most every ONSEN_STATUS_THROTTLE_MS (1 s); a report at least every
   // ONSEN_STATUS_HEARTBEAT_S (15 s; 0 = none), each carrying detail.heartbeat_s
   const hbS = Number(process.env.ONSEN_STATUS_HEARTBEAT_S ?? OnsenStatus.HEARTBEAT_MS / 1000)
@@ -3878,16 +3830,14 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     // WO-172 (Chiron 02:43Z) / WO-177: a normal turn's turn_end goes when this record shows the turn over (not busy, stuck or compacting), not 60 s later
     try { facts.statusRecord(member) } catch {}
     itemClaims?.statusRecord(member, sid => registry.backgroundAgents(sid), OnsenStatus.REGISTRY_SETTLE_MS)
-    try { calls?.statusRecord(member) } catch {}                          // WO-175: a main turn's Calls end with it, the same way
     if (edge !== lastEdge) { lastEdge = edge; if (Lanes.LANES_ON) { try { Lanes.mainStatusChanged() } catch {} } }
   }
   // WO-172: each turn that ended (the main's, a lane run): one line. Its outcome and bound ride every turn_end fact of a Joey message in it (Onsen keeps
   // the fact's detail); a turn with no Joey message in it (a colleague's call alone) has no fact to ride: Onsen takes delivery facts for Telegram
   // messages only, so this line is its record here
   const turnEnded = (t: OnsenStatus.TurnEnded): void => log('info', `onsen: turn_end ${t.session} ${t.turn_id} ${t.outcome} bound=[${t.bound.join(',')}] facts=${t.facts}`)
-  const tap = Lanes.LANES_ON ? new OnsenStatus.LanesTap({ facts, joey: onsenJoeyOf, gen: () => Lanes.mainGenRow(), changed: kick, trigger: row => Lanes.triggerOfItem(row), turnEnded,
-    calls, callOf: id => Lanes.callOfEvent(id) }) : null
-  if (tap) Lanes.observeLanes({ journal: (r, l) => tap.journal(r, l), mainEvent: b => tap.mainEvent(b), calls })
+  const tap = Lanes.LANES_ON ? new OnsenStatus.LanesTap({ facts, joey: onsenJoeyOf, gen: () => Lanes.mainGenRow(), changed: kick, trigger: row => Lanes.triggerOfItem(row), turnEnded }) : null
+  if (tap) Lanes.observeLanes({ journal: (r, l) => tap.journal(r, l), mainEvent: b => tap.mainEvent(b) })
   // WO-165: seen (lanes off) comes from this read; it follows the registry's main session (its <session id>.jsonl) at once, so a new session's first
   // message is not seen only at the next 10 s rescan (registry is set up below: read only once the block has run)
   const watch = tap ? null : new OnsenStatus.TurnWatch({ dir: () => consumptionCheckAvailable() ? TRANSCRIPT_DIR : null, facts, joey: onsenJoeyOf, changed: kick,
@@ -3982,49 +3932,12 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   // WO-169 part 2: the observation beside the record it was composed with (the one handed out last; WO-180: the one obsPut sends to Onsen)
   onsenStatusNow = () => ({ ...(status.current() ?? {}), observation: lastObservation, put: obsPut.health(),   // WO-180: is it being sent (sent, rejected, …)
     mode: tap ? 'lanes' : watch?.watching() ? 'transcript' : 'stream-only', registry: registry.mode(),
-    turn_end_settling: facts.pendingLater(), ...(screenStatus ? { screen_status: screenStatus.health() } : {}), ...(calls ? { calls: calls.health() } : {}),
-    // WO-145: the visible half (only what is on)
-     ...(onsenWakeLog ? { wake_log: { on: true, recorded: onsen.stats.wake_recorded } } : {}) })
+    turn_end_settling: facts.pendingLater(), ...(screenStatus ? { screen_status: screenStatus.health() } : {}) })
   log('info', `onsen: step 3 on (delivery facts and the main's status: Claude Code's session registry; detail from ${tap ? 'the lanes journal' : 'the transcript'})`)
-  // WO-147 (Onsen step 4a, ONSEN_WAKE_LOG): every route record (routing.jsonl line) as one wake row in Onsen (onsen-wake.ts), through the spool. Read only:
-  // the row is built from the record the router already wrote and appended to the spool after the router's own step (a microtask: toMain has given the
-  // event its M1 item by then, and nothing of the route waits for it); any failure is logged once an hour and that row is dropped.
-  if (Lanes.LANES_ON && OnsenWake.wakeLogOn(process.env, ONSEN_AGENT)) {
-    const host = (process.env.ONSEN_HOST ?? '').trim() || hostname().replace(/\.local$/, '')
-    const boot = randomBytes(3).toString('hex')
-    let seq = 0, warnAt = 0
-    const warn = (e: unknown): void => { if (Date.now() - warnAt > 3600_000) { warnAt = Date.now(); log('warn', `onsen: wake row dropped (${e instanceof Error ? e.message : e}); routing unchanged`) } }
-    /** WO-169: a wake row's member_state is the status record at that moment (the one decideWake read), else the one last handed out */
-    const recordNow = (): OnsenStatus.StatusView | null => { try { return currentStatus() } catch { return lastView } }
-    Lanes.observeRoutes((row, ctx) => {
-      const now = Date.now(), at = new Date(now).toISOString(), n = ++seq
-      const memberState = OnsenWake.memberStateOf(recordNow(), ctx.main)
-      queueMicrotask(() => {
-        try {
-          const ok = onsen.recordWake(OnsenWake.wakeItem(row, { ...ctx, did: ctx.did() }, { agent: ONSEN_AGENT, host, at, idem: OnsenWake.idemWake(ONSEN_AGENT, boot, n, now), memberState }))
-          if (!ok) warn(new Error('the spool did not take it'))
-        } catch (e) { warn(e) }
-      })
-    })
-    // 1.49.1 (Chiron, WO-147 09:56Z): the hand-over decisions (handoff_main, a decision card, the deferred cards' batch, a lane run's end): one row per
-    // event-keyed wake line of the state journal (onsen-wake.ts handItem; at = the line's ts)
-    Lanes.observeWakes((line, ctx) => {
-      const now = Date.now(), n = ++seq
-      const memberState = OnsenWake.memberStateOf(recordNow(), ctx.main)
-      queueMicrotask(() => {
-        try {
-          const ok = onsen.recordWake(OnsenWake.handItem(line, ctx, { agent: ONSEN_AGENT, host, idem: OnsenWake.idemWake(ONSEN_AGENT, boot, n, now), memberState }))
-          if (!ok) warn(new Error('the spool did not take it'))
-        } catch (e) { warn(e) }
-      })
-    })
-    onsenWakeLog = true
-    log('info', `onsen: wake log on for ${ONSEN_AGENT} (host ${host}): every routing.jsonl row and every hand-over wake line of the state journal also as a row in Onsen (POST ${onsen.cfg.base}/wake/batch, through the spool)`)
-  }
 }
 /** WO-145: a page answer to the main, as Joey's Telegram message in that chat would go (lanes on: the one builder, never a lane; lanes off: the same
  *  delivery as his message). Its id is form-<Onsen message id> (no Telegram id can collide); meta via=web-form, form_title, form_id. false = its chat is
- *  not allowlisted (acked and dropped, logged). */
+ *  not allowlisted (logged and dismissed). */
 async function deliverFormAnswer(it: OnsenVisible.FormItem, route: 'main' | 'rules' = 'main', personIds?: string[], refs?: ItemRef[]): Promise<boolean> {
   const access = loadAccess(), chat = String(it.chat)
   if (!(access.allowFrom.map(String).includes(chat) || chat in (access.groups ?? {}) || (Connector.ONSEN_CHAT.test(chat) && CONNECTOR))) {

@@ -7,125 +7,13 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { randomUUID } from 'crypto'
 import { spawnSync } from 'child_process'
-import { OnsenClient, idemDelivery, idemStatus, inboundItem, type DeliveryFact, type StatusFact } from './onsen-client.ts'
+import { idemDelivery, idemStatus, type DeliveryFact, type StatusFact } from './onsen-client.ts'
 import { DeliveryFacts, HANDLED_HERE, StatusFacts, statusOf, LanesTap, TurnWatch, Registry, Streams, channelTags, compareRegistry, pickMain, regEntry, sameStart, osProcStart, SharedCli, runCli, pidAlive, REG_SETTLE_MS, type JoeyOf,
   type RegEntry, type StatusInputs, type StatusSource } from './onsen-status.ts'
 
-const CRED = 'mesh_STEP3************************************'
 const AGENT = 'adam'
 const JOEY = '1828'
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
-
-/** a stand-in Onsen 0.5.0: messages, deliveries, status (each idem key once: a second is a duplicate) */
-function fakeOnsen() {
-  const calls: Array<{ path: string; body: any }> = []
-  const seen = new Map<string, number>()
-  const st = { down: false, missing: false, refuse: null as null | ((it: any) => string | null) }
-  let next = 1
-  const json = (status: number, j: unknown) => new Response(JSON.stringify(j), { status, headers: { 'content-type': 'application/json' } })
-  const one = (it: any) => { const was = seen.get(it.idem_key); if (was) return { id: was, duplicate: true }; const id = next++; seen.set(it.idem_key, id); return { id, duplicate: false } }
-  const f = (async (input: any, init?: any) => {
-    const url = new URL(String(input)), path = url.pathname.replace(/^\/api\/onsen/, '')
-    const body = init?.body ? JSON.parse(init.body) : undefined
-    if (st.down) throw new TypeError('fetch failed: connect ECONNREFUSED')
-    calls.push({ path, body })
-    if (init?.headers?.Authorization !== `Bearer ${CRED}`) return json(401, { error: 'no credential' })
-    if (path === '/messages/batch') return json(200, { results: body.items.map(one) })
-    if ((path === '/deliveries/batch' || path === '/status/batch') && st.missing) return json(404, { detail: 'Not Found' })
-    if (path === '/deliveries/batch' || path === '/status/batch') return json(200, { results: body.items.map((it: any) => { const why = st.refuse?.(it); return why ? { error: why, status: 422 } : one(it) }) })
-    return json(404, { error: 'no route' })
-  }) as typeof fetch
-  return { f, calls, st }
-}
-function client(fo: ReturnType<typeof fakeOnsen>, record = true) {
-  const dir = mkdtempSync(join(tmpdir(), 'onsen3-'))
-  const logs: string[] = []
-  const c = new OnsenClient({ dir, base: 'https://core.test/api/onsen', agent: AGENT, record, credential: () => CRED, log: (_l, m) => logs.push(m), fetch: fo.f, intervalMs: 3_600_000 })
-  return { c, dir, logs }
-}
-const spoolKinds = (dir: string): string[] => existsSync(join(dir, 'spool.jsonl')) ? readFileSync(join(dir, 'spool.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l).k) : []
-const joeyMsg = (id: number) => ({ message_id: id, date: 1764020000, chat: { id: Number(JOEY), type: 'private' }, from: { id: Number(JOEY), first_name: 'J' }, text: `hi ${id}` })
-
-describe('the spool: delivery facts and status lines, in order, the same guarantees as messages', () => {
-  test('a message, then its facts, then a status: one batch each, in the order they were recorded; duplicates count as sent; /healthz counters', async () => {
-    const fo = fakeOnsen(), { c, dir } = client(fo)
-    const facts = new DeliveryFacts({ agent: AGENT, sink: f => c.recordDelivery(f) })
-    const status = new StatusFacts({ agent: AGENT, sink: f => c.recordStatus(f) })
-    c.recordMessage(inboundItem(AGENT, joeyMsg(501), 'hi 501'))
-    facts.delivered(JOEY, 501)
-    facts.seen(JOEY, 501, 'main')
-    facts.seen(JOEY, 501, 'main')                                              // the same fact again: spooled once
-    status.update({ state: 'busy', detail: { turn_started_at: null, tool: null, subagents: 0, queued_joey: 0 } })
-    facts.turnEnd(JOEY, 501, 'main')
-    expect(spoolKinds(dir)).toEqual(['m', 'd', 'd', 's', 'd'])
-    await c.syncNow(true)
-    expect(fo.calls.map(x => x.path)).toEqual(['/messages/batch', '/deliveries/batch', '/status/batch', '/deliveries/batch'])
-    const d1 = fo.calls[1]!.body.items
-    expect(d1.map((x: DeliveryFact) => x.state)).toEqual(['delivered', 'seen'])
-    expect(d1[0]).toMatchObject({ idem_key: `tg:${AGENT}:${JOEY}:dlv:501:delivered`, agent: AGENT, client: 'telegram', chat: JOEY, client_msg_id: '501', state: 'delivered' })
-    expect(d1[0].by).toBeUndefined()
-    expect(d1[1]).toMatchObject({ idem_key: idemDelivery(AGENT, JOEY, 501, 'seen'), by: 'main' })
-    expect(Date.parse(d1[1].at)).toBeGreaterThan(0)
-    const s = fo.calls[2]!.body.items[0] as StatusFact
-    expect(s).toMatchObject({ agent: AGENT, state: 'busy', detail: { turn_started_at: null, tool: null, subagents: 0, queued_joey: 0 } })
-    expect(s.idem_key).toBe(idemStatus(AGENT, Date.parse(s.at), 'busy'))
-    expect(c.pendingBytes()).toBe(0)
-    expect(c.health()).toMatchObject({ deliveries_recorded: 3, status_recorded: 1, posted: 5, rejected: 0 })
-    // a crash between the POST and the cursor: the same lines again are duplicates at Onsen, counted as sent
-    writeFileSync(join(dir, 'cursor.json'), JSON.stringify({ offset: 0 }))
-    await c.syncNow(true)
-    expect(c.health()).toMatchObject({ duplicates: 5, rejected: 0 })
-  })
-
-  test('Onsen down: kept and retried; one item refused: that one to rejected.jsonl, the rest sent', async () => {
-    const fo = fakeOnsen(), { c, dir } = client(fo)
-    fo.st.down = true
-    c.recordDelivery({ idem_key: 'k1', agent: AGENT, client: 'telegram', chat: JOEY, client_msg_id: '1', state: 'delivered', at: new Date().toISOString() })
-    c.recordDelivery({ idem_key: 'k2', agent: AGENT, client: 'telegram', chat: JOEY, client_msg_id: '2', state: 'delivered', at: new Date().toISOString() })
-    await c.syncNow(true)
-    expect(c.pendingBytes()).toBeGreaterThan(0)
-    expect(c.health().last_error).toContain('/deliveries/batch unreachable')
-    fo.st.down = false
-    fo.st.refuse = it => it.idem_key === 'k1' ? 'unknown message' : null
-    await c.syncNow(true)
-    expect(c.pendingBytes()).toBe(0)
-    expect(c.health()).toMatchObject({ posted: 1, rejected: 1 })
-    const rej = readFileSync(join(dir, 'rejected.jsonl'), 'utf8')
-    expect(rej).toContain('"k1"'); expect(rej).toContain('unknown message'); expect(rej).not.toContain('"k2"')
-  })
-
-  test('an Onsen without these routes (404): the facts go to rejected.jsonl with one log line; the message behind them is still sent', async () => {
-    const fo = fakeOnsen(), { c, dir, logs } = client(fo)
-    fo.st.missing = true
-    for (let i = 0; i < 3; i++) c.recordDelivery({ idem_key: `m${i}`, agent: AGENT, client: 'telegram', chat: JOEY, client_msg_id: String(i), state: 'seen', at: new Date().toISOString(), by: 'main' })
-    c.recordMessage(inboundItem(AGENT, joeyMsg(777), 'after'))
-    await c.syncNow(true)
-    expect(c.pendingBytes()).toBe(0)
-    expect(fo.calls.map(x => x.path)).toEqual(['/deliveries/batch', '/messages/batch'])
-    expect(c.health()).toMatchObject({ rejected: 3, posted: 1 })
-    expect(logs.filter(l => l.includes('rejected 3 line(s)')).length).toBe(1)
-    expect(readFileSync(join(dir, 'rejected.jsonl'), 'utf8').trim().split('\n').length).toBe(3)
-  })
-
-  test('recording off: nothing is spooled, nothing counted', () => {
-    const fo = fakeOnsen(), { c, dir } = client(fo, false)
-    c.recordDelivery({ idem_key: 'x', agent: AGENT, client: 'telegram', chat: JOEY, client_msg_id: '1', state: 'delivered', at: new Date().toISOString() })
-    c.recordStatus({ idem_key: 'y', agent: AGENT, state: 'idle', at: new Date().toISOString() })
-    expect(existsSync(join(dir, 'spool.jsonl'))).toBe(false)
-    expect(c.health()).toMatchObject({ deliveries_recorded: 0, status_recorded: 0 })
-  })
-
-  test('the spool answer of chat_history ignores the new lines (only messages and their events)', async () => {
-    const fo = fakeOnsen(), { c } = client(fo)
-    fo.st.down = true
-    c.recordMessage(inboundItem(AGENT, joeyMsg(601), '第一則'))
-    c.recordDelivery({ idem_key: 'z', agent: AGENT, client: 'telegram', chat: JOEY, client_msg_id: '601', state: 'seen', at: new Date().toISOString(), by: 'main' })
-    c.recordStatus({ idem_key: 'w', agent: AGENT, state: 'busy', at: new Date().toISOString() })
-    const t = await c.queryHistory({ chat: JOEY })
-    expect(t).toContain('第一則'); expect(t).toContain('共 1 則')
-    expect(c.findInbound(JOEY, 601)?.body).toBe('第一則')
-  })
-})
 
 describe('delivery facts', () => {
   test('WO-197: a message the daemon handled itself: delivered (took) and turn_end by daemon with how it ended; never queued, no ✍, no turn, nothing bound', () => {

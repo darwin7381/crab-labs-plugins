@@ -62,9 +62,7 @@ const calls = new CallFacts({ sink: l => lines.push(l), client: { callFate: asyn
   findRunCall: async run => { onsenSays.looked.push(run); return onsenSays.run ?? { none: true } }, getCall: async () => onsenSays.now ?? null } })
 const tap = new LanesTap({ facts: new DeliveryFacts({ agent: AGENT, sink: () => {} }), joey: () => null, gen: () => L.mainGenRow(), changed: () => {}, calls, callOf: id => L.callOfEvent(id) })
 L.observeLanes({ journal: (r, l) => tap.journal(r, l), mainEvent: b => tap.mainEvent(b), calls })
-const acks: string[] = []
-L.__setAckHook(run => acks.push(run))
-afterAll(() => { schedSrv.close(); L.__setClaudeBin(restoreBin); L.__setAckHook(null); L.__setMeshSend(null)
+afterAll(() => { schedSrv.close(); L.__setClaudeBin(restoreBin); L.__setMeshSend(null)
   for (const k of ['LANES_WAKE_DECIDE', 'LANES_FLOOD_CONTROL', 'LANES_RECEIPT_STEPS', 'LANES_INBOX_PORT']) delete process.env[k] })
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 async function until(f: () => boolean, ms = 8000) { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (f()) return true; await sleep(20) } return f() }
@@ -142,7 +140,7 @@ test('the main (an unverified caller goes to the main): accepted main → runnin
   expect(of(ev.id)).toEqual(['accepted:main', 'running:main'])
   calls.statusRecord('idle')
   expect(of(ev.id)).toEqual(['accepted:main', 'running:main', 'completed:main'])
-  expect(acks).toEqual([])
+  expect(sched.filter(r => r.path === '/lanes/scheduler' && r.action === 'ack')).toEqual([])
 })
 
 test('the main\'s turn cut (Esc) with the item put back for the next delivery: accepted again (the one step back), running again when a turn takes it', async () => {
@@ -203,7 +201,7 @@ test('a scheduled run in a lane: running is the start receipt (no auto-ack); its
   expect(lines.find(l => l.event === ev.id)!.call_id).toBe('4175')
   expect(sched.filter(x => x.run_id === run)).toEqual([])                                   // no ack, no /complete of its own
   expect((L.__events().get(ev.id)?.obligations ?? []).find((o: any) => o.kind === 'receipt')).toMatchObject({ state: 'met', run_id: run })
-  expect(acks).toEqual([])
+  expect(sched.filter(r => r.path === '/lanes/scheduler' && r.action === 'ack')).toEqual([])
 })
 
 test('a scheduled run the main takes into its turn: no M1 start receipt (its Call\'s running is it)', async () => {
@@ -215,7 +213,7 @@ test('a scheduled run the main takes into its turn: no M1 start receipt (its Cal
   expect(await until(() => itemOf(ev.id)?.state === 'offered', 2000)).toBe(true)
   await L.__mainEvent({ event: 'UserPromptSubmit', pid, prompt_id: `p175-${++p}`, dids: [itemOf(ev.id).id] })
   expect(of(ev.id)).toEqual(['accepted:main', 'running:main'])
-  expect(acks).toEqual([])
+  expect(sched.filter(r => r.path === '/lanes/scheduler' && r.action === 'ack')).toEqual([])
   await stop()
 })
 

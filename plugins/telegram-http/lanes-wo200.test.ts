@@ -29,15 +29,16 @@ function daemon(age = 300_000, m2: 'idle' | 'walled' | 'offline' = 'walled') {
         : path === '/deliveries/batch' ? { results: body.items.map(() => ({})) } : {})
     }) as typeof fetch })
   if (m2 !== 'offline') journal.write('main', '123', m2, { pid: 123, session_id: sid })
+  const blocked: Array<{ id: string; retry_after: string | null }> = [], delivery: Array<{ state: string; turn_id?: string | null }> = []
   const env: MainEnv = { journal, agent: 'adam', usageWall: () => wall, memberState: () => wall.walled ? 'walled' : 'idle',
     offer: async n => { const p = n.params as any; offers.push(p.meta.did?.split(',') ?? []); texts.push(p.content); return true },
     streamOpen: () => true, pidAlive: () => true, info: () => null, done: () => {}, undone: () => {},
     tellJoey: (_s, rule) => notices.push(rule), log: () => {}, expectedSession: () => [sid], refused: () => {}, genChanged: () => {}, context: () => '',
-    blocked: (r, retry_after) => { for (const id of r.person_message_ids) client.recordBlocked({ message_id: id, retry_after }) },
+    blocked: (r, retry_after) => { for (const id of r.person_message_ids) blocked.push({ id, retry_after }) },
     checkCall: (id, why) => client.checkWaitingCall(id, why) }
   const main = createMain(env)
   main.initMain()
-  const facts = new DeliveryFacts({ agent: 'adam', sink: f => client.recordDelivery(f) })
+  const facts = new DeliveryFacts({ agent: 'adam', sink: f => delivery.push(f) })
   const tap = new LanesTap({ facts, joey: () => null, gen: () => main.currentGen(), changed: () => {} })
   journal.observe((r, l) => tap.journal(r, l))
   const add = (kind: ItemKind, n: string, batched = false) => main.enqueue(kind, { method: 'notifications/claude/channel',
@@ -46,7 +47,7 @@ function daemon(age = 300_000, m2: 'idle' | 'walled' | 'offline' = 'walled') {
   const flush = async () => { await Bun.sleep(0); await main.pump(); await Bun.sleep(0) }
   const hook = (event: string, prompt_id: string, other: object = {}) => main.mainEvent({ event, prompt_id, session_id: sid, pid: 123, ...other })
   const clear = () => { wall.walled = false; wall.clearedMs = Date.now(); main.statusChanged(wall.clearedMs) }
-  return { env, journal, main, add, wall, offers, texts, notices, requests, calls, client, hook, clear, flush }
+  return { env, journal, main, add, wall, offers, texts, notices, requests, calls, client, blocked, delivery, hook, clear, flush }
 }
 
 test('WO-200 (a) human probes an old wall immediately', async () => {
@@ -180,11 +181,9 @@ test('WO-200 (d) two refusals write blocked receipts and replay in order once', 
     await d.main.tick()
   }
   await d.client.syncNow(true)
-  expect(d.requests.filter(r => r.method === 'PUT')).toEqual(['101', '102'].map(n => ({
-    method: 'PUT', path: '/v1/messages/' + n + '/receipt', body: { handling: { state: 'blocked', blocked_by: 'usage_limit', retry_after: n === '101' ? '2026-12-02T07:00:00Z' : null } },
-  })))
-  expect(d.requests.some(r => r.path.includes('messages') && r.method === 'POST')).toBe(false)
-  expect(d.requests.flatMap(r => r.body?.items ?? []).some(f => f.state === 'turn_end')).toBe(false)
+  expect(d.blocked).toEqual([{ id: '101', retry_after: '2026-12-02T07:00:00Z' }, { id: '102', retry_after: null }])
+  expect(d.requests.some(r => r.method === 'PUT')).toBe(false)
+  expect(d.delivery.some(f => f.state === 'turn_end')).toBe(false)
   expect(d.offers).toEqual(ids.map(id => [id]))
   d.clear(); await d.flush()
   expect(d.offers).toEqual([[ids[0]], [ids[1]], ids])
@@ -192,7 +191,7 @@ test('WO-200 (d) two refusals write blocked receipts and replay in order once', 
   await d.hook('Stop', 'retry', { phase: 'final' }); await d.flush(); await d.main.tick()
   expect(d.offers).toHaveLength(3)
   await d.client.syncNow(true)
-  expect(d.requests.flatMap(r => r.body?.items ?? []).filter(f => f.state === 'seen').map(f => f.turn_id)).toEqual(['101', '102', 'retry', 'retry'])
+  expect(d.delivery.filter(f => f.state === 'seen').map(f => f.turn_id)).toEqual(['101', '102', 'retry', 'retry'])
   expect(d.notices).toEqual(['main-wall-up', 'main-wall-down'])
 })
 

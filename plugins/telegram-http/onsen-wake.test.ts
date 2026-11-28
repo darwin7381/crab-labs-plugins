@@ -11,7 +11,6 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { randomUUID } from 'crypto'
 import * as W from './onsen-wake.ts'
-import { OnsenClient, inboundItem } from './onsen-client.ts'
 
 const ROSTER = () => ['eve', 'adam']
 const AS = ['alert-dispatcher']
@@ -284,72 +283,5 @@ describe('part 2: the router (lanes.ts, role tg) with the tap', () => {
     expect(d).toMatchObject({ rule: 'mesh-no-reply', target: 'ledger' })
     expect(x.routing().length).toBe(before + 1)
     x.L.observeRoutes(null)
-  })
-})
-
-// ================================================================== part 3: the spool (k 'w', POST /wake/batch)
-describe('part 3: wake rows through the Onsen spool', () => {
-  const CRED = 'mesh_WAKEspool**********************************'
-  function fake() {
-    const calls: Array<{ path: string; body: any }> = [], seen = new Map<string, number>()
-    const st = { down: false, missing: false, refuse: null as null | ((it: any) => string | null) }
-    let next = 1
-    const json = (status: number, j: unknown) => new Response(JSON.stringify(j), { status, headers: { 'content-type': 'application/json' } })
-    const one = (it: any) => { const was = seen.get(it.idem_key); if (was) return { id: was, duplicate: true }; const id = next++; seen.set(it.idem_key, id); return { id, duplicate: false } }
-    const f = (async (input: any, init?: any) => {
-      const path = new URL(String(input)).pathname.replace(/^\/api\/onsen/, ''), body = init?.body ? JSON.parse(init.body) : undefined
-      if (st.down) throw new TypeError('fetch failed: connect ECONNREFUSED')
-      calls.push({ path, body })
-      if (path === '/messages/batch') return json(200, { results: body.items.map(one) })
-      if (path === '/wake/batch' && st.missing) return json(404, { detail: 'Not Found' })
-      if (path === '/wake/batch') return json(200, { results: body.items.map((it: any) => { const why = st.refuse?.(it); return why ? { error: why, status: 403 } : one(it) }) })
-      return json(404, { error: 'no route' })
-    }) as typeof fetch
-    return { f, calls, st, seen }
-  }
-  const mk = (fo: ReturnType<typeof fake>) => {
-    const dir = mkdtempSync(join(tmpdir(), 'onsen-wake-spool-')), logs: string[] = []
-    return { dir, logs, c: new OnsenClient({ dir, base: 'https://core.test/api/onsen', agent: 'adam', record: true, credential: () => CRED, log: (_l, m) => logs.push(m), fetch: fo.f, intervalMs: 3_600_000 }) }
-  }
-  const row = (n: number) => W.wakeItem({ event: `mesh-${n}`, source: 'mesh', from: 'eve', text: `t${n}`, rule: 'mesh-peer-call', target: 'lane', lane: 'adam.reflex.1' },
-    { ...ctx0, ev: mesh(`mesh-${n}`, 'eve', `t${n}`, { btcc_msg_id: String(n) }), laneKind: 'reflex' }, { ...o, idem: W.idemWake('adam', 'b00t01', n, 1764064800000 + n) })
-  const joeyMsg = (id: number) => ({ message_id: id, date: 1764020000, chat: { id: 1828, type: 'private' }, from: { id: 1828, first_name: 'J' }, text: `hi ${id}` })
-
-  test('in order behind the message they follow, one batch per run; a resend (crash before the cursor) is duplicates; /healthz wake_recorded', async () => {
-    const fo = fake(), { c, dir } = mk(fo)
-    c.recordMessage(inboundItem('adam', joeyMsg(1), 'hi 1'))
-    expect(c.recordWake(row(1))).toBe(true); expect(c.recordWake(row(2))).toBe(true)
-    c.recordMessage(inboundItem('adam', joeyMsg(2), 'hi 2'))
-    c.recordWake(row(3))
-    await c.syncNow(true)
-    expect(fo.calls.map(x => x.path)).toEqual(['/messages/batch', '/wake/batch', '/messages/batch', '/wake/batch'])
-    expect(fo.calls[1]!.body.items.map((x: any) => x.idem_key)).toEqual([row(1).idem_key, row(2).idem_key])
-    expect(fo.calls[1]!.body.items[0]).toEqual(row(1))
-    expect(c.pendingBytes()).toBe(0)
-    expect(c.health()).toMatchObject({ wake_recorded: 3, posted: 5, rejected: 0 })
-    writeFileSync(join(dir, 'cursor.json'), JSON.stringify({ offset: 0 }))
-    await c.syncNow(true)
-    expect(c.health()).toMatchObject({ duplicates: 5, rejected: 0 })
-    expect(fo.seen.size).toBe(5)
-  })
-  test('Onsen down: kept, retried; one row refused (another agent\'s): rejected.jsonl, the rest sent; an Onsen without the route: rejected, nothing held', async () => {
-    const fo = fake(), { c, dir, logs } = mk(fo)
-    fo.st.down = true
-    c.recordWake(row(1)); c.recordWake(row(2))
-    await c.syncNow(true)
-    expect(c.pendingBytes()).toBeGreaterThan(0)
-    expect(c.health().last_error).toContain('/wake/batch unreachable')
-    fo.st.down = false
-    fo.st.refuse = it => it.idem_key === row(1).idem_key ? 'eve writes only its own decisions (agent=adam)' : null
-    await c.syncNow(true)
-    expect(c.pendingBytes()).toBe(0)
-    expect(c.health()).toMatchObject({ posted: 1, rejected: 1 })
-    expect(readFileSync(join(dir, 'rejected.jsonl'), 'utf8')).toContain('writes only its own decisions')
-    fo.st.refuse = null; fo.st.missing = true
-    c.recordWake(row(3)); c.recordWake(row(4)); c.recordMessage(inboundItem('adam', joeyMsg(9), 'after'))
-    await c.syncNow(true)
-    expect(c.pendingBytes()).toBe(0)
-    expect(fo.calls.slice(-2).map(x => x.path)).toEqual(['/wake/batch', '/messages/batch'])
-    expect(logs.filter(l => l.includes('rejected 2 line(s)')).length).toBe(1)
   })
 })

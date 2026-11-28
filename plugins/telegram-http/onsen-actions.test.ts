@@ -138,9 +138,9 @@ describe('OnsenActions', () => {
     const h = a.open({ ...perm, assignees: ['joey', 'joey-test'] }, 'k1')!
     a.pressedElsewhere(h, 'allow', 'joey-test', '2026-11-26T03:00:00.000Z')   // before the create answered
     await h.tail; await h.tail
-    expect(s.calls.map(c => c.path)).toEqual(['/v1/actions', '/v1/actions/1/resolve', '/v1/actions/1/applied'])
+    expect(s.calls.map(c => c.path)).toEqual(['/v1/actions', '/v1/actions/1/resolve'])
     expect(s.calls[1]!.body).toEqual({ option_id: 'allow', expected_version: 1, resolved_by: 'joey-test', at: '2026-11-26T03:00:00.000Z' })   // r3: when it was pressed
-    expect(s.calls[2]!.body).toEqual({ at: '2026-11-26T03:00:00.000Z' })
+    expect(h.appliedAt).toBe('2026-11-26T03:00:00.000Z')
     expect(s.acts.get('1')).toMatchObject({ state: 'resolved', selected_option_id: 'allow', resolved_by: 'joey-test' })
     // a presser who is not an assignee: the first assignee
     const h2 = a.open(perm, 'k2')!
@@ -158,9 +158,9 @@ describe('OnsenActions', () => {
     a.pressedElsewhere(h, 'allow', 'joey')
     await h.tail
     expect(s.calls.slice(1).map(c => [c.path, c.body])).toEqual([
-      ['/v1/actions/1/resolve', { option_id: 'allow', expected_version: 1, resolved_by: 'joey' }],
-      ['/v1/actions/1/applied', { option_id: 'allow', resolved_by: 'joey' }]])
-    expect(s.acts.get('1')).toMatchObject({ selected_option_id: 'allow' })
+      ['/v1/actions/1/resolve', { option_id: 'allow', expected_version: 1, resolved_by: 'joey' }]])
+    expect(h.selected).toBe('allow')
+    expect(s.acts.get('1').selected_option_id).toBe('deny')
     expect(a.stats.conflicts).toBe(1)
   })
 
@@ -239,7 +239,7 @@ describe('OnsenActions', () => {
     expect(a.stats.skipped).toBe(3)
   })
 
-  test('applied is reported once (WO-176 r2): the same answer again makes no call; another option than the recorded one still does', async () => {
+  test('a handled press stays on the local handle and suppresses cancellation', async () => {
     const s = standIn()
     const a = new OnsenActions({ req: s.req, log })
     const h = a.open(perm, 'k')!
@@ -249,11 +249,11 @@ describe('OnsenActions', () => {
     a.applied(h, {})
     a.applied(h, { option_id: 'deny', resolved_by: 'joey' })
     await h.tail
-    expect(s.calls.filter(c => c.path === '/v1/actions/1/applied')).toHaveLength(1)
+    expect(s.calls.filter(c => c.path === '/v1/actions/1/applied')).toHaveLength(0)
     expect(h.selected).toBe('deny')
     a.applied(h, { option_id: 'allow', resolved_by: 'joey' })          // what was really pressed differs: Onsen hears it (and answers 409: applied already)
     await h.tail
-    expect(s.calls.filter(c => c.path === '/v1/actions/1/applied')).toHaveLength(2)
+    expect(s.calls.filter(c => c.path === '/v1/actions/1/applied')).toHaveLength(0)
     // two cancels queued for one Action (the officer's closeGone and the channel's close): one call
     const h2 = a.open(perm, 'k2')!
     a.cancel(h2, 'menu gone'); a.cancel(h2, 'session closed')
@@ -315,7 +315,7 @@ describe('OnsenActions', () => {
     a.pressedElsewhere(h2, 'allow', 'joey', T.at)
     await h2.tail
     expect(s.calls.filter(c => c.path === '/v1/actions/2/resolve').map(c => c.body)).toEqual([{ option_id: 'allow', expected_version: 1, resolved_by: 'joey', at: T.at }])
-    expect(s.calls.find(c => c.path === '/v1/actions/2/applied')!.body).toEqual({ at: T.at })
+    expect(h2.appliedAt).toBe(T.at)
     const bad = await s.req('POST', '/v1/actions', { ...perm, pressed_at: T.at })   // the stand-in still refuses a field Onsen does not take
     expect(bad!.status).toBe(400)
   })
@@ -326,7 +326,7 @@ describe('OnsenActions', () => {
     const h = a.open(perm, 'k')!
     a.pressedElsewhere(h, 'deny', 'duty-officer', '2026-11-26T04:30:00.000Z', true)
     await h.tail
-    expect(s.calls.map(c => c.path)).toEqual(['/v1/actions', '/v1/actions/1/resolve', '/v1/actions/1/applied'])
+    expect(s.calls.map(c => c.path)).toEqual(['/v1/actions', '/v1/actions/1/resolve'])
     expect(s.calls[1]!.body).toEqual({ option_id: 'deny', expected_version: 1, resolved_by: 'duty-officer', at: '2026-11-26T04:30:00.000Z' })
     expect(s.acts.get('1')).toMatchObject({ state: 'resolved', resolved_by: 'duty-officer', selected_option_id: 'deny', assignees: ['joey'] })
     // without asIs a name that is not an assignee is taken for the first assignee (a Telegram presser Onsen has no name for)

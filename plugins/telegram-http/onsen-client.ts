@@ -13,11 +13,6 @@
 //   - step 2 (WO-142): draws and lifts restart lines (Joey's /clear and its button: POST /restart-lines, /restart-lines/lift), directly with a short
 //     timeout, else through the spool in order; keeps the lines it drew in <STATE_DIR>/onsen/lines.json so the spool's answer respects them too;
 //     records edit_delivered (an edited message of Joey's reached the agent).
-//   - step 3 (WO-143): delivery facts (k 'd': delivered / in_session / seen / turn_end of Joey's messages, POST /deliveries/batch) and the main's status (k 's', POST
-//     /status/batch; 1.45.1: the registry's states and last_activity_at) go through the same spool, in order behind the messages they are about (onsen-status.ts decides them; server.ts wires them). A batch
-//     refused as a whole (an Onsen without those routes) goes to rejected.jsonl: the messages behind it are never held.
-//   - WO-147 (step 4a, onsen-wake.ts): every wake decision (one route record of the lanes router) as one row (k 'w', POST /wake/batch), through the same
-//     spool and the same batch rules as the step 3 facts: written locally first, synced in order, a resent line keeps its idem_key (duplicate = sent).
 //   - WO-145 (the half Joey sees, onsen-visible.ts): a send context may carry `redact` (a reply's page links with their one-time form keys → the links as the
 //     agent wrote them): the record keeps the text WITHOUT the keys.
 // The credential (the agent's mesh credential, read from the agent-inbox daemon's state dir) is never logged, printed or written anywhere.
@@ -26,8 +21,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from 'fs'
 import { randomUUID } from 'crypto'
 import { basename, join } from 'path'
-import { OnsenIds } from './onsen-connector.ts'
-import type { WakeItem } from './onsen-wake.ts'
+import type { ItemReport } from './onsen-receive.ts'
 
 // ------------------------------------------------------------------ records (the contract posted on WO-139)
 export type OnsenAttachment = { name?: string; mime?: string; size?: number; file_id?: string }
@@ -76,25 +70,14 @@ export type DeliveryFact = { idem_key: string; agent: string; client: 'telegram'
  *  the newest write to the main's transcript or its subagents' (null = none found) */
 export type StatusState = 'offline' | 'idle' | 'busy' | 'waiting' | 'stuck' | 'walled' | 'starting'   // walled, starting: WO-165 A (Jev reads the screen; Onsen 0.12.5)
 export type StatusFact = { idem_key: string; agent: string; state: StatusState; at: string; detail?: Record<string, unknown>; last_activity_at?: string | null }
-/** WO-145: the form answers this daemon queued for the main (POST /forms/ack), when Onsen did not take the ack directly */
-export type FormAck = { ids: number[]; at: string }
 /** fw (WO-190, local only, never posted): this message's files are being stored in Onsen; the sync joins their ids when it sends the line */
-import type { ItemReport } from './onsen-receive.ts'
 export type SpoolLine = { k: 'm'; r: OnsenItem; fw?: 1 } | { k: 'e'; r: OnsenEvent } | { k: 'l'; r: RestartLineDraw } | { k: 'u'; r: RestartLineLift }
-  | { k: 'd'; r: DeliveryFact } | { k: 's'; r: StatusFact } | { k: 'a'; r: FormAck } | { k: 'w'; r: WakeItem }
+  | { k: 's'; r: StatusFact }
   /** WO-164: one thread event (lanes-threads.ts OnsenThreadEvent), POST /threads/events */
   | { k: 't'; r: Record<string, unknown> & { thread: string; dedupe: string } }
-  /** WO-175: one moment of a Call this agent received (onsen-status.ts CallFacts), PUT /v1/calls/<id>/state */
-  | { k: 'c'; r: CallStateLine }
   | { k: 'ir'; r: ItemReport }
-  | { k: 'blocked'; r: BlockedReceipt }
-  /** WO-192: what Telegram did with a reply written into Onsen first (onsen-first.ts), POST /messages/<message_id>/delivery */
-  | { k: 'r'; r: DeliveryReportLine }
-type BlockedReceipt = ({ message_id: string } | { chat: string; client_msg_id: string }) & { retry_after: string | null }
+  | { k: 'a' | 'r' | 'd' | 'w' | 'blocked' | 'c'; r: unknown } // historical spool entries, read only
 const SPOOL_KINDS = new Set(['ir', 'blocked', 'm', 'e', 'l', 'u', 'd', 's', 'a', 'w', 't', 'c', 'r'])
-/** WO-192 (Onsen 0.31.0, WO-191 B): one delivery report: the Onsen message A wrote, and the body Onsen takes */
-export type DeliveryReportLine = { message_id: number
-  body: { client: 'telegram'; state: 'sent' | 'failed'; client_msg_ids: string[]; at: string; error?: string } }
 /** WO-175 (Onsen contract v1 §4, §9; Onsen 0.24.1: a pulled item carries its `call_id`): the Call a received item is, as the item names it */
 export type CallRef = { kind: 'peer_call' | 'scheduled' | 'alert' | 'board'; id: string }
 export type CallWait = 'wall' | 'offline' | 'restart'
@@ -119,11 +102,9 @@ export function answeredCall(refs: unknown): string | null {
 }
 /** a run's Call as Onsen lists it (GET /v1/calls?ref_kind=run&ref_value=<run>), or why there is none to say */
 export type RunCallLookup = { found: { id: string; state: string | null; result: unknown } } | { none: true } | CallLineFate
-/** btcc-receipt's budget (Chiron 05:55Z): the first try and three more, all within 10 s */
-export const CALL_RECEIPT_WAIT_MS = 10_000
 const CALL_RETRY_AT = [0, 1_000, 3_000, 7_000]
 /** the batch route of each kind that is posted in runs (≤500 a batch) */
-const BATCH_PATH: Record<string, string> = { d: '/deliveries/batch', s: '/status/batch', w: '/wake/batch', t: '/threads/events' }
+const BATCH_PATH: Record<string, string> = { s: '/status/batch', t: '/threads/events' }
 
 export const idemIn = (agent: string, chat: string, id: string | number): string => `tg:${agent}:${chat}:in:${id}`
 export const idemOut = (agent: string, chat: string, id: string | number): string => `tg:${agent}:${chat}:out:${id}`
@@ -435,7 +416,6 @@ export class OnsenClient {
   private appendWarnAt = 0
   private authWarnAt = 0
   private observers: Array<(line: SpoolLine) => void> = []
-  /** WO-175: what became of the Call lines sent lately (idem → fate), and who waits for one not sent yet */
   private itemReports = 0
   private itemAck?: (line: ItemReport, ok: boolean) => void
 
@@ -457,15 +437,13 @@ export class OnsenClient {
     return true
   }
 
-  private callFates = new Map<string, CallLineFate>()
-  private callWaits = new Map<string, Array<(f: CallLineFate) => void>>()
   /** WO-190: a message's files being stored (its idem_key → when the upload started, and its end), and the ids once known ([] = none: failed, late,
    *  lost with a restart, or refused by Onsen) */
   private fileJobs = new Map<string, { at: number; p: Promise<void> }>()
   private fileIds = new Map<string, string[]>()
   readonly stats = { recorded: 0, posted: 0, duplicates: 0, rejected: 0, last_ok_at: null as string | null, last_error: null as string | null,
-    lines_drawn: 0, lines_lifted: 0, lines_spooled: 0, edits_delivered: 0, deliveries_recorded: 0, status_recorded: 0, wake_recorded: 0,
-    thread_events: 0, thread_conflicts: 0, calls_spooled: 0, calls_put: 0, calls_unchanged: 0,
+    lines_drawn: 0, lines_lifted: 0, lines_spooled: 0, edits_delivered: 0, status_recorded: 0,
+    thread_events: 0, thread_conflicts: 0,
     files_uploaded: 0, files_upload_failed: 0, files_late: 0, files_lost: 0, files_refused: 0 }
   /** 1.58.32: the records Onsen refused for good (a 4xx; also counted in `rejected`) and the last of them; /healthz onsen.skipped */
   readonly skipped = { count: 0, last: null as (SkippedInfo & { at: string; key: string }) | null }
@@ -573,11 +551,7 @@ export class OnsenClient {
   }
   recordEvent(ev: OnsenEvent): void { this.append({ k: 'e', r: ev }) }
   recordLine(line: SpoolLine | null): void { if (line) this.append(line) }
-  /** step 3 (WO-143): a delivery fact / a status of the main, through the same spool (in order behind the message they are about) */
-  recordDelivery(f: DeliveryFact): void { if (this.append({ k: 'd', r: f })) this.stats.deliveries_recorded++ }
   recordStatus(f: StatusFact): void { if (this.append({ k: 's', r: f })) { this.stats.status_recorded++; this.fastStatus(f) } }
-  /** WO-147: one wake decision (onsen-wake.ts wakeItem), through the same spool; false = not spooled (recording off, or the append failed) */
-  recordWake(w: WakeItem): boolean { const ok = this.append({ k: 'w', r: w }); if (ok) this.stats.wake_recorded++; return ok }
   /** WO-164: thread events (lanes-threads.ts threadEvents), one spool line each, posted in order as /threads/events batches; false = not all spooled */
   recordThreads(evs: unknown[]): boolean {
     let ok = true
@@ -585,48 +559,6 @@ export class OnsenClient {
     if (ok) this.stats.thread_events += evs.length
     return ok
   }
-  /** WO-175: one moment of a Call (onsen-status.ts CallFacts), PUT /v1/calls/<id>/state when the spool reaches it. false = not spooled */
-  recordBlocked(r: BlockedReceipt): boolean { return this.append({ k: 'blocked', r }) }
-  recordCall(c: CallStateLine): boolean { const ok = this.append({ k: 'c', r: c }); if (ok) this.stats.calls_spooled++; return ok }
-  /** WO-175 (Chiron 05:55Z): wait for what Onsen says to Call line `idem` (spooled already): the spool is tried at once and three more times within
-   *  `ms`, whatever its backoff, as btcc-receipt does. A line sent before keeps its fate; one still unsent after `ms` stays in the spool (pending) */
-  callFate(idem: string, ms = CALL_RECEIPT_WAIT_MS): Promise<CallLineFate> {
-    const known = this.callFates.get(idem)
-    if (known) return Promise.resolve(known)
-    if (!this.cfg.record) return Promise.resolve({ fate: 'pending', why: 'recording to Onsen is off' })
-    if (!this.cfg.credential()) return Promise.resolve({ fate: 'nocred', why: this.noCredText() })
-    return new Promise(resolve => {
-      const timers: Array<ReturnType<typeof setTimeout>> = []
-      let done = false
-      const finish = (f: CallLineFate): void => {
-        if (done) return
-        done = true
-        for (const t of timers) clearTimeout(t)
-        const ws = (this.callWaits.get(idem) ?? []).filter(w => w !== finish)
-        if (ws.length) this.callWaits.set(idem, ws); else this.callWaits.delete(idem)
-        resolve(f)
-      }
-      this.callWaits.set(idem, [...(this.callWaits.get(idem) ?? []), finish])
-      for (const at of CALL_RETRY_AT) if (at < ms) timers.push(setTimeout(() => { if (!done) void this.syncNow(true) }, at))
-      timers.push(setTimeout(() => finish({ fate: 'pending', why: this.stats.last_error ?? 'Onsen did not answer' }), ms))
-      for (const t of timers) (t as any).unref?.()
-    })
-  }
-  private settleCall(idem: string, f: CallLineFate): void {
-    this.callFates.set(idem, f)
-    if (this.callFates.size > 2_000) this.callFates.delete(this.callFates.keys().next().value!)
-    for (const w of this.callWaits.get(idem) ?? []) { try { w(f) } catch {} }
-  }
-  private noCredText(): string { return `no mesh credential${this.cfg.credentialWhere ? ` at ${this.cfg.credentialWhere}` : ''}` }
-  /** WO-175 (Chiron 05:55Z): run `run`'s Call in Onsen (this agent's own Calls), tried again while Onsen does not answer or answers 5xx, within `ms` */
-  async findRunCall(run: string, ms = CALL_RECEIPT_WAIT_MS): Promise<RunCallLookup> {
-    if (!this.cfg.credential()) return { fate: 'nocred', why: this.noCredText() }
-    const r = await this.retried(`/v1/calls?ref_kind=run&ref_value=${encodeURIComponent(run)}&limit=5`, ms)
-    if ('fate' in r) return r
-    const items = Array.isArray(r.json?.items) ? r.json.items.filter((c: any) => c && c.id != null) : []
-    return items.length ? { found: { id: String(items[0].id), state: items[0].state ?? null, result: items[0].result ?? null } } : { none: true }
-  }
-  /** WO-175: one Call as Onsen has it now (GET /v1/calls/<id>), or null */
   async getCall(id: string, ms = 3_000): Promise<{ state: string | null; result: unknown; thread_id?: string; conversation_id?: string; caller?: string } | null> {
     const r = await this.retried(`/v1/calls/${encodeURIComponent(id)}`, ms).catch(() => null)
     if (!r || 'fate' in r) return null
@@ -818,7 +750,7 @@ export class OnsenClient {
     if (bytes.byteLength > maxBytes) throw new Error(`too large (${bytes.byteLength} bytes)`)
     return { status: r.status, bytes, mime }
   }
-  /** WO-175: a JSON PUT with this agent's credential (a Call's state) */
+  /** PUT a claim report with the same idempotency key on retries. */
   private async put(path: string, body: unknown, cred: string, timeoutMs?: number, headers?: Record<string, string>): Promise<{ status: number; json: any }> {
     const r = await this.f(`${this.cfg.base}${path}`, { method: 'PUT', headers: this.headers(cred, headers), body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs ?? this.cfg.postTimeoutMs ?? 15_000) })
     let json: any = null
@@ -884,8 +816,8 @@ export class OnsenClient {
         this.writeCursor(t.end); this.ok(); i++
         continue
       }
-      if (t.line.k === 'd' || t.line.k === 's' || t.line.k === 'w' || t.line.k === 't') {
-        // step 3 (WO-143): a run of delivery facts (or of status lines; WO-147: of wake decisions; WO-164: of thread events): one batch (≤500), in its place in the order
+      if (t.line.k === 's' || t.line.k === 't') {
+        // Batch consecutive status or thread records in arrival order.
         const k = t.line.k, path = BATCH_PATH[k]!
         const run: Array<{ line: SpoolLine; end: number }> = []
         while (i < todo.length && run.length < 500 && todo[i]!.line?.k === k) { run.push({ line: todo[i]!.line!, end: todo[i]!.end }); i++ }
@@ -912,22 +844,10 @@ export class OnsenClient {
         }
         return this.failStatus(r, path)
       }
-      // Old spools can contain form acks and Telegram delivery reports. Both were drained before cutover.
-      if (t.line.k === 'a' || t.line.k === 'r') {
+      // These records were drained before cutover. A restored pre-cutover spool
+      // must advance past them without replaying an obsolete delivery or projection.
+      if (t.line.k !== 'ir' && t.line.k !== 'e' && t.line.k !== 'm') {
         this.writeCursor(t.end); i++
-        continue
-      }
-      if (t.line.k === 'blocked') {
-        const receipt = t.line.r
-        const ids = new OnsenIds({ request: (m, p, b, ms) => this.request(m, p, b, ms) })
-        const id = 'message_id' in receipt ? receipt.message_id : /^form-(\d+)$/.exec(receipt.client_msg_id)?.[1] ?? await ids.message(receipt.chat, receipt.client_msg_id)
-        const path = id ? `/v1/messages/${encodeURIComponent(id)}/receipt` : ''
-        const r = id ? await this.put(path, { handling: { state: 'blocked', blocked_by: 'usage_limit', retry_after: receipt.retry_after } }, cred)
-          : { status: 404, json: { error: 'message no longer exists' } }
-        if (r.status >= 200 && r.status < 300) this.stats.posted++
-        else if (refusedForGood(r)) this.reject(t.line, `blocked receipt: HTTP ${r.status} ${callSaid(r.json)}`)
-        else return this.failStatus(r, path)
-        this.writeCursor(t.end); this.ok(); i++
         continue
       }
       if (t.line.k === 'ir') {
@@ -946,26 +866,6 @@ export class OnsenClient {
         this.writeCursor(t.end)
         this.itemReports = Math.max(0, this.itemReports - 1)
         this.ok(); i++; continue
-      }
-      if (t.line.k === 'c') {
-        // WO-175: one moment of a received Call (the id its pulled item carried)
-        const c = t.line.r, id = c.call_id
-        const r = await this.put(`/v1/calls/${encodeURIComponent(id)}/state`, c.body, cred).catch(e => ({ status: 0, json: { error: errText(e) } }))
-        if (r.status >= 200 && r.status < 300) {
-          const st = r.json?.data?.state
-          if (st && st !== c.body.state) this.stats.calls_unchanged++; else this.stats.calls_put++
-          this.settleCall(c.idem, { fate: 'took', state: st ?? null })
-        }
-        // a step Onsen already has past (it took a reply, or a lane's exit row, first), a Call that is over, or (1.58.32) one this agent is not the
-        // recipient of (403 not_authorized), a Call Onsen does not have (404): refused for good, not retried, nothing behind it held
-        else if (refusedForGood(r)) {
-          this.reject(t.line, `PUT /v1/calls/${id}/state ${c.body.state}: HTTP ${r.status} ${callSaid(r.json)}`,
-            { kind: 'c', path: `/v1/calls/${id}/state`, status: r.status, code: errCode(r.json) })
-          this.settleCall(c.idem, { fate: 'refused', status: r.status, said: callSaid(r.json) })
-        }
-        else return this.failStatus(r, `/v1/calls/${id}/state`)
-        this.writeCursor(t.end); this.ok(); i++
-        continue
       }
       if (t.line.k === 'e') {
         const r = await this.post('/events', t.line.r, cred).catch(e => ({ status: 0, json: { error: errText(e) } }))
@@ -1502,15 +1402,6 @@ export function assigneesOf(chats: unknown[]): string[] {
   return out.length ? out : ['joey']
 }
 /** ONSEN_ACTIONS: unset or empty = on; 0 / off / false / no = off; else a comma list of agent names or `*` */
-/** WO-175: ONSEN_CALL_STATE, the stop switch of the Call moments this agent's daemon reports (on unless 0 / off / false / no; a comma list: those
- *  agents, or `*`). On, the two old start receipts (a lane taking a scheduled run, the main binding it into a turn) are gone: the moments replace them */
-export function callStateOn(env: NodeJS.ProcessEnv, agent: string): boolean {
-  const v = (env.ONSEN_CALL_STATE ?? '').trim()
-  if (!v) return true
-  if (['0', 'off', 'false', 'no'].includes(v.toLowerCase())) return false
-  const list = v.split(',').map(x => x.trim()).filter(Boolean)
-  return list.includes('*') || list.includes(agent)
-}
 export function actionsOn(env: NodeJS.ProcessEnv, agent: string): boolean {
   const v = (env.ONSEN_ACTIONS ?? '').trim()
   if (!v) return true
@@ -1612,15 +1503,18 @@ export class OnsenActions {
       const who = asIs ? by : h.assignee(by)
       const r = await this.call('POST', `/v1/actions/${h.id}/resolve`, { option_id, expected_version: h.version, resolved_by: who, ...(at ? { at } : {}) })
       if (r?.status === 200) { this.take(h, r.json?.data); this.stats.resolved++; this.o.log('info', `onsen action ${h.id}: resolved ${option_id} by ${who} (pressed ${where})`) }
-      else if (r?.status === 409) { this.stats.conflicts++; this.o.log('info', `onsen action ${h.id}: answered in Onsen first (${errOf(r)}); reporting what was pressed ${where} (${option_id})`) }
+      else if (r?.status === 409) { this.stats.conflicts++; this.o.log('info', `onsen action ${h.id}: answered in Onsen first (${errOf(r)}); recorded local choice ${where} (${option_id})`) }
       else { this.fail(`resolve ${h.id}`, r); return }
-      await this.appliedNow(h, { ...(at ? { at } : {}), ...(r?.status === 409 ? { option_id, resolved_by: who } : {}) })
+      this.applied(h, { at, option_id })
     })
   }
   /** this daemon pressed the answer (for Onsen's control item, or the answer Telegram gave before it came: option_id and resolved_by) */
   applied(h: ActionHandle | null | undefined, o: { at?: string; option_id?: string; resolved_by?: string } = {}): void {
     if (!h) return
-    this.queue(h, () => this.appliedNow(h, o))
+    // Keep the local prompt from being cancelled after a handled press. Onsen
+    // projects applied_at from the control Item's completed report.
+    h.appliedAt ??= o.at ?? new Date().toISOString()
+    if (o.option_id) h.selected = o.option_id
   }
   /** the menu went away, the session closed, or nothing was pressed: cancelled (an open Action, or one answered in Onsen and not applied). A version that
    *  moved meanwhile is read once and tried again */
@@ -1696,14 +1590,6 @@ export class OnsenActions {
   }
   health(): Record<string, unknown> { return { on: this.on, ...this.stats, followed: this.byKey.size } }
 
-  private async appliedNow(h: ActionHandle, o: { at?: string; option_id?: string; resolved_by?: string }): Promise<void> {
-    if (!h.id) return
-    if (h.appliedAt && (!o.option_id || o.option_id === h.selected)) return   // WO-176 r2: applied is reported once
-    const r = await this.call('POST', `/v1/actions/${h.id}/applied`, o)
-    if (r?.status === 200) { this.take(h, r.json?.data); this.stats.applied++; this.o.log('info', `onsen action ${h.id}: applied${o.option_id ? ` ${o.option_id}` : ''}`) }
-    else if (r?.status === 409) { this.stats.conflicts++; this.o.log('info', `onsen action ${h.id}: applied not recorded (${errOf(r)})`) }
-    else this.fail(`applied ${h.id}`, r)
-  }
   private take(h: ActionHandle, d: any): void {
     if (!d || typeof d !== 'object') return
     if (d.id != null && h.id == null) { h.id = String(d.id); this.byId.set(h.id, h) }

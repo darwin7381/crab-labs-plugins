@@ -60,7 +60,6 @@ plugins/telegram-http/server.ts::onsenFacts.delivered(chat_id, msgId)
 plugins/telegram-http/server.ts::Lanes.observeLanes({ journal:
 plugins/telegram-http/lanes.ts::export function observeLanes(
 plugins/telegram-http/lanes-state.ts::observe(fn: (row: Row
-plugins/telegram-http/onsen-client.ts::recordDelivery(f: DeliveryFact)
 plugins/telegram-http/lanes.ts::export function mainChatBlock(
 plugins/telegram-http/server.ts::mainChat: (a, o) => onsen ? onsen.queryHistory(a, 'hook', o)
 plugins/telegram-http/lanes-boundary.ts::export const BOUNDARY_LOOK_LINE
@@ -172,17 +171,12 @@ plugins/telegram-http/lanes-events.ts::else if (ob.state === 'handed' || (main &
 plugins/telegram-http/screen-status.ts::const workAt = since('main.work'
 plugins/telegram-http/lanes.ts::r.back ? { thinking_since: r.back }
 plugins/telegram-http/onsen-status.ts::export class CallFacts
-plugins/telegram-http/onsen-client.ts::recordCall(c: CallStateLine): boolean
-plugins/telegram-http/onsen-client.ts::if (t.line.k === 'c') {
 plugins/telegram-http/lanes.ts::export function callRefOf(ev: InEvent): CallRef | null
 plugins/telegram-http/lanes.ts::function callsEnded(laneId: string
-plugins/telegram-http/server.ts::const CALL_STATE = Lanes.LANES_ON
 plugins/telegram-http/onsen-status.ts::handedOver(event: string, call: CallRef, at = iso(this.now())): void
 plugins/telegram-http/onsen-status.ts::this.emit(event, call, 'accepted', 'main', at, undefined, false, true)
 plugins/telegram-http/lanes.ts::its receipt goes to BTCC /complete (WO-175: the one case left)
 plugins/telegram-http/onsen-status.ts::async receipt(event: string, call: CallRef
-plugins/telegram-http/onsen-client.ts::callFate(idem: string, ms = CALL_RECEIPT_WAIT_MS)
-plugins/telegram-http/server.ts::onsen.recordCall(line) }, client: onsen })
 plugins/telegram-http/lanes.ts::if (batchRule(v.rule, cfg)) return { id, match: {}, to: 'main', batch: true }
 plugins/telegram-http/lanes-threads.ts::return clip80(topic ? `${who} 私訊／${String(it.topic_name ?? '').trim() || `#${topic}`}` : `${who} 私訊`)
 plugins/telegram-http/lanes.ts::export function refreshDmTitles(): number {
@@ -310,10 +304,8 @@ plugins/telegram-http/onsen-client.ts::const RETRYABLE_4XX = new Set([401, 408, 
 plugins/telegram-http/onsen-client.ts::export const refusedForGood = (r: { status: number; json: any }): boolean =>
 plugins/telegram-http/onsen-client.ts::export const credentialRefused = (r: { status: number; json: any }): boolean => r.status === 401 || (r.status === 403 && errCode(r.json) === 'not_authenticated')
 plugins/telegram-http/onsen-client.ts::skipped: { count: this.skipped.count, last: this.skipped.last }
-plugins/telegram-http/onsen-client.ts::{ kind: 'c', path: `/v1/calls/${id}/state`, status: r.status, code: errCode(r.json) })
 plugins/telegram-http/onsen-client.ts::    if (credentialRefused(r)) {
 plugins/telegram-http/test-fixtures/onsen-standin.ts::只有收件人 ${rcp} 的常駐程式能回報這一通的狀態
-plugins/telegram-http/onsen-spool-skip.test.ts::calls 541/546/573/580/590/598/616, all caller state, three moments each
 plugins/telegram-http/lanes.ts::ev.reply_to_id || ev.answers_call || ev.urgency === 'silent'
 plugins/telegram-http/server.ts::const answers = Onsen.answeredCall(body?.refs) ?? undefined
 plugins/telegram-http/server.ts::const call = !answers && body?.call_id != null
@@ -374,3 +366,5 @@ plugins/telegram-http/server.ts::await deliverFormAnswer(fi, item.main ? 'main' 
 plugins/telegram-http/onsen-take.ts::code === 'not_current_connector' ? 45_000 : 60_000
 plugins/telegram-http/onsen-connector.ts::export class HeldInOnsen extends Error
 plugins/telegram-http/onsen-take-daemon.test.ts::the old hand-over routes and local stores are gone
+plugins/telegram-http/onsen-client.ts::const path = '/v1/items/' + encodeURIComponent(line.item_id) + '/report'
+plugins/telegram-http/onsen-spool-skip.test.ts::old receipts advance locally

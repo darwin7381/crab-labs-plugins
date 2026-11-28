@@ -212,7 +212,6 @@ export interface LanesDeps {
   schedulerCall?: (runId: string, action: 'ack' | 'complete', outcome?: string, note?: string) => Promise<string>
   /** inbox role, WO-205 (Chiron mesh-13475): M2's registry disagreement as a BTCC page alert (POST /api/fleet/main-registry, this daemon's mesh credential) */
   inboundLog?: (body: Record<string, unknown>) => Promise<number | undefined>
-  schedulerTaken?: (runId?: string) => void
   registryAlert?: (a: { state: 'open' | 'clear'; session?: string; pid?: number; why?: string }) => Promise<string>
   /** inbox role, WO-128 (item 4): the cards that wait on the main's decision (BTCC /due over its longest window, the past due included), for the context the
    *  main gets back after a /clear, a compaction or a restart */
@@ -446,7 +445,7 @@ function mainEnv() {
     toolGate: mainToolGate,
     woke: mainWoke,                                                                 // WO-128 (item 9): one main_wake row per wake (switch on)
     mailbox: async (): Promise<string> => deferDecisionsOn() ? mailboxContext() : '',   // WO-128 (item 4): what waits in the mailbox, when the main gets its context back
-    bound: mainTookItems,                                                           // lanes-golive (C3): the main has it: a scheduler run's start receipt                                                         // 002w (D): one receipt per scheduler run, the main included                                                         // 002w (D): the main's own completion of a scheduler run
+    bound: (items: Row[]) => cardsTold(items.filter(row => row.kind !== 'digest')),
     memberState: memberNow,                                                         // WO-177 一: 「can the main take an item now」 is the status record's (decideWake's member)
   }
 }
@@ -494,27 +493,6 @@ async function mailboxContext(): Promise<string> {
   const known = [...new Map((events?.rows(e => waitsOf(e).some(pendingWait)) ?? []).flatMap(e => waitsOf(e).filter(pendingWait)).map(w => [w.mail_id, w])).values()]
   return `〔信箱〕等你決定的件現在讀不到（${why}）${known.length ? `；分流器記得 ${known.length} 件：${known.slice(0, 10).map(w => `#${w.mail_id}「${clip(w.title || w.decide, 40)}」`).join('、')}` : ''}；用 mailbox_list 看。`
 }
-/** lanes-golive (C3): the main's turn took these items in (M1 bound). For a scheduler run handed to the main that is its start receipt (開工回執): the
- *  fleet acks a run when the transcript shows the delivery consumed; with lanes on M1 is the one that knows (a lane's run is acked when the lane takes
- *  it, server.ts). Once per run. */
-const ackedRuns = new Set<string>()
-export let __ackHook: ((runId: string) => void) | null = null
-export const __setAckHook = (f: ((runId: string) => void) | null): void => { __ackHook = f }          // tests only
-function mainTookItems(items: Row[]): void {
-  cardsTold(items.filter(r => r.kind !== 'digest'))                               // WO-137 甲 (item 2): a digest taken in with these items (pulled, or bound to a turn)
-  // WO-175: with the Call moments on, a run bound into the main's turn is its Call's `running` (the tap): BTCC reads that as the start receipt
-  if (onsenTap?.calls) return
-  for (const it of items) {
-    const e = it.event ? events?.get(String(it.event)) : undefined
-    for (const o of ((e?.obligations ?? []) as Ob[])) if (o.kind === 'receipt' && o.run_id && !ackedRuns.has(String(o.run_id))) {
-      const run = String(o.run_id)
-      ackedRuns.add(run); if (ackedRuns.size > 1000) ackedRuns.clear()
-      if (__ackHook) { __ackHook(run); continue }
-      void inboxPost('/lanes/scheduler', { run_id: run, action: 'ack' }).then(r => D.log('info', `lanes: scheduler run ${run} taken by the main: ${r?.text ?? 'the agent-inbox daemon did not answer'}`))
-    }
-  }
-}
-
 // lanes-golive: what the main still owes survives its compaction. The daemon (the one writer) keeps .lanes/open-handoffs.md, read-only, one line per open
 // main obligation (a lane's hand-over, or an item routed to the main), rewritten whenever an event record changes and the list with it. The fleet's
 // re-anchor hook (WO-119, reanchor_hook.py) reads it after a compaction. Line format (fields separated by 「｜」):
@@ -8701,10 +8679,6 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
     if (D.inboundLog && p === '/lanes/inbound-log' && req.method === 'POST') {
       const body = await readBody(req)
       sendJson(res, 200, { id: await D.inboundLog?.(body) }); return true
-    }
-    if (D.schedulerTaken && p === '/lanes/scheduler-taken' && req.method === 'POST') {
-      D.schedulerTaken?.((await readBody(req)).run_id)
-      sendJson(res, 200, { ok: true }); return true
     }
     if (p === '/lanes/registry-alert' && req.method === 'POST') {       // WO-205: M2's registry disagreement → BTCC (this daemon's credential)
       const b = await readBody(req)
