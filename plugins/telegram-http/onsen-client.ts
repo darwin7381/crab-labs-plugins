@@ -86,7 +86,7 @@ export type StatusFact = { idem_key: string; agent: string; state: StatusState; 
 export type FormAck = { ids: number[]; at: string }
 /** fw (WO-190, local only, never posted): this message's files are being stored in Onsen; the sync joins their ids when it sends the line */
 import type { ItemReport } from './onsen-receive.ts'
-import { claudeSessionId, roamerSessionId } from './onsen-items.ts'
+import { claudeSessionId, roamerSessionId, type InboxItem } from './onsen-items.ts'
 import { isDeepStrictEqual } from 'node:util'
 import { ItemWrites, type ItemWrite } from './onsen-item-writes.ts'
 export type SpoolLine = { k: 'm'; r: OnsenItem; fw?: 1 } | { k: 'e'; r: OnsenEvent } | { k: 'l'; r: RestartLineDraw } | { k: 'u'; r: RestartLineLift }
@@ -458,9 +458,9 @@ export class OnsenClient {
   private itemReports = 0
   private reportedThrough: number
   private refusedReportEnd: number
-  private itemAck?: (line: ItemReport, ok: boolean) => void
+  private itemAck?: (line: ItemReport, ok: boolean, row?: InboxItem) => void
 
-  watchItemReports(replay: (line: ItemReport) => void, ack: (line: ItemReport, ok: boolean) => void): void {
+  watchItemReports(replay: (line: ItemReport) => void, ack: (line: ItemReport, ok: boolean, row?: InboxItem) => void): void {
     this.itemAck = ack
     this.itemReports = 0
     for (const { line } of this.pendingReports()) { this.itemReports++; replay(line.r) }
@@ -1081,7 +1081,7 @@ export class OnsenClient {
           }
         }
         if (ok) this.itemWrites.observe(r.json?.data)
-        this.itemAck?.(line, ok)
+        this.itemAck?.(line, ok, ok ? r.json?.data : undefined)
         this.writeCursor(this.readCursor(), t.end)
         this.itemReports = Math.max(0, this.itemReports - 1)
         this.ok(); i++; continue

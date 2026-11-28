@@ -19,7 +19,7 @@ function sameState(before: ReceivingState, now: ReceivingState): boolean {
 }
 // Hooks and transcripts identify a Claude process locally. Lane events identify their lane directly.
 const localSession = (row: Claim) => row.registry_session ?? row.session_id
-type Done = { item_id: string; claim_id: string; at: number }
+type Done = { item_id: string; claim_id: string; at: number; version?: number }
 type Spool = {
   cfg: { agent: string }
   recordItemReport(line: ItemReport): boolean
@@ -99,7 +99,17 @@ export class Claims implements ClaimStore {
   }
   inSession(id: string): boolean { return !!this.rows[id]?.in_session_at }
   blocked(): boolean { return this.spool.hasItemReports() }
-  completed(id: string): boolean { return this.done.some(d => d.item_id === id && d.at > this.now() - week) }
+  completed(id: string, offered?: InboxItem): boolean {
+    const prior = this.done.find(d => d.item_id === id && d.at > this.now() - week)
+    if (!prior) return false
+    // Old ledgers cached HTTP success even for unread mail returned to waiting.
+    if (offered?.kind === 'mail' && offered.state === 'waiting' && (prior.version === undefined || offered.version > prior.version)) {
+      this.done = this.done.filter(d => d.item_id !== id)
+      this.save()
+      return false
+    }
+    return true
+  }
 
   private save(connector = this.connector, pollOffset = this.pollOffset): void {
     mkdirSync(dirname(this.file), { recursive: true, mode: 0o700 })
@@ -225,18 +235,19 @@ export class Claims implements ClaimStore {
     }
     this.save()
   }
-  acknowledged(line: ItemReport, accepted: boolean): void {
+  acknowledged(line: ItemReport, accepted: boolean, item?: InboxItem): void {
     const { item_id: id, body } = line
     if (intermediate.has(body.outcome)) return
     if (accepted && ['completed', 'stopped', 'not_applied'].includes(body.outcome)) this.receivers.delete(id)
-    if (accepted && body.outcome === 'completed') {
+    if (accepted && body.outcome === 'completed' && item?.state === 'completed') {
       if (!this.done.some(d => d.claim_id === body.claim_id && d.item_id === id))
-        this.done.push({ item_id: id, claim_id: body.claim_id, at: this.now() })
+        this.done.push({ item_id: id, claim_id: body.claim_id, at: this.now(), version: item.version })
       for (const [sid, wait] of this.waits) {
         wait.ids = wait.ids.filter(waiting => waiting !== id)
         if (!wait.ids.length) this.waits.delete(sid)
       }
     }
+    if (accepted && item?.state === 'waiting') this.done = this.done.filter(d => d.item_id !== id)
     if (this.rows[id]?.claim_id === body.claim_id) delete this.rows[id]
     this.save(); this.clock(id); this.changed()
   }

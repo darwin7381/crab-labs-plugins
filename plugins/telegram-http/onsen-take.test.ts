@@ -28,7 +28,7 @@ function rig() {
   const file = join(dir, 'claims.json')
   let main: MainApi | undefined
   const claims = new Claims(file, client, (id, outcome) => { misses.push(id); main?.offerMissed(id, outcome) }, () => {}, f.now, id => main?.unboundOutcome(id) ?? 'not_taken')
-  client.watchItemReports(r => claims.replay(r), (r, ok) => claims.acknowledged(r, ok))
+  client.watchItemReports(r => claims.replay(r), (...args) => claims.acknowledged(...args))
   const receiver = new ItemReceiver(mode, claims, time => deadlines.push(time))
   clean.push(() => { mode.stop(); claims.stop(); client.stop(); f.stop(); rmSync(dir, { recursive: true, force: true }) })
   const outcomes = (id: string) => f.history.filter(r => r.item_id === id).map(r => r.body.outcome)
@@ -884,7 +884,7 @@ test.each(['pre-C6', 'C6'])('%s main claim replays as main and only its local UU
   writeFileSync(r.file, JSON.stringify(saved))
   const claims = new Claims(r.file, r.client, () => {}, () => {}, r.f.now)
   r.client.recordItemReport({ item_id: row.id, body: { claim_id: row.claim!.id, outcome: 'in_session', session_id: oldSession, at: new Date().toISOString() } })
-  r.client.watchItemReports(l => claims.replay(l), (l, ok) => claims.acknowledged(l, ok))
+  r.client.watchItemReports(l => claims.replay(l), (...args) => claims.acknowledged(...args))
   await r.sync()
   expect(row.session_id).toBe('main')
   expect(row.claim!.session_id).toBe('main')
@@ -906,11 +906,11 @@ test('an intake spooled just before a crash restores its local turn without send
   r.receiver.bind([itemRef(row)], 'main', 'receiving-turn', sid)
   writeFileSync(r.file, beforeBind)
   const recovered = new Claims(r.file, r.client, () => {}, () => {}, r.f.now)
-  r.client.watchItemReports(l => recovered.replay(l), (l, ok) => recovered.acknowledged(l, ok))
+  r.client.watchItemReports(l => recovered.replay(l), (...args) => recovered.acknowledged(...args))
   await r.sync()
   // A second restart has only the ledger. The acknowledged intake has left the spool.
   const restored = new Claims(r.file, r.client, () => {}, () => {}, r.f.now)
-  r.client.watchItemReports(l => restored.replay(l), (l, ok) => restored.acknowledged(l, ok))
+  r.client.watchItemReports(l => restored.replay(l), (...args) => restored.acknowledged(...args))
   restored.finalStop(sid, 'receiving-turn')
   restored.statusRecord(sid, 'idle', () => 0, 0)
   await r.sync()
@@ -1461,7 +1461,7 @@ test('restart renews the same connector, terminal report survives outage and blo
   const other = new TakeMode('adam', r.client.request.bind(r.client), () => {}, () => {}, 'mac-mini')
   await other.probe()
   const restored = new Claims(r.file, r.client, () => {}, () => {}, r.f.now)
-  r.client.watchItemReports(l => restored.replay(l), (l, ok) => restored.acknowledged(l, ok))
+  r.client.watchItemReports(l => restored.replay(l), (...args) => restored.acknowledged(...args))
   clean.push(() => { restored.stop(); other.stop() })
   r.f.advance(40_000)
   const renew = await r.client.putBytes('/v1/members/adam/observation', Buffer.from(JSON.stringify({ connector: other.connector, held_item_ids: restored.held() })),
@@ -1925,4 +1925,25 @@ test('an inclusive timestamp shared by two pages does not route unchanged gated 
   expect(r.f.calls.filter(c => c.query.has('changed_after')).slice(0, 2).map(c => c.query.get('changed_after')))
     .toEqual([first.changed_after, first.changed_after])
   expect(versions).toEqual(rows.map(row => row.id))
+})
+
+test('an unread mailbox completion returned to waiting survives restart and invalidates pre-86 cached mail', async () => {
+  const r = rig(), mail = r.f.add('unread', 'mail')
+  await r.mode.probe()
+  await r.receiver.receive([itemRef(mail)])
+  r.claims.report(mail.id, 'completed')
+  r.client.cfg.fetch = (async (url, init) => {
+    const reply = await fetch(url, init)
+    if (!String(url).endsWith('/report')) return reply
+    return Response.json({ data: { ...mail, state: 'waiting', not_before: new Date(r.f.now() + 3600000).toISOString() } })
+  }) as typeof fetch
+  await r.sync()
+  expect(r.claims.completed(mail.id)).toBe(false)
+  const ledger = JSON.parse(readFileSync(r.file, 'utf8'))
+  expect(ledger.done).toEqual([])
+  ledger.done.push({ item_id: mail.id, claim_id: 'old', at: r.f.now() })
+  writeFileSync(r.file, JSON.stringify(ledger))
+  const reopened = new Claims(r.file, r.client, () => {}, () => {}, r.f.now)
+  expect(reopened.completed(mail.id, { ...mail, state: 'waiting' })).toBe(false)
+  expect(JSON.parse(readFileSync(r.file, 'utf8')).done).toEqual([])
 })

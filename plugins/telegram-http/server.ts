@@ -428,8 +428,8 @@ if (ONSEN_TAKE_ON) {
     itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, ROAMER ? () => itemPeek!.reset() : Lanes.offerMissed, () => registryStatusChanged?.(),
       takeMode.now, ROAMER ? undefined : Lanes.unboundOutcome, t => roamerItems?.stateOf(t))
     if (ROAMER && itemClaims.carriedBy(takeMode.connector)) CONNECTOR = onsen.cfg.record = takeMode.observationRequired = true
-    onsen.watchItemReports(line => itemClaims!.replay(line), (line, ok) => {
-      itemClaims!.acknowledged(line, ok)
+    onsen.watchItemReports(line => itemClaims!.replay(line), (line, ok, row) => {
+      itemClaims!.acknowledged(line, ok, row)
       // The spool advances its cursor after this callback. A waiting lane can take as soon as it drains.
       if (!ROAMER) queueMicrotask(() => { if (takeMode!.canReceive && !itemClaims!.blocked()) Lanes.sweepQueue() })
     })
@@ -5161,7 +5161,7 @@ async function routeInboxItem(row: InboxItem, change?: 'edited' | 'version'): Pr
     Lanes.updateWaitingItem(item, change === 'edited' ? { content: String(row.payload.text ?? ''), at: row.updated_at } : undefined)
     return
   }
-  if (itemClaims?.completed(row.id)) {
+  if (itemClaims?.completed(row.id, row)) {
     const result = await itemReceiver!.receive([item])
     if (result.given.has(row.id)) itemReceiver!.report([item], 'completed')
     return
