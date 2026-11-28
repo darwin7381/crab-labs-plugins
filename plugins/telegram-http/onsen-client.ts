@@ -441,9 +441,12 @@ export class OnsenClient {
   /** WO-175: what became of the Call lines sent lately (idem → fate), and who waits for one not sent yet */
   private itemReports = 0
   private reportedThrough: number
+  private itemBody?: (line: ItemReport) => ItemReport['body']
   private itemAck?: (line: ItemReport, ok: boolean) => void
 
-  watchItemReports(replay: (line: ItemReport) => void, ack: (line: ItemReport, ok: boolean) => void): void {
+  watchItemReports(replay: (line: ItemReport) => void, ack: (line: ItemReport, ok: boolean) => void,
+    body?: (line: ItemReport) => ItemReport['body']): void {
+    this.itemBody = body
     this.itemAck = ack
     this.itemReports = 0
     for (const { line } of this.pendingReports()) { this.itemReports++; replay(line.r) }
@@ -963,7 +966,7 @@ export class OnsenClient {
       if (t.line.k === 'ir') {
         // The FIFO cursor can now pass a report acknowledged ahead of a stuck record.
         if (t.end <= this.reportedThrough) { this.writeCursor(t.end); i++; continue }
-        const line = t.line.r, body = line.body
+        const line = t.line.r, body = this.itemBody?.(line) ?? line.body
         const path = '/v1/items/' + encodeURIComponent(line.item_id) + '/report'
         const key = ['ir', line.item_id, body.claim_id, body.outcome].map(encodeURIComponent).join(':')
         const r = await this.put(path, body, cred, undefined, { 'Idempotency-Key': key }).catch(e => ({ status: 0, json: { error: errText(e) } }))
@@ -1479,11 +1482,10 @@ export function recordOn(env: NodeJS.ProcessEnv): boolean {
   const v = (env.ONSEN_RECORD ?? '').trim().toLowerCase()
   return !(v === '0' || v === 'off' || v === 'false' || v === 'no')
 }
-/** 1.58.32 (Chiron: roamers do not write the spool): a roamer's daemon (ROAMER_MODE=1, ROAMER.md) speaks for no Onsen member: no agent name, no mesh
- *  credential of its own, so nothing it spooled was ever posted (the four roamers held ~1.6 MB each, posted 0). It records nothing */
+/** A local-polling roamer starts with recording off. Its own member may record after the take handover. */
 export const isRoamerEnv = (env: NodeJS.ProcessEnv): boolean => (env.ROAMER_MODE ?? '').trim() === '1'
 /** ONSEN_AGENTS (the canary switch): a comma list of agent names, or `*` (unset = `*`). Recording runs only for an agent in it, and only with ONSEN_RECORD on;
- *  never for a roamer (1.58.32) */
+ *  a roamer also needs a confirmed connector handover. */
 export function recordFor(env: NodeJS.ProcessEnv, agent: string, roamerConnector = false): boolean {
   if (!recordOn(env) || (isRoamerEnv(env) && !roamerConnector)) return false
   const list = (env.ONSEN_AGENTS ?? '*').split(',').map(x => x.trim()).filter(Boolean)

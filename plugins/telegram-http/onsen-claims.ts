@@ -118,6 +118,13 @@ export class Claims implements ClaimStore {
     row.last_outcome = body.outcome
     if (body.outcome === 'in_session') { row.in_session_at = body.at; row.session_id ??= body.session_id }
   }
+  /** A queued pre-C6 report has the old wire value even after the ledger has been migrated. */
+  reportBody({ item_id, body }: ItemReport): ItemReport['body'] {
+    const row = this.rows[item_id]
+    if (body.outcome === 'in_session' && body.session_id === 'main' && row?.claim_id === body.claim_id && row.session_id)
+      return { ...body, session_id: row.session_id }
+    return body
+  }
   acknowledged(line: ItemReport, accepted: boolean): void {
     const { item_id: id, body } = line
     if (intermediate.has(body.outcome)) return
@@ -126,11 +133,11 @@ export class Claims implements ClaimStore {
     if (this.rows[id]?.claim_id === body.claim_id) delete this.rows[id]
     this.save(); this.clock(id); this.changed()
   }
-  reply(turn: string, conversation: string, message: string, registrySession?: string | null): void {
+  reply(turn: string, conversation: string, message: string, session?: string | null): void {
     let updated = false
     for (const row of Object.values(this.rows)) {
-      if (registrySession && row.session_id !== registrySession) continue
-      const continued = row.last_outcome === 'background' && registrySession && row.session_id === registrySession
+      if (session && row.session_id !== session) continue
+      const continued = row.last_outcome === 'background' && session
       if ((!continued && row.turn !== turn) || row.conversation !== conversation) continue
       const replies = row.replies ??= []
       if (!replies.includes(message)) { replies.push(message); updated = true }
@@ -151,7 +158,7 @@ export class Claims implements ClaimStore {
     if (updated) this.save()
   }
   statusRecord(session: string | null, member: string, background: (session: string) => number | null, settleMs: number): void {
-    if (!session || ['busy', 'stuck', 'compacting'].includes(member)) return
+    if (!session || ['busy', 'stuck', 'compacting', 'offline'].includes(member)) return
     for (const [id, row] of Object.entries(this.rows)) {
       if (row.session_id !== session || !this.owns(id) || !row.stop || this.now() < row.stop.at + settleMs) continue
       const count = background(session)

@@ -4489,7 +4489,7 @@ function startOnsenStatus(onsen: Onsen.OnsenClient): void {
     const edge = `${member}|${pub.state}|${pub.detail?.interrupted === true}`
     // WO-172 (Chiron 02:43Z) / WO-177: a normal turn's turn_end goes when this record shows the turn over (not busy, stuck or compacting), not 60 s later
     try { facts.statusRecord(member) } catch {}
-    if (!roamerItems) itemClaims?.statusRecord(registry.mainSessionId(), member, sid => registry.backgroundAgents(sid), OnsenStatus.REGISTRY_SETTLE_MS)
+    itemClaims?.statusRecord(registry.mainSessionId(), member, sid => registry.backgroundAgents(sid), OnsenStatus.REGISTRY_SETTLE_MS)
     try { calls?.statusRecord(member) } catch {}                          // WO-175: a main turn's Calls end with it, the same way
     if (edge !== lastEdge) { lastEdge = edge; if (Lanes.LANES_ON) { try { Lanes.mainStatusChanged() } catch {} } }
   }

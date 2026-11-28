@@ -647,18 +647,21 @@ test('a later successful probe drains the local poll before the bridge can carry
 async function target(d: Awaited<ReturnType<typeof daemon>>) {
   const child = Bun.spawn(['sleep', '300']), sid = randomUUID()
   clean.push(async () => { child.kill(); await child.exited })
-  const home = join(d.root, 'home', '.claude'), regs = join(home, 'sessions'), project = join(home, 'projects', d.root.replaceAll('/', '-'))
+  const cwd = join(d.root, 'lab-project')
+  const home = join(d.root, 'home', '.claude'), regs = join(home, 'sessions'), project = join(home, 'projects', cwd.replaceAll('/', '-'))
   for (const dir of [regs, project]) mkdirSync(dir, { recursive: true })
-  writeFileSync(join(regs, child.pid + '.json'), JSON.stringify({ pid: child.pid, sessionId: sid, cwd: d.root, kind: 'interactive', status: 'idle' }))
+  const status = (value: string) => writeFileSync(join(regs, child.pid + '.json'), JSON.stringify({
+    pid: child.pid, sessionId: sid, cwd, kind: 'interactive', status: value, statusUpdatedAt: Date.now() }))
+  status('idle')
   const transcript = join(project, sid + '.jsonl')
   writeFileSync(transcript, '')
-  const write = (fields: object) => appendFileSync(transcript, JSON.stringify({ timestamp: new Date().toISOString(), ...fields }) + '\n')
-  const select = () => writeFileSync(roamerState(d.root).ROAMER_STATE_FILE, JSON.stringify({ current_target: { tmux: sid, claude_pid: child.pid, cwd: d.root, session_id: sid } }))
+  const write = (fields: object) => appendFileSync(transcript, JSON.stringify({ entrypoint: 'cli', timestamp: new Date().toISOString(), ...fields }) + '\n')
+  const select = () => writeFileSync(roamerState(d.root).ROAMER_STATE_FILE, JSON.stringify({ current_target: { tmux: sid, claude_pid: child.pid, cwd, session_id: sid } }))
   const client = new Client({ name: 'lab', version: '1' }), got: any[] = []
   client.fallbackNotificationHandler = async n => { if (n.method === 'notifications/claude/channel') got.push(n.params) }
   await client.connect(new StreamableHTTPClientTransport(new URL(d.base + '/mcp'), { requestInit: { headers: { 'x-test-claude-pid': String(child.pid) } } }))
   clean.push(() => client.close())
-  return { child, sid, select, client, got, accept: (msg: any) => write({ type: 'user', message: { content:
+  return { child, sid, cwd, select, status, client, got, accept: (msg: any) => write({ type: 'user', message: { content:
     `<channel source="telegram" chat_id="1" message_id="${msg.meta.message_id}" onsen_claims="${msg.meta.onsen_claims}">hello</channel>` } }),
     stop: () => write({ type: 'system', subtype: 'turn_duration' }) }
 }
@@ -689,7 +692,9 @@ test('roamer switches between two live streams in one cwd, binds on intake and c
   expect(b.got.map(n => n.content)).toEqual(['second'])
   const reply = await a.client.callTool({ name: 'reply', arguments: { chat_id: '1', text: 'first received' } })
   expect(reply.isError).not.toBe(true)
-  b.stop()
+  b.status('busy')
+  await Bun.sleep(400)
+  b.status('idle') // Short turn with registry evidence and no transcript turn_duration.
   await waitFor(() => two.state === 'completed', 9000)
   expect(two.response_message_ids).toEqual([])
   expect(one.claim?.session_id).toBe(a.sid)

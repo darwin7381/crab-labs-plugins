@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, rmSync } from 'fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
-import { OnsenClient } from './onsen-client.ts'
+import { OnsenClient, roamerMember } from './onsen-client.ts'
 import { OnsenInbox, OnsenPuller, switchOn } from './onsen-inbox.ts'
 import { deliveryMode, machineName, takeRefusal, TakeMode } from './onsen-take.ts'
 import { ItemPeek, itemRef, type InboxItem } from './onsen-items.ts'
@@ -91,6 +91,36 @@ test('loopback list and detail match the captured 0.40.0 envelopes and add the S
   for (const row of [list.items.find((it: any) => it.id === mail.id), detail, take])
     expect(row).toMatchObject({ kind: 'mail', mail_id: '81', note: null, payload: old.payload })
   expect(detail.events).toBeArray()
+})
+
+test('a pre-C6 claim and a replayed main wire report retain the original receiving UUID through restart', async () => {
+  const r = rig(), row = r.f.add('old', 'message', { session_id: 'main' }), sid = crypto.randomUUID()
+  await r.mode.probe()
+  await r.receiver.receive([itemRef(row)])
+  const saved = JSON.parse(readFileSync(r.file, 'utf8'))
+  Object.assign(saved.claims.old, { registry_session: sid, session_id: 'main', turn: 'turn' })
+  writeFileSync(r.file, JSON.stringify(saved))
+  const claims = new Claims(r.file, r.client, () => {}, () => {}, r.f.now)
+  r.client.recordItemReport({ item_id: row.id, body: { claim_id: row.claim!.id, outcome: 'in_session', session_id: 'main', at: new Date().toISOString() } })
+  r.client.watchItemReports(l => claims.replay(l), (l, ok) => claims.acknowledged(l, ok), l => claims.reportBody(l))
+  await r.sync()
+  expect(row.session_id).toBe('main')
+  expect(row.claim!.session_id).toBe(sid)
+  claims.finalStop('main', 'turn')
+  claims.statusRecord(sid, 'idle', () => 0, 0)
+  claims.finalStop(sid, 'turn')
+  claims.statusRecord('main', 'idle', () => 0, 0)
+  expect(r.client.hasItemReports()).toBe(false)
+  claims.statusRecord(sid, 'idle', () => 0, 0)
+  await r.sync()
+  expect(r.outcomes('old')).toEqual(['in_session', 'completed'])
+})
+
+test('the four roamer bot names resolve to their registered members without lanes', () => {
+  for (const [bot, member] of [['space_roamers', 'space-roamers'], ['time_travelers', 'time-travelers'],
+    ['@SpaceX_Roamer_bot', 'spacex-roamer'], ['@SpaceY_Roamer_bot', 'spacey-roamer']]) {
+    expect(roamerMember({ ROAMER_MODE: '1', ROAMER_BOT_NAME: bot })).toBe(member)
+  }
 })
 
 test('switch, prerequisites, stable machine/member and all probe refusals', async () => {

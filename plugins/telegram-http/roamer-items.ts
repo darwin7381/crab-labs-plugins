@@ -11,6 +11,7 @@ type Offer = { target: ReceivingTarget; stream: string }
 export class RoamerItems {
   private watches = new Map<string, TurnWatch>()
   private gate = ''
+  private busyTurns = new Map<string, string>()
   constructor(readonly o: {
     selected(): ReceivingTarget | null
     alive(pid: number): boolean
@@ -69,10 +70,18 @@ export class RoamerItems {
         this.watches.set(sid, watch)
       }
       watch.tick()
-      if (reg?.status === 'idle' && !watch.busy())
+      const turn = watch.turnFacts()?.id
+      if (reg?.status === 'busy' && turn) this.busyTurns.set(sid, turn)
+      if (reg?.status === 'idle' && turn && this.busyTurns.get(sid) === turn) {
+        watch.endTurn(new Date().toISOString())
+        this.o.watch.changed()
+      }
+      if (reg?.status !== 'busy') this.busyTurns.delete(sid)
+      // The common status feed closes the selected session. A switched-away session still has its own registry facts.
+      if (sid !== selected?.session_id && reg?.status === 'idle' && !watch.busy())
         this.o.claims.statusRecord(sid, 'idle', id => this.o.registry.backgroundAgents(id, dirname(t.transcript)), REGISTRY_SETTLE_MS)
     }
-    for (const sid of this.watches.keys()) if (!live.has(sid)) this.watches.delete(sid)
+    for (const sid of this.watches.keys()) if (!live.has(sid)) { this.watches.delete(sid); this.busyTurns.delete(sid) }
     const dest = this.offerTo()
     const gate = dest ? dest.target.session_id + '/' + dest.stream : ''
     if (gate !== this.gate) { this.gate = gate; this.o.revisit(); this.o.watch.changed() }

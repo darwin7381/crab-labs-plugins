@@ -825,7 +825,7 @@ export class TurnWatch {
     // timestamp read before it
     const before = this.latestMs, own = typeof j.timestamp === 'string' ? Date.parse(j.timestamp) : NaN
     if (own > this.latestMs) this.latestMs = own
-    if (j.type === 'system' && j.subtype === 'turn_duration') return this.end(ts)
+    if (j.type === 'system' && j.subtype === 'turn_duration') return this.endTurn(ts)
     if (j.type === 'attachment' && j.attachment?.type === 'queued_command') {
       const at = before > (Number.isFinite(own) ? own : 0) ? iso(before) : ts
       const b = this.begin(at); this.takeIn(String(j.attachment.prompt ?? ''), at); return b
@@ -872,7 +872,7 @@ export class TurnWatch {
       if (!(t < this.emitFloor)) this.o.facts.seen(j.chat, j.id, 'main', at, t < this.bornMs, this.inTurn && this.turnAt ? turnIdOf(this.turnAt) : null)
     }
   }
-  private end(ts: string): boolean {
+  endTurn(ts: string): boolean {
     if (!this.inTurn) return false
     const t = Date.parse(ts)
     // WO-172: a turn the transcript shows ending (turn_duration) ended done; bound = the Joey messages and the colleagues' items it took in
