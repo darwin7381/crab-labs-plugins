@@ -34,7 +34,7 @@ import { createServer as createHttpServer, type IncomingMessage, type ServerResp
 import {
   handleControlSlash,
   handleCallbackData,
-  isControlEnabled,
+  isControlEnabled, restartClaudeTUI,
   controlCommandsForBotApi, sharedTuiCommands,
   controlStatusText,
   startLoginExpiredWatchdog,
@@ -69,7 +69,7 @@ import { PaneReader, snapPaneLook, type PaneLook } from './pane-look.ts'   // WO
 import { Claims } from './onsen-claims.ts'
 import { ItemReceiver } from './onsen-receive.ts'
 import { ItemPeek, itemRef, type ItemRef, type InboxItem } from './onsen-items.ts'
-import { machineName, takeRefusal, TakeMode } from './onsen-take.ts'
+import { machineName, takeRefusal, TakeMode, takeModeActive } from './onsen-take.ts'
 import { ObservationPut } from './onsen-observation.ts'
 import { MentionCards, mentionItemText } from './onsen-mentions.ts'
 import { JevJudge, QUESTIONS_PATH_DEFAULT } from './screen-judge-jev.ts'
@@ -406,19 +406,23 @@ if (ONSEN_TAKE_ON) {
   if (reason) log('info', `onsen take: staying on pull: ${reason}`)
   else if (onsen) {
     takeMode = new TakeMode(ONSEN_AGENT, (m, p, b, t, h, signal) => onsen.request(m, p, b, t, h, signal),
-      active => {
-        if (active) {
+      canReceive => {
+        if (canReceive) {
           Lanes.retireItemReceipts(); Lanes.resumeSelfItems(); itemClaims!.start(); itemPeek!.reset()
           takeKeepwarm?.start(); void takeKeepwarm?.run()
         } else { itemPeek!.stop(); takeKeepwarm?.stop() }
-        registryStatusChanged?.()
+        Lanes.deliveryModeChanged(); registryStatusChanged?.()
       }, line => log('info', line))
     itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, Lanes.offerMissed, () => registryStatusChanged?.(), takeMode.now, Lanes.unboundOutcome)
-    onsen.watchItemReports(line => itemClaims!.replay(line), (line, ok) => itemClaims!.acknowledged(line, ok))
+    onsen.watchItemReports(line => itemClaims!.replay(line), (line, ok) => {
+      itemClaims!.acknowledged(line, ok)
+      // The spool advances its cursor after this callback. A waiting lane can take as soon as it drains.
+      queueMicrotask(() => { if (takeMode!.canReceive && !itemClaims!.blocked()) Lanes.sweepQueue() })
+    })
     itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at), () => itemPeek!.reset(), due => !!takeKeepwarm?.matchesWindow(due))
     onsen.watchItemWrites(Lanes.itemWriteSettled)
     Lanes.useItemReceiver(itemReceiver, onsen)
-    itemPeek = new ItemPeek(takeMode, Lanes.itemIndex, routeInboxItem, () => !itemClaims!.blocked())
+    itemPeek = new ItemPeek(takeMode, Lanes.itemIndex, routeInboxItem, () => !itemClaims!.blocked(), Lanes.sweepQueue)
     Lanes.observeItemGates(() => itemPeek!.reset())
   }
 }
@@ -2976,11 +2980,11 @@ if (isSystemAlertEnabled()) {
     resolveFile: isRoamerEnabled() ? roamerCurrentTranscript : (Lanes.LANES_ON ? () => Lanes.mainTranscriptFile(TRANSCRIPT_DIR) : undefined),
     // 002l (D12): with lanes on, a model wall (usage limit, overload, login, API error) is told once by the lanes wall notice, which names the
     // session that hit it; the TUI's copy of the same line is not relayed as well (design/notify 「同一件事不會連發」)
-    defer: Lanes.LANES_ON && !INBOX_ONLY ? (msg: string) => Lanes.wallKind(msg) != null : undefined,
+    defer: Lanes.LANES_ON && !INBOX_ONLY ? (msg: string) => takeModeActive(takeMode) || Lanes.wallKind(msg) != null : undefined,
     // WO-120: usage walls are one state — API errors inside one aren't forwarded one by one; enter + clear alerts (with lanes on these are the
     // main's wall notices too: mainWallNoticeOwned)
     wall: () => wallReader.state(),
-    wallAlerts: INBOX_ONLY ? undefined : (wallAlertsOn = true, new WallAlerts({ stateDir: STATE_DIR, log,
+    wallAlerts: INBOX_ONLY ? undefined : (wallAlertsOn = true, new WallAlerts({ stateDir: STATE_DIR, log, takeMode,
       enterToldElsewhere: w => (mainWallToldAt && w.sinceMs != null && Math.abs(mainWallToldAt - w.sinceMs) < 120_000 ? 'lanes main-wall-up' : null),
       // lanes on (Sonn #10731): the enter alert also says the main's messages are held, none lost; lanes off: text unchanged
       enterNote: Lanes.LANES_ON ? () => lanesEnterNote(Lanes.mainHeldCount()) : undefined })),
@@ -4275,6 +4279,7 @@ if (Lanes.LANES_ON) {
         onsen?.recordBlocked({ chat: String(meta.chat_id), client_msg_id: String(meta.message_id), retry_after: retryAfter })
       }
     },
+    restartSession: retryPid => restartClaudeTUI(true, retryPid),
     wallNoticeOwned: (rule, m) => mainWallNoticeOwned(rule, m.kind),
     ...(mentionCards ? { mentions: () => mentionCards.fetchIfOn(), mentionsRead: (posts: string[]) => mentionCards.read(posts) } : {}),   // WO-181
     // WO-120: M1 asks the usage-wall state before its in-session probe (walled → no offer; cleared after this episode began → offer now)
@@ -4530,7 +4535,7 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     try { f = recordFacts() } catch (e) { log('warn', `onsen: status facts: ${e}`) }
     const r = screenStatus ? screenStatus.record(v, f, true) : { view: v, observation: composeRecord(null, null, v, f).observation }
     const pub = r.view
-    if (takeMode?.active) Object.assign(r.observation, { connector: takeMode.connector, held_item_ids: itemClaims!.held() })
+    if (takeMode?.canReceive) Object.assign(r.observation, { connector: takeMode.connector, held_item_ids: itemClaims!.held() })
     lastView = pub; lastObservation = r.observation
     status.update(pub)
     if (!takeMode?.checking) obsPut.update(r.observation)                                          // WO-180: the same point, the same object (sent only if it changed or the beat is due)

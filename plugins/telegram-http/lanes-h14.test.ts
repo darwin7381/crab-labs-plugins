@@ -53,7 +53,9 @@ test('H14: a burst of 20 from one peer: 5 get a lane, 15 get none and are merged
   expect(await until(() => pushes(/流量管制/).length >= 1)).toBe(true)
   expect(pushes(/流量管制/).length).toBe(1); expect(pushes(/流量管制/)[0].silent).toBe(false); expect(pushes(/流量管制/)[0].text).toContain('cain')   // one push at the start
   const toCain = mesh.filter(m => m.to === 'cain')
-  expect(toCain.length).toBe(1); expect(toCain[0]).toMatchObject({ no_reply: true }); expect(toCain[0].text).toContain('收到你太多訊息')           // one reply per window, marked no_reply
+  expect(toCain).toHaveLength(1)
+  expect(toCain[0]).toMatchObject({ no_reply: true, urgency: 'silent' })
+  expect(toCain[0].text).toContain('收到你太多訊息')
   expect(rows('routing.jsonl').filter(r => r.rule === 'peer-flood' && r.from === 'cain').length).toBe(15)
   expect(rows('queue.jsonl').length).toBe(0)
   // nobody else is affected: another peer, the scheduler, an alert

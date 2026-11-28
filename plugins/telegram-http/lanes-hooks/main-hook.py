@@ -191,8 +191,16 @@ def main():
         if deny:
             out({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny', 'permissionDecisionReason': deny}})
     elif ev == 'Stop':
-        held = r.get('block') or aid('main-memory-gate.py', 'reason', p, r.get('turn') or {}, r.get('proposals') or [], bool(r.get('curator'))) \
-            or aid('main-answered-gate.py', 'reason', p, r.get('items') or [], r.get('outputs') or [], r.get('turn') or {}, r.get('context'))
+        held = r.get('block') or aid('main-memory-gate.py', 'reason', p, r.get('turn') or {}, r.get('proposals') or [], bool(r.get('curator')))
+        args = (p, r.get('items') or [], r.get('outputs') or [], r.get('turn') or {})
+        if r.get('item_stop') == 'check' and (not held or r.get('block')):
+            owed = aid('main-answered-gate.py', 'take_owed', *args)
+            if owed:
+                accepted = post({**body, 'phase': 'owed', 'owed_mids': owed['mids']}, 10).get('accepted')
+                if accepted or r.get('block'):
+                    held = '\n'.join(filter(None, [held, owed['reason']]))
+        elif not held and not r.get('item_stop'):
+            held = aid('main-answered-gate.py', 'reason', *args, r.get('context'))
         if held:
             out({'decision': 'block', 'reason': held})
             return

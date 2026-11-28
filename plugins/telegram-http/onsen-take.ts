@@ -14,18 +14,23 @@ export function takeRefusal(o: { inbox: boolean; roamer: boolean; lanes: boolean
 }
 
 /** The connector parameter distinguishes this probe from a normal member inbox read. */
-export async function deliveryMode(req: ActionReq, path: string, connector: string) {
+export async function deliveryMode(req: ActionReq, path: string, connector: string, active = false) {
   const r = await req('GET', path + '?' + new URLSearchParams({ limit: '1', connector }), undefined, 5000).catch(() => null)
-  return { take: r?.status === 200, status: r?.status, asOf: Date.parse(r?.json?.as_of) }
+  const mode: 'take' | 'pull' | 'not_current_connector' | 'unavailable' = r?.status === 409 && r.json?.error?.code === 'not_current_connector'
+    ? 'not_current_connector' : active && (!r || r.status >= 500) ? 'unavailable' : r?.status === 200 ? 'take' : 'pull'
+  return { mode, take: mode === 'take', status: r?.status, asOf: Date.parse(r?.json?.as_of) }
 }
 
 export type ItemRequest = OnsenClient['request']
+
+/** The C1 member-mode check used by the local delivery and notification gates. */
+export function takeModeActive(mode?: Pick<TakeMode, 'active'>): boolean { return mode?.active === true }
 
 export class TakeMode {
   readonly path: string
   readonly connector: string
   checking = true
-  active = false
+  active = false  // member delivery mode; pausing this connector does not switch the member to pull
   observationRequired = false
   private stopped = false
   private timer?: ReturnType<typeof setTimeout>
@@ -33,25 +38,32 @@ export class TakeMode {
   private offset = 0
   readonly now = () => Date.now() + this.offset
 
-  constructor(readonly member: string, readonly req: ItemRequest, readonly changed: (active: boolean) => void,
+  constructor(readonly member: string, readonly req: ItemRequest, readonly changed: (canReceive: boolean) => void,
     readonly log: (line: string) => void, machine = machineName(),
     readonly later = (fn: () => void, ms: number) => setTimeout(fn, ms)) {
     this.path = '/v1/members/' + encodeURIComponent(member) + '/items'
     this.connector = machine + '/' + member
   }
 
+  get canReceive(): boolean { return this.active && !this.stopped && !this.reason }
+
   async probe(): Promise<void> {
-    const mode = await deliveryMode(this.req, this.path, this.connector)
+    const probe = await deliveryMode(this.req, this.path, this.connector, this.active)
     if (this.stopped) return
     this.checking = false
-    if (!mode.take) {
-      if (this.reason === 'not_current_connector') this.pause(this.reason, 45_000)
-      else this.pause('mode probe: ' + (mode.status ? 'HTTP ' + mode.status : 'no response'), 60_000)
+    if (probe.mode === 'not_current_connector') {
+      this.active = true
+      this.pause(probe.mode, 45_000)
       return
     }
-    if (Number.isFinite(mode.asOf)) this.offset = mode.asOf - Date.now()
+    if (probe.mode === 'unavailable') { this.pause('mode probe unavailable', 60_000); return }
+    this.active = probe.take
+    if (!this.active) { this.pause('mode probe: ' + (probe.status ? 'HTTP ' + probe.status : 'no response'), 60_000); return }
+    if (Number.isFinite(probe.asOf)) this.offset = probe.asOf - Date.now()
+    clearTimeout(this.timer)
+    this.timer = undefined
     this.reason = ''
-    this.active = this.observationRequired = true
+    this.observationRequired = true
     this.log('onsen take: started ' + this.connector)
     this.changed(true)
   }
@@ -59,16 +71,18 @@ export class TakeMode {
   pause(reason: string, ms: number): void {
     if (this.stopped) return
     if (this.reason === reason && this.timer) return
-    if (reason !== this.reason) this.log('onsen take: ' + reason)
-    this.reason = reason
-    if (this.active) { this.active = false; this.changed(false) }
+    if (reason !== this.reason) {
+      this.log('onsen take: ' + reason)
+      this.reason = reason
+      this.changed(false)
+    }
     clearTimeout(this.timer)
     this.timer = this.later(() => { this.timer = undefined; void this.probe() }, ms)
     this.timer.unref()
   }
 
   stop(): void {
-    this.stopped = true
+    this.stopped = this.checking = true
     clearTimeout(this.timer)
     if (this.active) { this.active = false; this.changed(false) }
   }

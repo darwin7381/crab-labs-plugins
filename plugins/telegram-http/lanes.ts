@@ -23,7 +23,7 @@
  */
 import { Journal, type Row } from './lanes-state.ts'
 import { procFactsFor, type ProcFacts } from './lanes-proc.ts'
-import { createMain, mainContext, type MainApi, type MainEnv, type MainWall, type ItemKind, type Via } from './lanes-main.ts'
+import { createMain, mainContext, MAIN_STUCK_MS, toolSilenceMs, type MainApi, type MainEnv, type MainWall, type ItemKind, type Via } from './lanes-main.ts'
 import { pidAlive, type CallFacts, type TurnTrigger } from './onsen-status.ts'
 import type { CallCheck, CallRef, CallWait, OnsenClient, ScheduledResultLine } from './onsen-client.ts'
 import { createEvents, matterKey, owed, type EventsApi, type EvClass, type Ob, type Outcome } from './lanes-events.ts'
@@ -38,6 +38,7 @@ import {
   REPORT_STEP_RE, mainAskHeld, stepsHeld, MAIL_OPEN_HELD, refusalHoldOn,
   type RemoteChange, btccOutcome, receiptCliAnswer, receiptCliRuns, schedulerAnswerOk, mainChatOn, mainSameMatterOn, mainSameMatterP, mainSameMatterRefusal,
 } from './lanes-boundary.ts'
+import { personCanProbe } from './usage-wall.ts'
 import { genuineAssistantModelFile } from './liveness.ts'
 import { CHAT_HISTORY_TOOL, FORM_CLOSE_TOOL } from './onsen-tool.ts'
 import { decideWake, legacyAgentRules, loadWakeTable, WAKE_KINDS, type WakeItem, type WakeRule, type WakeState, type WakeTable, type WakeVerdict } from './wake-decide.ts'
@@ -225,6 +226,7 @@ export interface LanesDeps {
   mainPicker?: MainPicker
   /** WO-120 (server.ts mainWallNoticeOwned): true = the usage-wall alerts (system-alert WallAlerts) tell Joey about this wall of the main, so the
    *  main-wall-up / main-wall-down notice goes to the ledger only. Absent / false = pushed as before. The wall records themselves are untouched. */
+  restartSession?: MainEnv['restartSession']
   wallNoticeOwned?: (rule: 'main-wall-up' | 'main-wall-down', main: { kind: string | null }) => boolean
   /** WO-120 (server.ts): the usage-wall state for the main's wall episode that began at wallSinceMs (lanes-main.ts MainEnv.usageWall); WO-141 follow-up:
    *  the lanes' wall reads it too (followUsageWall). `by`: the clear's cleared_by (usage_wall.py: ok_turn | probe_after_reset | probe_after_switch |
@@ -259,8 +261,10 @@ export type MainPicker = {
 let D: LanesDeps
 /** lanes-golive (C2): what a lane's send carries besides to / text (the three lines of send_to_agent) */
 import type { InboxItem, ItemRef } from './onsen-items.ts'
+import { callSenders, hasCallFrom } from './onsen-items.ts'
 import { resumablePromise, chatWaiter, memberWaiter, projectPromises, promiseTime } from './onsen-promises.ts'
 import { ownItem, type ItemWriter, type ItemWrite } from './onsen-item-writes.ts'
+import { takeModeActive } from './onsen-take.ts'
 
 export type LaneSendFields = { line: Line; title?: string; ask?: string; because?: string; deadline?: string; touches?: string[]; ref?: string }
 let LANES_DIR = ''
@@ -299,7 +303,22 @@ function logos(kind: string, rec: Record<string, unknown>): void {
 }
 const shortId = () => randomBytes(3).toString('hex')
 
-const takingItems = () => itemReceiver?.mode.active === true
+const takingItems = () => takeModeActive(itemReceiver?.mode)
+// Only pull delivery uses periodic redispatch, deadline nudges and flood summaries. A take member's followup and due ticks
+// ring only the reminders Onsen refused for good (C5 L1: local_reminder); Onsen owns the rest.
+const modeTimers: Array<ReturnType<typeof setTimeout>> = []
+export function deliveryModeChanged(): void {
+  if (D?.role !== 'tg' || !S) return
+  for (const timer of modeTimers.splice(0)) clearTimeout(timer)
+  if (probeTimer) { clearTimeout(probeTimer); probeTimer = null }
+  if (itemReceiver?.mode.checking) return
+  modeTimers.push(setInterval(followupTick, 1_000), setInterval(dueTick, 1_000))
+  for (const timer of modeTimers) timer.unref()
+  if (takingItems()) { if (itemReceiver?.mode.canReceive) pump(); return }
+  modeTimers.push(setTimeout(sweepQueue, 2_000), setInterval(sweepQueue, 10_000), setInterval(floodTick, 10_000))
+  for (const timer of modeTimers) timer.unref()
+  if (S.wall) armProbe(Math.max(1_000, S.wall.probe_at - Date.now()))
+}
 
 // ------------------------------------------------------------------ init
 export function lanesInit(deps: LanesDeps): void {
@@ -333,14 +352,9 @@ export function lanesInit(deps: LanesDeps): void {
       for (const k of ['in', 'out'] as const) { try { rmSync(steerFile(id, k)) } catch {} }
     }
     if (S.steering) { S.steering = {}; saveState() }
-    setTimeout(sweepQueue, 2_000).unref()          // 002f: what the previous daemon left running is dispatched again now
-    setInterval(sweepQueue, 10_000).unref()
-    setInterval(followupTick, 1_000).unref()
-    setInterval(() => { void main.tick() }, 5_000).unref()       // M2: kill -0, the stuck rule; M1: the offer
+    deliveryModeChanged()
+    setInterval(() => { void main.tick(); checkLaneStalls() }, 5_000).unref()       // M2: kill -0, the stuck rule; M1: the offer
     setInterval(() => idleCheck(), 2_000).unref()                // WO-157b: a turn statusOf shows ended with no Stop (Esc) is closed as interrupted
-    setInterval(() => dueTick(), 1_000).unref()        // M3: the one due sweep (critical ring, hand-over not taken, promised answers, commitments)
-    setInterval(() => floodTick(), 10_000).unref()      // 002k (H14): a flood episode that went quiet, a hold that ran out
-    if (S.wall) armProbe(Math.max(1_000, S.wall.probe_at - Date.now()))
     // lanes-topics (item 4): a worker closed before the previous daemon stopped, its topic not finished yet (only `pending` ones: older closed lanes untouched)
     setTimeout(() => { for (const l of Object.values(S.lanes)) if (l.status === 'closed' && l.topic_close === 'pending' && !l.topic_done && !running.has(l.id)) void finishTopic(l, '關閉時 daemon 重啟，開機後補上') },
       num('LANES_TOPIC_SWEEP_MS', 3_000)).unref()
@@ -354,7 +368,7 @@ let main: MainApi
 function mainEnv() {
   return {
     journal, agent: D.agent, log: D.log, registry: D.registry, itemReceiver: () => itemReceiver, takingItems,
-    writeItem: write => itemWriter?.(write), writtenItemId: key => itemClient?.writtenItemId(key),
+    writeItem: write => itemWriter?.(write), writtenItemId: key => itemClient?.writtenItemId(key), restartSession: D.restartSession,
     // WO-205: the tg daemon holds no BTCC credential; its agent-inbox daemon sends the alert with its own
     registryAlert: (a: { state: 'open' | 'clear'; session?: string; pid?: number; why?: string }): void => {
       void inboxPost('/lanes/registry-alert', a).then(r => D.log(r?.ok ? 'info' : 'warn', `lanes: registry alert ${a.state}: ${r?.text ?? 'the agent-inbox daemon did not answer'}`))
@@ -769,6 +783,8 @@ type Lane = {
   id: string; kind: LaneKind; n: number; session_id: string; thread: string
   status: 'new' | 'running' | 'idle' | 'closed'
   created: string; last: string; transcript: string; runs: number
+  last_limit_refusal?: number
+  keeper_clear_used?: number
   tokens_in: number; tokens_out: number; topic?: number; title?: string; critical?: boolean
   fork_from?: string
   /** lanes-topics (item 4): a worker's topic name as stored (= shown); its finish: pending at the close, done (time) once the ✅ and the closing line went */
@@ -2245,6 +2261,7 @@ function mailDue(ev: InEvent): Decision {
  *  the mailbox: woken now (wakeDeferred); it was met by an earlier turn (the main saw it, did not decide): a new hand-over, woken now; the main has it already
  *  (an open item): nothing more. Returns the hand-over the main is woken for, or null. */
 function dueWake(m: number): string | null {
+  if (takingItems()) return null
   const e = events.rows(r => waitsOf(r).some(w => w.mail_id === m && pendingWait(w))).pop()
   const w = waitsOf(e).find(x => x.mail_id === m && pendingWait(x))
   if (!e || !w || w.urgency !== 'defer' || w.due_woke) return null
@@ -2903,6 +2920,9 @@ async function applyRule(r: Rule, ev: InEvent): Promise<Decision> {
     }
     case 'reflex': {
       const critical = !!(r.critical_regex && new RegExp(r.critical_regex, 'i').test(ev.text))
+      const prior = ev.onsen_items?.[0]?.refused_lane
+      const refusedLane = prior && S.lanes[prior]
+      if (refusedLane && refusedLane.status !== 'closed') return dispatch(ev, refusedLane, { ...base, critical })
       const rep = alertRepeat(ev, critical)                  // 002k (B12): a repeat of an alert that is already being handled opens no lane
       if (rep) return rep
       const inc = incidentMerge(ev, critical)                // WO-132 (item 2): an alert of an incident a lane already handles goes to that lane
@@ -2997,7 +3017,7 @@ export function holdLines(): string[] {
 /** 002l (D10): an admitted peer event that really opened (or went to) a lane: it counts as "answered" in the peer's flood episode. 002k counted every admit,
  *  ledger-only ones included, and the summary said 「6 則開了車道回覆」 for FYIs that opened nothing. */
 function noteAdmitted(ev: InEvent, d: Decision): void {
-  if (d.target !== 'lane' || !isPeerEvent(ev) || ev.no_reply) return
+  if (takingItems() || d.target !== 'lane' || !isPeerEvent(ev) || ev.no_reply) return
   const f = S.flood?.[ev.from.toLowerCase()]
   if (!f) return
   const now = Date.now()
@@ -3011,13 +3031,17 @@ function peerGate(ev: InEvent): { rule: string; note: string; episode: string; h
   if (h) {
     if (h.until != null && h.until <= now) endHold(peer, '時間到')
     else {
+      if (takingItems()) {
+        if (h.until != null) itemReceiver!.dueAt(new Date(h.until).toISOString())
+        return { rule: 'peer-hold', note: peer + ' is on hold: leaving its Item waiting', episode: h.since }
+      }
       h.count++; h.first ??= ev.id; h.last = ev.id; sampleOf(h.samples, ev)
       if (h.count === 1) ledger({ lane: 'router', thread: ev.thread ?? null, event: ev.id, kind: 'fyi', text: `${peer} 的第一則被暫停擋下的訊息（之後只計數，結束時一筆摘要）：${ev.text.slice(0, 160)}`, refs: { peer_hold: peer, held: true, btcc_msg_id: ev.btcc_msg_id ?? null } })
       saveState()
       return { rule: 'peer-hold', note: `${peer} is on hold (${h.reason}): ledger only`, episode: h.first, ...(h.count === 1 ? { head: { hold: { peer, count: 1, reason: h.reason } } } : {}) }
     }
   }
-  if (!floodOn()) return null
+  if (takingItems() || !floodOn()) return null
   // 002l (D10): design/routing 「標了『不用回』的純通知 → 帳本：只記一行，不開任何 session。零 token」. A no_reply notice opens nothing, so it is no load to
   // limit: it never touches the rate bucket, the queue count or the flood episode (G08: 40 FYIs started a flood, merged 34, rang Joey, auto-replied to Eve).
   if (ev.no_reply) return null
@@ -3061,7 +3085,7 @@ function peerGate(ev: InEvent): { rule: string; note: string; episode: string; h
 }
 /** a flood episode whose peer has been quiet is closed (one ledger row, one silent summary); a hold whose time is up ends */
 export function floodTick(now = Date.now()): void {
-  if (!S) return
+  if (!S || takingItems()) return
   for (const [peer, f] of Object.entries(S.flood ?? {})) {
     const e = f.episode
     if (!e || now - e.last_at < num('LANES_FLOOD_QUIET_S', 120) * 1000) continue
@@ -3146,7 +3170,7 @@ export function alertWorse(seen: AlertVal[] | undefined, now: AlertVal[], frac =
   return worse.join('、')
 }
 function alertRepeat(ev: InEvent, critical: boolean): Decision | null {
-  if (critical || !isAlertEvent(ev)) return null
+  if (critical || ev.onsen_items?.length || !isAlertEvent(ev)) return null
   const fp = alertFingerprint(ev.from, ev.text)
   const rec = S.alert_fp?.[fp]
   if (!rec || rec.sev !== alertSeverity(ev)) return null
@@ -3195,7 +3219,7 @@ function alertRepeat(ev: InEvent, critical: boolean): Decision | null {
 }
 /** the alert a new lane's thread was opened for (so its repeats find it) */
 function noteAlert(ev: InEvent, thread: string): void {
-  if (!isAlertEvent(ev)) return
+  if (ev.onsen_items?.length || !isAlertEvent(ev)) return
   S.alert_fp ??= {}
   const now = nowIso()
   S.alert_fp[alertFingerprint(ev.from, ev.text)] = { thread, event: ev.id, sev: alertSeverity(ev), repeats: 0, first: now, last: now, seen: alertValues(ev.text) }
@@ -3395,11 +3419,15 @@ function setPendingSteer(lane: string, pending: SteerRec[]): void {
 }
 /** The lane token identifies the receiving run. Only its own pending event IDs can be requested. */
 async function takeSteering(tok: RunTok, ids: string[], res: ServerResponse) {
-  const receiver = itemReceiver!, lane = S.lanes[tok.lane]
+  const receiver = itemReceiver, lane = S.lanes[tok.lane]
+  if (queue.get(tok.evId)?.wallProbe) return []
   const live = () => running.get(tok.lane)?.tok === tok && lane.status !== 'closed'
-  if (!takingItems() || !live()) return []
+  if (!receiver?.mode.canReceive || !live()) return []
+  syncSteer(tok.lane)
+  const peers = callSenders(runEvents(queue.get(tok.evId)).flatMap(ev => ev.onsen_items ?? []))
   const requested = new Set(ids)
-  const pending = (S.steering?.[tok.lane] ?? []).filter(s => s.run === tok.runId && s.ev.onsen_items?.length && requested.has(s.ev.id))
+  const pending = (S.steering?.[tok.lane] ?? []).filter(s => s.run === tok.runId && s.ev.onsen_items?.length
+    && requested.has(s.ev.id) && !hasCallFrom(s.ev.onsen_items, peers))
   const refs = pending.flatMap(s => s.ev.onsen_items!)
   if (!refs.length) return []
   // A lane can accumulate multiple peek pages between two tool calls. All takes share this hook's 3 s window.
@@ -3487,9 +3515,14 @@ function releaseClosedSteering(lane: Lane, pending: SteerRec[]): SteerRec[] {
 /** Undelivered messages become the lane's next run, first in line. */
 function queueSteering(lane: Lane, left: SteerRec[], why: string): void {
   if (lane.status === 'closed') left = releaseClosedSteering(lane, left)
+  // The next peek considers the original row again. A take without a hook receipt is returned first.
+  const waiting = left.filter(s => s.ev.onsen_items?.length)
+  if (waiting.length) {
+    for (const s of waiting) itemReceiver?.report(s.ev.onsen_items!, 'not_taken')
+    left = left.filter(s => !s.ev.onsen_items?.length)
+    onGateOpen?.()
+  }
   if (!left.length) return
-  // A take with no hook receipt must be returned before a future run takes it again.
-  for (const s of left) itemReceiver?.report(s.ev.onsen_items ?? [], 'not_taken')
   // WO-132 (item 2): a merged alert the run never reached was looked at by nobody: it owes Joey its line now (ringing when critical), as its own run would
   for (const s of left) if (s.merged && events?.get(s.ev.id) && !events.openObs(s.ev.id).some(o => o.kind === 'joey')) {
     const crit = events.get(s.ev.id)!.class === 'critical'
@@ -3637,7 +3670,7 @@ export function itemIndex(): Map<string, number> {
 /** the in-memory view of an event's current run record (M5): the journal is its state; this is what pump and the tools read */
 type QItem = { ev: InEvent; lane: string; state: 'queued' | 'leased' | 'done'; attempts: number; priority: number; summary?: string; enqueued: string
   /** the M5 record id of this event's current run; the process and lane run of a leased one */
-  rid?: string; pid?: number; run?: string
+  rid?: string; pid?: number; run?: string; wallProbe?: boolean; keeperProbe?: number; stuckRestart?: boolean
   /** after a death the next run waits until then (002f backoff) */
   not_before?: number
   /** 002k: later messages of the same peer that queued for this lane while it was busy; handled in the same run */
@@ -3681,8 +3714,25 @@ export function failedHandoffText(it: { attempts: number; ev: { from: string; te
 }
 const queue = new Map<string, QItem>()          // event id → item
 /** WO-177 六: the tool calls of a run whose result has not come back yet (its stream's tool_use → tool_result): tool_use id → name, since when */
-type OpenTools = Map<string, { name: string; since: string }>
-const running = new Map<string, { child: ChildProcess; evId: string; runId: string; tok: RunTok; at: string; tools?: OpenTools; back?: string }>()  // lane id → run (WO-132: `at` = when it started; WO-177: `back` = when its last open tool came back)
+type OpenTools = Map<string, { name: string; since: string; silenceMs: number }>
+const running = new Map<string, { child: ChildProcess; evId: string; runId: string; tok: RunTok; at: string; progressAt?: number; tools?: OpenTools; back?: string }>()  // lane id → run (WO-132: `at` = when it started; WO-177: `back` = when its last open tool came back)
+function checkLaneStalls(now = Date.now()): void {
+  if (!takingItems()) return
+  for (const run of running.values()) {
+    const it = queue.get(run.evId)
+    if (!it || it.stuckRestart || run.child.killed || run.child.exitCode != null) continue
+    const last = run.progressAt ?? Date.parse(run.at)
+    const toolEnds = Array.from(run.tools?.values() ?? [], tool => Date.parse(tool.since) + tool.silenceMs)
+    if (now <= Math.max(last + MAIN_STUCK_MS, ...toolEnds)) continue
+    syncSteer(it.lane)
+    const refs = runEvents(it).flatMap(ev => ev.onsen_items ?? [])
+    if (!refs.length) continue
+    itemReceiver!.report(refs, 'stuck')
+    it.stuckRestart = true
+    runRec(it, 'running', { stuck_restart: true })
+    run.child.kill('SIGKILL')
+  }
+}
 type RunTok = { runId: string; lane: string; evId: string; closers: string[]; critical: boolean; trigger: string; cls: string; commitments?: number
   /** lanes-golive (C2): how many mails this mail-lane run opened (an opened mail owes Joey the run's one line) */
   mailOpened?: number
@@ -3818,7 +3868,7 @@ function restoreRuns(): void {
     if (r.state === 'exited' || !r.ev) continue
     const it: QItem = { ev: r.ev, lane: String(r.lane), state: 'queued', attempts: r.state === 'queued' ? Number(r.attempt) - 1 : Number(r.attempt), priority: Number(r.priority ?? 5),
       summary: r.summary ?? undefined, enqueued: String(r.enqueued ?? r.created), rid: r.id, ...(r.extra ? { extra: r.extra } : {}), ...(r.deaths ? { deaths: r.deaths } : {}),
-      ...(r.steered ? { steered: r.steered } : {}) }
+      ...(r.steered ? { steered: r.steered } : {}), stuckRestart: r.stuck_restart === true }
     if (r.state === 'queued') {
       if (S.lanes[it.lane]?.status === 'closed' && releaseClosedQueue(it)) continue
       queue.set(it.ev.id, it); continue
@@ -3892,7 +3942,7 @@ const endWords = (reason: string, it: QItem): string => reason === 'normal' ? '�
  *    not an attempt (the event is queued again as it was);
  *  - the lanes' wall: up on a wall; down on any other exit of a run that reached the model (it wrote a result record or made a model call);
  *  - otherwise, and after MAX_ATTEMPTS, the run's work has ended: a task lane's own duty (endTask), then the exit rule over the set. */
-function runEnded(lane: Lane | undefined, it: QItem, e: { reason: string; processExit?: string; said?: string; reached?: string; reachedModel?: boolean; wallText?: string; runId?: string; receipt?: { outcome: string } }): void {
+function runEnded(lane: Lane | undefined, it: QItem, e: { reason: string; processExit?: string; said?: string; reached?: string; reachedModel?: boolean; halfDone?: boolean; wallText?: string; runId?: string; receipt?: { outcome: string } }): void {
   const wall = e.reason.startsWith('wall:') ? e.reason.slice(5) : null
   const retryable = !!wall || e.reason === 'died' || e.reason === 'timeout' || e.reason === 'restore'
   if (wall) it.attempts = Math.max(0, it.attempts - 1)                      // nothing was tried: not an attempt
@@ -3902,12 +3952,28 @@ function runEnded(lane: Lane | undefined, it: QItem, e: { reason: string; proces
     if (e.reason === 'died' || e.reason === 'timeout') { it.not_before = Date.now() + RETRY_BACKOFF_MS * it.attempts; setTimeout(pump, RETRY_BACKOFF_MS * it.attempts + 20) }   // 002f backoff
     queueRun(it)
   }
-  if (wall) wallUp({ kind: wall, text: e.wallText ?? '' }, e.runId ?? it.run ?? '?')
-  else if (S.wall && e.reachedModel) void wallDown(e.runId ?? it.run ?? '?')       // the first run that gets through takes the wall down, however it ended
-  if (again) return
   const itemExit = e.processExit ?? e.reason
-  const outcome = itemExit === 'normal' ? 'completed' : itemExit.startsWith('wall:') ? (['wall:server_error', 'wall:api_error'].includes(itemExit) ? 'error' : 'usage_limit') : 'cut'
-  if (refs.length && !['normal', 'closed', 'gone'].includes(e.reason)) itemReceiver?.report(refs, outcome)
+  const apiError = ['wall:server_error', 'wall:api_error', 'wall:overload'].includes(itemExit)
+  if (takingItems()) {
+    if (lane && wall && !apiError) {
+      lane.last_limit_refusal = Date.now()
+      const clear = keeperForLane(lane)?.clearedMs
+      if (clear) lane.keeper_clear_used = Math.max(clear, lane.keeper_clear_used ?? 0)
+      saveState()
+    }
+    else if (lane?.last_limit_refusal && !wall && e.reachedModel) { delete lane.last_limit_refusal; saveState() }
+  } else if (wall) wallUp({ kind: wall, text: e.wallText ?? '' }, e.runId ?? it.run ?? '?')
+  else if (S.wall && e.reachedModel) void wallDown(e.runId ?? it.run ?? '?')
+  if (again) return
+  const outcome = it.stuckRestart ? 'cut' : itemExit === 'normal' ? 'completed' : apiError ? 'error'
+    : wall ? (it.keeperProbe ? 'usage_limit_probe' : 'usage_limit') : 'cut'
+  if (refs.length && !['normal', 'closed', 'gone'].includes(e.reason)) {
+    const limit = outcome === 'usage_limit' || outcome === 'usage_limit_probe'
+    itemReceiver?.report(refs, outcome, { ...(limit ? { retry_after: (lane && keeperForLane(lane))?.resets_at ?? null } : {}),
+      ...(it.stuckRestart ? { note: '卡住重開' } : {}), ...(e.halfDone ? { half_done: true } : {}) })
+  }
+  // A lane that saw its one owed prompt and still ended normally has completed that row.
+  if (e.reason === 'normal') itemReceiver?.report(refs.filter(r => itemReceiver!.claims.wasOwed(r.onsen_item_id)), 'completed')
   releaseScheduleThread(lane, it)                                           // WO-164 point 4: a schedule's run is over: its thread lets the lane go
   const gaveUp = retryable && it.attempts >= MAX_ATTEMPTS
   asWake({ kind: 'lane_exit', rule: gaveUp ? 'exit-failed' : 'exit-owes', urgency: 'ordered', lane: lane?.id ?? it.lane }, () => {   // WO-147
@@ -4021,7 +4087,7 @@ function armProbe(ms: number): void {
  *  empty queue a bare one-line run is. Without the second, a wall that came up on the last queued event stayed up until
  *  the next event happened to arrive, and every critical alert until then was rung through as "no lane can look". */
 function probeTick(): void {
-  if (!S?.wall || D.role !== 'tg') return
+  if (!S?.wall || D.role !== 'tg' || takingItems()) return
   if (followUsageWall('probe') !== 'own') return          // WO-141 follow-up: the daemon's usage-wall state decides first
   if (running.size > 0) { armProbe(1000); return }        // a run is still out: its result is the probe
   if ([...queue.values()].some(i => i.state === 'queued')) {
@@ -4031,7 +4097,7 @@ function probeTick(): void {
   }
   S.wall.probe_at = Date.now() + wallBackoffMs(S.wall.kind, S.wall.probes + 1); saveState()
   bareProbe(MODEL, `${D.agent}.probe`, (walled, ok) => {
-    if (!S?.wall) return
+    if (!S?.wall || takingItems()) return
     if (ok) { logos('lane.wall_probe', { ok: true, bare: true }); wallDown('probe') }
     else wallUp(walled ?? { kind: S.wall.kind, text: S.wall.text }, 'probe')
   })
@@ -4190,7 +4256,8 @@ function followUsageWall(why: 'probe' | 'clear', u: { walled: boolean; clearedMs
  *  redrew the screen (nestor 11-26: Call 401 held:wall 07:07:10Z, the clear 07:12:26Z, offered 07:25:31Z) */
 export function usageWallChanged(state: { walled: boolean; clearedMs: number | null; by: string | null } | null): void {
   if (D?.role !== 'tg') return
-  if (S?.wall) { try { followUsageWall('clear', state) } catch (e) { D.log('warn', `lanes: following the usage wall: ${e}`) } }
+  if (takingItems()) { queueMicrotask(pump); onGateOpen?.() }
+  else if (S?.wall) { try { followUsageWall('clear', state) } catch (e) { D.log('warn', `lanes: following the usage wall: ${e}`) } }
   if (main) { try { main.statusChanged(state?.walled === false ? state.clearedMs : null) } catch (e) { D.log('warn', `lanes: the usage wall's clear to M1: ${e}`) } }
 }
 async function wallDown(by: string): Promise<void> {
@@ -4210,6 +4277,7 @@ async function wallDown(by: string): Promise<void> {
  *  when the first side hits it and the recovery when the last side is through. 002p told each side's up and down: four pushes for one limit. */
 const mainWalled = (): boolean => { const g = main?.currentGen(); return !!g && g.state !== 'gone' && !!g.wall_since }
 function wallNotice(text: string, rule: string, otherWalled: boolean): void {
+  if (takingItems()) return  // S4 cannot_move / recovered are addressed to the waiting person.
   if (otherWalled) { ledger({ lane: 'router', kind: 'notify', text: `[ledger] ${text}`, refs: { tier: 'ledger', tier_rule: `${rule}+same-limit`, escalated: false } }); logos('lane.notify', { escalated: false, tier: 'ledger', tier_rule: `${rule}+same-limit` }); return }
   ledger({ lane: 'router', kind: 'notify', text: `[push] ${text}`, refs: { tier: 'push', tier_rule: rule, escalated: true } })
   void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: rule, message_id: id }))
@@ -4244,10 +4312,42 @@ export function laneSlots(): number {
   }
   return n
 }
+function keeperForLane(lane: Lane): MainWall | null {
+  const keeper = D.usageWall?.(lane.last_limit_refusal ?? 0)
+  if (!keeper?.walled && !(lane.last_limit_refusal && keeper?.clearedMs)) return null
+  const transcript = mainTranscriptFile(D.transcriptDir)
+  const model = transcript && genuineAssistantModelFile(transcript)
+  return model && laneModelFor(lane.kind).model === model ? keeper : null
+}
+
+/** pump already serializes starts for this lane. Only a real waiting Item can probe its refusal. */
+function laneMayTake(it: QItem): boolean {
+  const lane = S.lanes[it.lane]
+  if (!lane) return true // no lane, no refusal: startRun takes its rows and hands them back (C1-final 96fd552)
+  const last = lane.last_limit_refusal
+  const keeper = keeperForLane(lane)
+  it.keeperProbe = undefined
+  it.wallProbe = !!last || !!keeper?.walled
+  if (!it.wallProbe) return true
+  const refs = runEvents(it).flatMap(ev => ev.onsen_items ?? [])
+  if (!refs.length) return false
+  const clear = keeper?.clearedMs
+  if (!keeper?.walled && last && clear && clear >= Math.floor(last / 1000) * 1000 && clear > (lane.keeper_clear_used ?? 0)) {
+    it.keeperProbe = clear
+    return true
+  }
+  if (keeper?.walled && !refs.every(r => r.kind === 'message' && !r.reason?.startsWith('usage_limit'))) return false
+  const refused = Math.max(last ?? 0, keeper?.lastWallMs ?? 0)
+  if (personCanProbe(refused)) return true
+  itemReceiver!.dueAt(new Date(refused + 60_000).toISOString())
+  return false
+}
+
 const startingItems = new Set<string>()
 function pump(): void {
-  if (S.wall && Date.now() < S.wall.probe_at) return      // the wall is up: nothing runs until the next probe
-  if (S.wall && daemonWall()?.walled) return              // WO-141 follow-up: the daemon's usage wall is up: its keeper probes, no run is one
+  const take = takingItems()
+  if (!take && S.wall && Date.now() < S.wall.probe_at) return      // the wall is up: nothing runs until the next probe
+  if (!take && S.wall && daemonWall()?.walled) return              // WO-141 follow-up: the daemon's usage wall is up: its keeper probes, no run is one
   const slots = laneSlots()                               // 002l (D13)
   const waiting = [...queue.values()].filter(i => i.state === 'queued')
     .sort((a, b) => a.priority - b.priority || a.enqueued.localeCompare(b.enqueued))
@@ -4259,7 +4359,8 @@ function pump(): void {
       break
     }
     if (sessionBusy(it)) continue                        // 002l (S0 item 2): never a second process on one session id
-    if (S.wall) {                                         // the probe: exactly one run; its result decides (startRun's exit handler)
+    if (take && !laneMayTake(it)) continue
+    if (!take && S.wall) {                                // the probe: exactly one run; its result decides (startRun's exit handler)
       if (running.size > 0 || chatFetching.size > 0 || startingItems.size > 0) return
       if (mainChatPending(it)) return                     // WO-144: its block first; the fetch's end pumps again
       S.wall.probe_at = Date.now() + wallBackoffMs(S.wall.kind, S.wall.probes + 1); saveState()
@@ -4267,7 +4368,7 @@ function pump(): void {
       return
     }
     if (mainChatPending(it)) continue                     // WO-144: the block of its run is fetched first (≤ LANES_MAIN_CHAT_TIMEOUT_MS); its end pumps again
-    coalesce(it, waiting)
+    if (!it.wallProbe) coalesce(it, waiting)
     startRun(it)
   }
 }
@@ -5252,13 +5353,17 @@ function startRun(it: QItem, acquired = false): void {
   if (lane?.status === 'closed' && releaseClosedQueue(it)) return
   const refs = runEvents(it).flatMap(ev => ev.onsen_items ?? [])
   if (refs.length && !acquired) {
-    if (!takingItems()) return
-    const receiver = itemReceiver!
+    if (!itemReceiver?.mode.canReceive) return
+    const receiver = itemReceiver
     startingItems.add(it.lane)
-    void receiver.receive(refs, false, !lane || !!th?.stopped || !!th && threadFresh(th) >= THREAD_BUDGET).then(({ given, gone }) => {
+    // A waiting incident can already have riders. Keep those waiting while its first real event probes.
+    const probeEvent = it.wallProbe && runEvents(it).find(ev => ev.onsen_items?.length)
+    const requested = probeEvent ? probeEvent.onsen_items! : refs
+    void receiver.receive(requested, false, !lane || !!th?.stopped || !!th && threadFresh(th) >= THREAD_BUDGET).then(({ given, gone }) => {
       if (it.state === 'queued' && !sessionBusy(it)) {
         const received = receivedRun(it, given, gone, receiver)
         if (received) startRun(received, true)
+        else if (gone.size) setTimeout(pump, 0).unref()
       } else {
         const taken = refs.filter(ref => given.has(ref.onsen_item_id))
         if (!lane || lane.status === 'closed' || th?.stopped) receiver.report(taken, 'reassigned', { note: `${it.lane} 在收下這件事之前已關閉。` })
@@ -5287,6 +5392,7 @@ function startRun(it: QItem, acquired = false): void {
     runEnded(lane, it, { reason: 'closed', said: `${lane.id} 在這件事開始處理之前被關閉了` })
     saveState(); return
   }
+  if (it.keeperProbe) lane.keeper_clear_used = it.keeperProbe
   const runId = `${lane.id}.r${lane.runs + 1}`
   const token = randomBytes(24).toString('base64url')
   const critical = !!lane.critical
@@ -5333,7 +5439,8 @@ function startRun(it: QItem, acquired = false): void {
   }, LANE_MAX_RUN_MS)
   const openTools: OpenTools = new Map()                                // WO-177 六: what the run is doing now (runningLanes: the observation's doing)
   if (refs.length) itemReceiver?.bind(refs, lane.id, runId)
-  running.set(lane.id, { child, evId: it.ev.id, runId, tok, at: nowIso(), tools: openTools })
+  const liveRun = { child, evId: it.ev.id, runId, tok, at: nowIso(), tools: openTools, progressAt: Date.now() }
+  running.set(lane.id, liveRun)
   lane.status = 'running'; lane.last = nowIso(); saveState()
   const started = Date.now()
   appendJsonl('lanes.jsonl', { lane: lane.id, kind: 'spawn', run: runId, event: it.ev.id, session_id: lane.session_id,
@@ -5369,6 +5476,7 @@ function startRun(it: QItem, acquired = false): void {
       const line = buf.slice(0, i); buf = buf.slice(i + 1)
       if (!line.trim()) continue
       let j: any; try { j = JSON.parse(line) } catch { continue }
+      if (j.type === 'assistant' || j.type === 'user' || j.type === 'tool_progress' || j.type === 'result') liveRun.progressAt = Date.now()
       if (j.type === 'system' && j.subtype === 'init' && j.session_id) sessionSeen = j.session_id
       if (j.type === 'assistant' && j.message) {
         const u = j.message.usage ?? {}
@@ -5378,7 +5486,11 @@ function startRun(it: QItem, acquired = false): void {
         for (const c of j.message.content ?? []) {
           if (c?.type === 'tool_use') {
             tools.push({ id: c.id ? String(c.id) : undefined, name: c.name, input: c.input })
-            if (c.id) openTools.set(String(c.id), { name: String(c.name ?? 'tool'), since: nowIso() })
+            if (c.id) {
+              const timeout = c.tool_timeout_ms ?? c.input?.timeout_ms ??
+                (c.name === 'Bash' && !c.input?.run_in_background ? c.input?.timeout ?? process.env.BASH_DEFAULT_TIMEOUT_MS ?? 120000 : undefined)
+              openTools.set(String(c.id), { name: String(c.name ?? 'tool'), since: nowIso(), silenceMs: toolSilenceMs(timeout, c.name) })
+            }
             if (!String(c.name).startsWith('mcp__lane__')) (tok.calls ??= []).push({ name: c.name, input: c.input })   // the lane stop's model aid (its lane tools: callLaneTool)
             const rs = c.name === 'Bash' ? restartCommand(String(c.input?.command ?? '')) : null
             if (c.name === 'Bash' && prodChangeOn()) for (const pc of remoteChanges(String(c.input?.command ?? ''))) prodChanges.push({ ...pc, cmd: clip(String(c.input?.command ?? ''), 300) })
@@ -5558,7 +5670,7 @@ function startRun(it: QItem, acquired = false): void {
       ledger({ lane: lane.id, thread: lane.thread, event: it.ev.id, kind: 'action',
         text: `分身線結果：${result.slice(0, 400) || '(無文字結果)'}`, detail: lane.transcript })
     }
-    runEnded(lane, it, { reason, processExit, said, reached, reachedModel: !!resultJson || usage.size > 0, wallText: result.slice(0, 200), runId, ...(tok.receipt ? { receipt: { outcome: tok.receipt.outcome } } : {}) })
+    runEnded(lane, it, { reason, processExit, said, reached, reachedModel: !!resultJson || usage.size > 0, halfDone: !!lastText || tools.length > 0, wallText: result.slice(0, 200), runId, ...(tok.receipt ? { receipt: { outcome: tok.receipt.outcome } } : {}) })
     saveState()
     pump()
   }
@@ -6235,11 +6347,13 @@ function mainDownMs(from: number, now: number): number {
 }
 export const __mainDown = (): { since: number | null; spans: Array<[number, number]> } => mainDown          // tests only
 export function dueTick(now = Date.now()): void {
-  if (!events || !S) return
-  try { batchTick(now) } catch (e) { D.log('warn', `lanes: batch wake sweep: ${e}`) }   // WO-137 甲: the batch wake of cards that can wait
+  if (!events || !S || itemReceiver?.mode.checking) return
+  // A take member's due notices are Onsen's (S4); only a reminder Onsen refused for good (C5 L1) still rings here.
+  const take = takingItems()
+  if (!take) try { batchTick(now) } catch (e) { D.log('warn', `lanes: batch wake sweep: ${e}`) }   // WO-137 甲: the batch wake of cards that can wait
   const down = noteMainDown(now)                                         // WO-201 (point 5)
   for (const { e, o } of events.due(now)) {
-    if (o.self) continue
+    if (o.self || take && !o.local_reminder) continue
     if (o.kind === 'main') {                                             // 1.38.2: the main is on it (mainOnIt): no push now
       const why = mainOnIt(e, o)
       if (why) { if (!heldDue.has(o.id)) { heldDue.add(o.id); if (heldDue.size > 1000) heldDue.clear(); logos('lane.handoff_due_held', { event: e.id, handoff: o.handoff ?? o.id, why }) } continue }
@@ -7526,7 +7640,10 @@ export function laneStop(tok: RunTok): string | null {
   if (tok.stopHeld) return null
   const ids = runEventIds(tok).filter(id => events.openObs(id).length)
   if (!ids.length) return null
+  const owed = runEvents(queue.get(tok.evId)).filter(ev => ids.includes(ev.id)).flatMap(ev => ev.onsen_items ?? [])
+  itemReceiver?.report(owed, 'owed')
   tok.stopHeld = true
+  if (owed.length) return `這一輪還欠事沒交代：${ids.map(id => events.openText(id)).join(' ')}。把結果告訴等的人，再結束這一輪。`
   logos('lane.stop_held', { lane: lane.id, run: tok.runId, events: ids })
   return `⛔ lane-stop: ${lane.id} has not finished what its event owes. ${ids.map(id => events.openText(id)).join(' ')} `
     + 'Do it now (one message each). If Joey must decide, use ask_joey; if the main must do it, handoff_main. Whatever is still open when the run ends goes to the main.'
@@ -8807,7 +8924,7 @@ export const mainCommitmentCheck = (m: { msgId: unknown; to: string; text: strin
 /** Returns true when the request was handled. Both roles; each endpoint checks its role. */
 export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerResponse): Promise<boolean> {
   if (u.pathname === '/lane-mcp' && D.role === 'tg') { await handleLaneMcp(req, res); return true }
-  if (u.pathname === '/lane-steer' && takingItems() && D.role === 'tg' && req.method === 'POST') {
+  if (u.pathname === '/lane-steer' && itemReceiver?.mode.canReceive && D.role === 'tg' && req.method === 'POST') {
     const token = laneBearer(req), tok = token && runTokens.get(token)
     if (!tok) { sendJson(res, 403, { error: 'lane token required' }); return true }
     const b = await readBody(req)

@@ -35,6 +35,7 @@ import {
 } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { holdMainOffers, mainSessionId, markDeliberateRestart } from './lanes.ts'
+import { osProcStart, pidAlive } from './onsen-status.ts'
 import { homedir } from 'node:os'
 import { spawn } from 'node:child_process'
 
@@ -1442,6 +1443,26 @@ export async function forwardSharedTuiSlash(
   return false
 }
 
+/** The name may already belong to the wrapper's replacement when a take restart retries. */
+async function stopTuiForRestart(exactSession: boolean, retryPid?: number): Promise<string> {
+  if (retryPid === undefined) {
+    const target = exactSession ? '=' + TMUX_SESSION : TMUX_SESSION
+    const kill = await runCommand(['tmux', 'kill-session', '-t', target])
+    if (exactSession && kill.exitCode !== 0) throw new Error(`tmux kill-session ${target} failed (${kill.exitCode}): ${kill.stderr.trim()}`)
+    return `tmux kill: ${kill.exitCode}`
+  }
+  if (!Number.isSafeInteger(retryPid) || retryPid <= 1 || retryPid === process.pid) throw new Error(`invalid main PID: ${retryPid}`)
+  const started = osProcStart(retryPid)
+  try {
+    process.kill(retryPid, 'SIGTERM')
+    await new Promise(resolve => setTimeout(resolve, 3_000))
+    if (pidAlive(retryPid) && (started === null || osProcStart(retryPid) === started)) process.kill(retryPid, 'SIGKILL')
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ESRCH') throw err
+  }
+  return `old TUI pid: ${retryPid}`
+}
+
 /**
  * Trigger claude TUI restart via the wrapper.
  *
@@ -1471,16 +1492,16 @@ export async function forwardSharedTuiSlash(
  * window. Net: -k was strictly worse than letting the running wrapper's
  * own tick pick up the dead session.
  */
-async function restartClaudeTUI(): Promise<string> {
-  // Step 1: kill tmux session — this triggers wrapper's "session does
-  // not exist" branch and forces start_claude on next monitor tick.
-  const killResult = await runCommand(['tmux', 'kill-session', '-t', TMUX_SESSION])
-  // killResult.exitCode != 0 may just mean session was already gone — proceed regardless.
+export async function restartClaudeTUI(exactSession = false, retryPid?: number): Promise<string> {
+  if (!TMUX_SESSION) throw new Error('CHANNEL_BOT_TMUX_SESSION is not set — no TUI to restart')
+  const stopped = await stopTuiForRestart(exactSession, retryPid)
+  const action = retryPid === undefined ? 'TUI tmux session closed' : 'TUI restart'
+  // A manual /restart also checks the wrapper when its old session was already gone.
 
-  if (SERVICE_MANAGER === 'systemd-user') return ensureWrapperSystemd(killResult.exitCode)
+  if (SERVICE_MANAGER === 'systemd-user') return ensureWrapperSystemd(stopped, action)
 
   if (!WRAPPER_LABEL) {
-    throw new Error(`TUI tmux session closed (tmux kill: ${killResult.exitCode}), but CHANNEL_BOT_WRAPPER_LABEL is not set, so there is no wrapper service to confirm a respawn`)
+    throw new Error(`${action} (${stopped}), but CHANNEL_BOT_WRAPPER_LABEL is not set, so there is no wrapper service to confirm a respawn`)
   }
   // Step 2: health backstop — never `kickstart -k` a healthy wrapper.
   const target = `gui/${process.getuid?.() ?? 501}/${WRAPPER_LABEL}`
@@ -1494,7 +1515,7 @@ async function restartClaudeTUI(): Promise<string> {
   const kick = await runCommand(['launchctl', 'kickstart', target], 25000)
   if (kick.exitCode !== 0) {
     throw new Error(
-      `wrapper ${WRAPPER_LABEL} not running AND kickstart failed (${kick.exitCode}): ${kick.stderr.trim().slice(0, 200)} (tmux kill: ${killResult.exitCode})`,
+      `wrapper ${WRAPPER_LABEL} not running AND kickstart failed (${kick.exitCode}): ${kick.stderr.trim().slice(0, 200)} (${stopped})`,
     )
   }
   return `wrapper (${WRAPPER_LABEL}) 剛才沒在跑，已重新拉起`
@@ -1505,11 +1526,12 @@ async function restartClaudeTUI(): Promise<string> {
  * the tmux kill above IS the restart; only start the wrapper unit if it is not
  * active, never restart a healthy one.
  */
-export async function ensureWrapperSystemd(killExit: number): Promise<string> {
+export async function ensureWrapperSystemd(stop: number | string, action = 'TUI tmux session closed'): Promise<string> {
+  const stopped = typeof stop === 'number' ? `tmux kill: ${stop}` : stop
   if (!process.env.CHANNEL_BOT_WRAPPER_LABEL) {
     // No unit configured → we cannot verify anything will respawn the TUI. Say so
     // instead of reporting a restart that may not happen.
-    throw new Error(`TUI tmux session closed (tmux kill: ${killExit}), but CHANNEL_BOT_WRAPPER_LABEL is not set, so there is no wrapper unit to confirm a respawn`)
+    throw new Error(`${action} (${stopped}), but CHANNEL_BOT_WRAPPER_LABEL is not set, so there is no wrapper unit to confirm a respawn`)
   }
   const unit = WRAPPER_LABEL
   const probe = await runCommand(['systemctl', '--user', 'is-active', unit], 5000)
@@ -1519,7 +1541,7 @@ export async function ensureWrapperSystemd(killExit: number): Promise<string> {
   const start = await runCommand(['systemctl', '--user', 'start', unit], 25000)
   if (start.exitCode !== 0) {
     throw new Error(
-      `wrapper ${unit} not active (${probe.stdout.trim() || probe.exitCode}) AND systemctl --user start failed (${start.exitCode}): ${start.stderr.trim().slice(0, 200)} (tmux kill: ${killExit})`,
+      `wrapper ${unit} not active (${probe.stdout.trim() || probe.exitCode}) AND systemctl --user start failed (${start.exitCode}): ${start.stderr.trim().slice(0, 200)} (${stopped})`,
     )
   }
   return `wrapper (${unit}) 剛才沒在跑，已重新拉起`

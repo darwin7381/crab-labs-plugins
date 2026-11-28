@@ -18,9 +18,10 @@ export type ClaimStore = {
   owns(id: string): boolean
   inSession(id: string): boolean
   completed(id: string): boolean
+  wasOwed(id: string): boolean
   taken(row: InboxItem, ref: ItemRef): void
   bind(id: string, session: string, turn: string, registrySession?: string): void
-  report(id: string, outcome: Outcome, fields?: ReportFields): void
+  report(id: string, outcome: Outcome, fields?: ReportFields): boolean
   finalStop(session: string, turn: string): void
   continued(turn: string): void
 }
@@ -32,8 +33,11 @@ export class ItemReceiver {
     readonly currentKeepwarm?: (due?: string) => boolean) {}
   taking(id: string): boolean { return this.requesting.has(id) }
 
-  report(refs: ItemRef[], outcome: Outcome, fields?: ReportFields): void {
-    for (const ref of refs) this.claims.report(ref.onsen_item_id, outcome, fields)
+  /** Number of owned claims with this outcome durably recorded. */
+  report(refs: ItemRef[], outcome: Outcome, fields?: ReportFields): number {
+    let reported = 0
+    for (const ref of refs) if (this.claims.report(ref.onsen_item_id, outcome, fields)) reported++
+    return reported
   }
 
   bind(refs: ItemRef[] | undefined, session: string, turn: string, registrySession?: string): void {
@@ -43,7 +47,7 @@ export class ItemReceiver {
   async receive(refs: ItemRef[], hook = false, binding = false, onGone?: (ids: Set<string>) => void,
     superseded?: (id: string) => boolean): Promise<ReceiveResult> {
     const result = empty()
-    if (!this.mode.active || this.claims.blocked()) return result
+    if (!this.mode.canReceive || this.claims.blocked()) return result
     const byId = new Map(refs.map(r => [r.onsen_item_id, r]))
     const ids = [...byId.keys()]
     if (ids.some(id => this.requesting.has(id))) return result
@@ -73,9 +77,9 @@ export class ItemReceiver {
       let r = await take().catch(() => null)
       // The first write may have committed before the response was lost. Recover its exact result.
       let retry = 0
-      while ((!r || r.status >= 500 || expired && retry === 0) && this.mode.active) {
+      while ((!r || r.status >= 500 || expired && retry === 0) && this.mode.canReceive) {
         if (retry) await new Promise(resolve => setTimeout(resolve, Math.min(30_000, 1000 * retry)).unref())
-        if (!this.mode.active) return empty()
+        if (!this.mode.canReceive) return empty()
         retry++
         if (!this.claims.blocked()) r = await take().catch(() => null)
       }
@@ -107,7 +111,7 @@ export class ItemReceiver {
         }))
         if (result.gone.size) onGone?.(result.gone)
       }
-      if (expired || !this.mode.active) {
+      if (expired || !this.mode.canReceive) {
         for (const id of need) if (result.given.has(id)) this.claims.report(id, superseded?.(id) ? 'superseded' : 'not_taken')
         return empty()
       }
