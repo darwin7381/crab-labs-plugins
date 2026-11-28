@@ -451,7 +451,7 @@ export function createMain(E: MainEnv) {
   }
   function readyInTurn(r: Row): boolean {
     const refs: ItemRef[] | undefined = r.onsen_items
-    return !refs || refs.every(ref => ref.kind === 'message' || ref.kind === 'call' || ref.kind === 'control' || Date.parse(ref.deadline ?? '') <= Date.now())
+    return !refs || refs.every(ref => ref.kind === 'message' || ref.kind === 'call' || ref.kind === 'control' || (ref.kind !== 'self' && Date.parse(ref.deadline ?? '') <= Date.now()))
   }
 
   /** An album is one notification. If just some of its rows were given, return the claims without writing it. */

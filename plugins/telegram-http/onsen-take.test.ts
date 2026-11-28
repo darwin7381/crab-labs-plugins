@@ -153,6 +153,20 @@ test('while busy mail waits, a person binds inside PostToolUse, pre-switch work 
   for (const id of r.claims.held()) { const it = r.f.rows.get(id)!; expect(!!it.in_session_at || r.f.now() - Date.parse(it.claim!.taken_at) < 20_000).toBe(true) }
 })
 
+test('a self Item waits through a busy turn and is taken when the conversation is idle', async () => {
+  const r = await mainRig()
+  await r.hook('UserPromptSubmit'); r.status('busy')
+  const self = r.f.add('own', 'self', { from: 'adam' })
+  r.enqueue(self)
+  await r.hook('PostToolUse'); await r.hook('Stop')
+  expect(r.offers).toHaveLength(0)
+  expect(self.claim).toBeNull()
+  await r.hook('Stop', { phase: 'final' }); r.status('idle')
+  await r.m.pump()
+  await until(() => r.offers.length === 1)
+  expect(self.claim?.connector).toBe('mac-mini/adam')
+})
+
 test('20 s without a bind returns the offer, the same did can bind once on a new claim', async () => {
   const r = await mainRig(), row = r.f.add('miss'), did = r.enqueue(row)
   await until(() => r.offers.length === 1)

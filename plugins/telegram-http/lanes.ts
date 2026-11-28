@@ -1865,7 +1865,7 @@ function recordOnlyRow(ev: InEvent, v: WakeVerdict): Decision {
 
 /** Router: rules from router.json, in order, first match wins. No model call. */
 export async function routeEvent(ev: InEvent): Promise<Decision> {
-  if (ev.onsen_items?.some(r => r.main)) {
+  if (ev.onsen_items?.some(r => r.main || r.kind === 'self')) {
     return routeMainItem(ev)
   }
   if (ev.onsen_items?.length) ev.id = itemEventId(ev.onsen_items[0]!)
@@ -2527,6 +2527,7 @@ function toMain(ev: InEvent, d: Decision, opt: { owesOnlyMain?: boolean } = {}):
   // main as the lanes' own message (chat lanes, no_reply), its mention block riding with it. As a peer's call it carried a Joey line, and the main answered
   // Joey 「沒有要我做的事」 (Chiron's WO-175 lab, 08:42Z, lab-relay msg 881): fleet-wide, every comment naming an agent would have made it write to Joey
   const notice = ev.item_kind === 'mention'
+  const self = ev.onsen_items?.some(r => r.kind === 'self')
   const p = (notice ? { content: String(ev.text ?? ''), meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'mention', no_reply: 'true' } }
     : ev.notif?.params ?? {}) as { content?: string; meta?: Record<string, string> }
   const notif = d.warn ? { method: ev.notif.method || 'notifications/claude/channel', params: { ...p, content: `${d.warn}\n\n${String(p.content ?? ev.text)}`, meta: { ...(p.meta ?? {}), screened: 'instructions-to-agent' } } }
@@ -2537,9 +2538,9 @@ function toMain(ev: InEvent, d: Decision, opt: { owesOnlyMain?: boolean } = {}):
   // main, those are `handed` (the main meets them: its reply meets the Joey line and rings a critical one's ring, the due sweep rings it if nobody did)
   ev.trigger ??= triggerClass(undefined, ev) || undefined
   const cls = evClassOf(ev)
-  recordInbound(ev, { owner: 'main', class: cls, obligations: [{ kind: 'main', level: 'handed', owner: 'main' }, ...(opt.owesOnlyMain || notice ? [] : eventObligations(ev, cls)).map(o => ({ ...o, state: 'handed',
+  recordInbound(ev, { owner: 'main', class: cls, obligations: [{ kind: 'main', level: 'handed', owner: 'main' }, ...(opt.owesOnlyMain || notice || self ? [] : eventObligations(ev, cls)).map(o => ({ ...o, state: 'handed',
     ...(o.kind === 'peer' ? { due_at: Date.now() + PROMISE_MIN * 60_000, what: String(ev.text ?? '').slice(0, 160) } : {}) }))] })   // 002w (B, gap 9): the answer is due
-  return main.enqueue(kind, notif, { via: ev.source === 'telegram' || notice ? 'tg' : 'inbox', event: ev.id, ...(ev.person_message_ids?.length ? { fields: { person_message_ids: ev.person_message_ids } } : {}), ...(ev.onsen_items ? { fields: { person_message_ids: ev.person_message_ids, onsen_items: ev.onsen_items } } : {}), ...(d.batch ? { batched: true } : {}) })   // WO-164: batched
+  return main.enqueue(kind, notif, { via: ev.source === 'telegram' || notice || self ? 'tg' : 'inbox', event: ev.id, ...(ev.person_message_ids?.length ? { fields: { person_message_ids: ev.person_message_ids } } : {}), ...(ev.onsen_items ? { fields: { person_message_ids: ev.person_message_ids, onsen_items: ev.onsen_items } } : {}), ...(d.batch ? { batched: true } : {}) })   // WO-164: batched
 }
 function itemEventId(ref: ItemRef): string {
   const id = 'item-' + ref.onsen_item_id + '-v' + ref.onsen_version

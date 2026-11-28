@@ -132,12 +132,23 @@ for (const inboxOnly of ['0', '1']) test('/inject writes one waiting Item on the
   expect(result).toEqual({ injected: true, item_id: expect.any(String) })
   expect(await (await post(body)).json()).toEqual(result)
   expect([...d.f.rows.values()]).toMatchObject([{ member: 'adam', state: 'waiting', claim: null, kind: 'self',
-    payload: { text: '[/inject unverified sender: storage-watch]\ndisk check' } }])
+    from: 'adam', note: 'storage-watch', payload: { text: 'disk check' } }])
   expect(d.journal().some(r => r.onsen_items?.length)).toBe(false)
   d.f.down(true)
   const failed = await post({ text: 'second' })
   expect(failed.status).toBe(503)
   expect((await failed.json()).injected).toBe(false)
+})
+
+test('/inject on an active connector queues the self Item for the idle main', async () => {
+  const d = await daemon({ AGENT_INBOX_SELF: 'adam' })
+  const res = await fetch(d.base + '/inject', { method: 'POST', body: JSON.stringify({ text: '[P2] check disk', from: 'watch' }) })
+  const { item_id } = await res.json()
+  const queued = () => d.journal().find(r => r.rec === 'msg' && r.onsen_items?.some((it: any) => it.onsen_item_id === item_id))
+  await waitFor(() => !!queued())
+  expect(queued()).toMatchObject({ state: 'queued', via: 'tg', notif: { params: { content: '[P2] check disk', meta: { user: 'adam' } } } })
+  expect(d.f.rows.get(item_id)?.claim).toBeNull()
+  expect(d.f.calls.some(c => c.path.endsWith('/take'))).toBe(false)
 })
 
 test('startup counts retired delivery stores without replaying or changing their contents', async () => {
@@ -169,7 +180,7 @@ test('/inject keeps signed identity, quarantine and the shared-token gate before
   expect(await (await post('eve', { 'x-inject-token': 'local' })).json()).toMatchObject({ injected: false, dropped: 'forged-unsigned' })
   expect(await (await post('watch', { 'x-inject-token': 'local' })).json()).toEqual({ injected: false, held: true })
   expect(await (await post('joey', { authorization: 'Bearer ' + caller })).json()).toMatchObject({ injected: true })
-  expect([...d.f.rows.values()].map(r => r.payload.text)).toEqual(['[/inject from: eve]\ncheck'])
+  expect([...d.f.rows.values()]).toMatchObject([{ member: 'adam', from: 'adam', note: 'eve', payload: { text: 'check' } }])
 })
 
 test('real daemon routes one unclaimed notification per album at count or 1.5 s and replaces a newer waiting edit', async () => {

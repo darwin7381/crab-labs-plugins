@@ -4021,8 +4021,7 @@ async function writeInject(req: IncomingMessage, res: ServerResponse): Promise<v
   const trusted = tokenOk || v.verified || FORWARDERS.has(v.relay)
   const idem = 'inject:' + (key && trusted ? sha256hex(JSON.stringify([v.sender, key])) : randomUUID())
   const path = '/v1/members/' + encodeURIComponent(inboxClient.cfg.agent) + '/items'
-  const r = await inboxClient.request('POST', path, { kind: 'self', body: { format: 'markdown',
-    text: `[/inject ${v.verified ? 'from' : 'unverified sender'}: ${v.sender}]\n${text}` }, refs }, 10_000, { 'Idempotency-Key': idem }).catch(() => null)
+  const r = await inboxClient.request('POST', path, { kind: 'self', body: { format: 'markdown', text }, note: signed ?? v.sender, refs }, 10_000, { 'Idempotency-Key': idem }).catch(() => null)
   const id = r?.json?.data?.id
   if (r && r.status >= 200 && r.status < 300 && typeof id === 'string' && id) answer(200, { injected: true, item_id: id })
   else answer(r?.status === 409 ? 409 : 503, { injected: false, error: 'Onsen did not confirm the Item' })
@@ -4148,6 +4147,10 @@ async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
       const c = Onsen.actionControlOf(payload)
       if (c && c.action_id === row.action_id) applied = await applyActionControl(c)
     } finally { receiver.report([item], applied ? 'completed' : 'not_applied') }
+    return
+  }
+  if (row.kind === 'self') {
+    await routePeerItem({ text: payload.text, logged: true, no_reply: true }, { sender: row.member, verified: true, forged: false, relay: 'direct' }, item)
     return
   }
   const kinds: Record<string, string> = { call: 'peer_call', mail: 'peer_mail', schedule: 'scheduled', keepwarm: 'wd_keepwarm' }
