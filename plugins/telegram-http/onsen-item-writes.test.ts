@@ -153,6 +153,32 @@ test('one ordered spool reads legacy self lines, drops a permanent refusal once 
   } finally { client.stop(); rmSync(dir, { recursive: true, force: true }) }
 })
 
+test('an older followup spool recovers an accepted row or posts once with only Onsen-openable refs', async () => {
+  fake = fakeItems()
+  const dir = mkdtempSync(join(tmpdir(), 'followup-upgrade-'))
+  const c = new OnsenClient({ dir, agent: 'adam', base: fake.base, record: true, credential: () => 'test-member', log: () => {} })
+  try {
+    const origin = fake.add('upstream')
+    const legacy = (key: string) => ({ key, item: ownItem('self', 'adam.worker.1', key + ' reminder', fake.now() + 60_000, 'eve', null,
+      [{ kind: 'item', value: key }, { kind: 'item', value: origin.id }]) })
+    const sent = legacy('fu-accepted'), pending = legacy('fu-unsent')
+    const existing = fake.add('opaque-original', 'self', { from: 'adam', session_id: 'main', waiter: 'eve', state: 'completed',
+      payload: { text: sent.item.body!.text }, not_before: sent.item.not_before, deadline: null })
+    for (const write of [sent, pending, pending]) appendFileSync(c.spool, JSON.stringify({ k: 'self', r: write }) + '\n')
+    await c.syncNow(true)
+    expect(c.writtenItemId(sent.key)).toBe(existing.id)
+    const posts = fake.calls.filter(call => call.path === base && call.key !== null)
+    expect(posts.map(call => call.key)).toEqual([pending.key])
+    expect(posts[0]!.body.refs).toEqual([{ kind: 'item', value: origin.id }])
+    expect(posts[0]!.body).not.toHaveProperty('waiter')
+    const id = c.writtenItemId(pending.key)!
+    expect(fake.rows.get(id)!.waiter).toBe('adam')
+    c.recordItemWrite({ ...pending, outcome: 'withdrawn' })
+    await c.syncNow(true)
+    expect(fake.rows.get(id)!.reason).toBe('withdrawn')
+  } finally { c.stop(); rmSync(dir, { recursive: true, force: true }) }
+})
+
 test('a pre-receipt commitment closes by matching its original waiting Item without a second POST', async () => {
   fake = fakeItems()
   const dir = mkdtempSync(join(tmpdir(), 'item-upgrade-'))
