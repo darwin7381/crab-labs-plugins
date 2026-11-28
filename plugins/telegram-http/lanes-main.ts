@@ -39,7 +39,7 @@ export type EndReason = 'asked' | 'killed' | 'exited' | 'replaced'
 
 import type { ItemRef } from './onsen-items.ts'
 import type { ItemReceiver, Outcome, ReportFields } from './onsen-receive.ts'
-import { ACCOUNT_WALL, ResumeItems, resumeNotification, resumeText, type CutTurn } from './onsen-resume.ts'
+import { ACCOUNT_WALL, ResumeItems, resumeNotification, resumeText, type CutTurn, type ResumeLine } from './onsen-resume.ts'
 
 export type MainEnv = {
   itemReceiver?: () => ItemReceiver | undefined
@@ -209,9 +209,9 @@ export function createMain(E: MainEnv) {
     const g = latestMain()
     const row = J().write('main', g?.id ?? UNREGISTERED, g?.state ?? 'gone', { resume_items: entries.length ? entries : null })
     if (row) resumeWrites.set(row, (resumeWrites.get(row) ?? 0) + 1)
-  }, () => E.itemReceiver?.(), resumeDelivered, id => {
-    for (const r of items(r => r.state !== 'done' && r.onsen_items?.[0]?.onsen_item_id === id)) closeItem(r, { reason: 'superseded' })
-  }, () => { void pump() })
+  }, () => E.itemReceiver?.(), resumeDelivered, (id, reason) => {
+    for (const r of items(r => r.state !== 'done' && r.onsen_items?.[0]?.onsen_item_id === id)) closeItem(r, { reason })
+  }, () => { void pump('resume-ready') })
   const aidItem = (r: Row): AidItem => { const m = metaOf(r.notif); return { mid: m.message_id || m.btcc_msg_id || r.id, kind: m.message_id ? 'tg' : m.btcc_msg_id ? 'mesh' : 'sys',
     user: String(m.user ?? ''), no_reply: m.no_reply === 'true', system: m.user === 'lanes' || r.kind === 'handoff' || r.kind === 'carry', body: contentOf(r).slice(0, BODY_MAX) } }
   /** boot: fold done by the caller (journal.load); pick the live gen */
@@ -225,6 +225,7 @@ export function createMain(E: MainEnv) {
     const at = latestMain()?.undelivered_since
     if (at != null) stuck = { gen: cur, prompt: null, at, undelivered: true }
     const restored = J().rows('msg')
+    resumes.restoreLines(J().path, restored)
     restoredThrough = restored.at(-1)?.n ?? 0
     seq = restored.length
   }
@@ -353,7 +354,7 @@ export function createMain(E: MainEnv) {
   const isResume = (r: Row): boolean => r.onsen_items?.[0]?.kind === 'resume' && r.onsen_items[0].from === E.agent
   const owed = (r: Row): boolean => isResume(r) ? resumes.canOffer(r.onsen_items[0].onsen_item_id, contentOf(r)) : (E.owed ? E.owed(r) : r.kind !== 'digest')
   function routeResume(ref: ItemRef, text: string): void {
-    resumes.remember(ref.onsen_item_id)
+    resumes.remember(ref.onsen_item_id, text)
     if (resumes.cancelling(ref.onsen_item_id)) return
     const pending = items(r => r.state !== 'done' && r.onsen_items?.[0]?.onsen_item_id === ref.onsen_item_id)[0]
     if (pending) {
@@ -484,13 +485,13 @@ export function createMain(E: MainEnv) {
     const refs: ItemRef[] = rows.flatMap(r => r.onsen_items ?? [])
     if (!receiver) return rows.filter(r => !r.onsen_items)
     if (!ready()) return []
-    const { given, gone } = await receiver.receive(refs, hook, binding, id => resumes.cancelling(id))
+    const { given, gone } = await receiver.receive(refs, hook, binding, id => resumes.cancelling(id) === 'superseded')
     const valid = ready()
     return rows.filter(r => {
       const own: ItemRef[] | undefined = r.onsen_items
       if (!own) return valid
       if (isResume(r) && resumes.cancelling(own[0]!.onsen_item_id)) {
-        if (given.has(own[0]!.onsen_item_id)) receiver.report(own, 'superseded')
+        if (given.has(own[0]!.onsen_item_id)) receiver.report(own, resumes.cancelling(own[0]!.onsen_item_id) === 'withdrawn' ? 'not_taken' : 'superseded')
         return false
       }
       if (valid && r.state === 'queued' && own.every(ref => given.has(ref.onsen_item_id))) return true
@@ -573,7 +574,8 @@ export function createMain(E: MainEnv) {
       const dg = wall.active && !probe ? null : attachInfo(mb)
       const ids = [it.id, ...riders.map(r => r.id), ...(dg ? [dg.id] : [])]
       const p = (it.notif?.params ?? {}) as Record<string, any>
-      const own = [cutText(it, String(p.content ?? '')), ...riders.map(r => cutText(r, renderItem(r)))].join('\n')
+      const line = carryResume(g, [it, ...riders])
+      const own = [...(line ? [line.text] : []), cutText(it, String(p.content ?? '')), ...riders.map(r => cutText(r, renderItem(r)))].join('\n')
       const content = dg ? `${contentOf(dg)}\n〔以上是系統附上的車道摘要，只附這一次；以下才是這則訊息本身〕\n${own}` : own
       const notif = { method: it.notif.method, params: { ...p, content, meta: { ...(p.meta ?? {}), did: ids.join(','), ...(dg ? { lane_digest: 'rides' } : {}) } } }
       let ok = false
@@ -586,6 +588,7 @@ export function createMain(E: MainEnv) {
       const now = currentGen()
       if (!now || now.id !== g.id) return
       if (!ok) {
+        if (line && it.state === 'queued') J().write('msg', it.id, 'queued', { carried_resume: null })
         for (const r of [it, ...riders]) if (r.onsen_items) E.itemReceiver?.()?.report(r.onsen_items, 'not_taken')
         down.add(String(it.via))
         if (it.last_no_wake !== 'unreachable') { J().write('msg', it.id, 'queued', { last_no_wake: 'unreachable' }); J().write('wake', it.id, 'no_wake', { reason: `main gen ${g.id} has no open ${it.via} stream` }) }
@@ -637,6 +640,16 @@ export function createMain(E: MainEnv) {
   /** bind queued owed items (and the riding information) to the running prompt: what a busy main pulls at a boundary. `mb` (WO-181): the unread mentions
    *  fetched for it (pullable() first said there is something to pull) */
   const pullable = (g: Row): boolean => items(r => r.state === 'queued' && owed(r) && forGen(r, g) && !waitsRetry(r)).length > 0
+  /** Pin the exact sentence to the delivery receipt before the stream or hook can reach Claude. */
+  function carryResume(g: Row, rows: Row[], prompt?: string): ResumeLine | undefined {
+    const alreadyTold = prompt && items(r => r.gen === g.id && r.prompt_id === prompt && r.state === 'bound' && r.carried_resume).length
+    const line = !alreadyTold ? resumes.line(g.session_id) : undefined
+    for (const r of rows) {
+      const carried = r === rows[0] ? line : undefined
+      if (carried || r.carried_resume) J().write('msg', r.id, r.state, { carried_resume: carried ?? null })
+    }
+    return line
+  }
   async function pull(g: Row, prompt: string, mb: { text: string; posts: string[] } | null = null): Promise<Row[]> {
     const wall = wallDelivery(g)
     let got = items(r => r.state === 'queued' && owed(r) && forGen(r, g) && !waitsRetry(r) && wallAllows(r, wall))     // WO-201: a failed turn's item waits for its retry time
@@ -652,6 +665,7 @@ export function createMain(E: MainEnv) {
       if (got.some(r => r.onsen_items)) got = await receiveRows(got, true, () => currentGen() === g && g.prompt_id === prompt && g.state === 'in_turn' && ['idle', 'busy'].includes(member() ?? ''))
     }
     if (!got.length) return []
+    carryResume(g, got, prompt)
     const dg = wallDelivery(g).active ? null : attachInfo(mb)
     const all = dg ? [...got, dg] : got
     const at = new Date().toISOString()                                                           // WO-201: bound_at, what "output after it" is measured from
@@ -675,6 +689,7 @@ export function createMain(E: MainEnv) {
     const info = rs.filter(isInfo), msgs = rs.filter(r => !isInfo(r))
     return ['〔交給主線｜這一回合進行中送到的訊息，交給你接著處理。來源已驗證（這段對話只收白名單裡的人，這就是 Joey 本人；mesh 訊息看 verified）。'
       + '照平常處理：問的就回答，交代的就照做（能馬上做的現在做，其餘接在手上這一步之後），Joey 用 reply 回，同事用 send_to_agent 回；已經處理過的不用重做。〕',
+      ...rs.filter(r => r.carried_resume).map(r => r.carried_resume.text),
       ...msgs.map(r => cutText(r, renderItem(r))), ...info.map(r => r.kind === 'digest' ? `〔車道摘要（只讓你知道，不是新的指示）〕\n${contentOf(r)}` : contentOf(r))].join('\n')
   }
   function requeue(pred: (r: Row) => boolean, reason: string, fields: Record<string, unknown> = {}): Row[] {
@@ -937,7 +952,8 @@ export function createMain(E: MainEnv) {
     const accepted = items(canBind)
     for (const r of accepted) if (r.onsen_items) receiver?.bind(r.onsen_items, 'main', prompt, g.session_id)
     const at = new Date().toISOString()
-    for (const r of accepted) J().write('msg', r.id, 'bound', { gen: g.id, prompt_id: prompt, bound_at: at })
+    for (const r of accepted) J().write('msg', r.id, 'bound', { gen: g.id, prompt_id: prompt, bound_at: at,
+      ...(r.carried_resume && (!ids || !identifies(ids, r)) ? { carried_resume: null } : {}) })
     if (accepted.length) { try { E.bound?.(accepted.map(r => J().get('msg', r.id)!)) } catch (e) { E.log('warn', `lanes: bound hook: ${e}`) }; delivered() }
   }
   /** the prompt the gen last stopped is running again: a Stop hook other than ours blocked that Stop. The turn was not over: it re-opens, and
@@ -1062,6 +1078,7 @@ export function createMain(E: MainEnv) {
         }
         { // 002v: the work this turn leaves for the next (the turn's items, or the outputs it adds to the work it carried on)
           const mine = items(r => r.gen === g.id && r.prompt_id === p && (r.state === 'bound' || r.state === 'done') && r.kind !== 'digest')
+          for (const r of mine) if (r.carried_resume?.session === g.session_id && r.state === 'bound') resumes.withdraw(r.carried_resume)
           const outs = outputs.get(p) ?? [], w = work.get(g.id)
           if (mine.length) work.set(g.id, { items: mine.map(aidItem).slice(-6), outputs: outs.slice(-12), ids: mine.map(r => r.id),
             events: [...new Set(mine.map(r => String(r.event ?? '')).filter(Boolean))] })

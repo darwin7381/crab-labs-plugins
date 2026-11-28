@@ -402,6 +402,6 @@ plugins/telegram-http/server.ts::/api/fleet/main-registry
 plugins/telegram-http/lanes-main.ts::resume_sent: cut.at
 # WO-213 C4: take members write the WO-209 sentence into their own resume Item
 plugins/telegram-http/onsen-resume.ts::body: { format: 'markdown', text: resumeText(cut) }
-plugins/telegram-http/onsen-resume.ts::expected_version: row.version, outcome: 'superseded'
+plugins/telegram-http/onsen-resume.ts::id: e.id, outcome: e.withdrawn ? 'withdrawn' : 'superseded'
 plugins/telegram-http/lanes-main.ts::const probe = g?.state === 'walled' && (clear ?? 0) > Number(g.uw_clear_used ?? 0)
 plugins/telegram-http/lanes-main.ts::undelivered_since: previous?.undelivered_since ?? null

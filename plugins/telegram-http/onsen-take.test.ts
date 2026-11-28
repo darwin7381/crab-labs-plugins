@@ -393,7 +393,7 @@ test.each(['item id', 'earlier did'])('C4 a prompt naming the %s binds the curre
   expect(r.row.state).toBe('waiting')
 })
 
-test('C4 a claimed offer without its did is superseded, while a turn opened by another item leaves the resume waiting', async () => {
+test('C4 a claimed offer that never reaches a turn is superseded', async () => {
   const claimed = await accountCut()
   claimed.setWall({ walled: false, clearedMs: Date.now() + 1000 })
   await claimed.m.pump()
@@ -404,14 +404,97 @@ test('C4 a claimed offer without its did is superseded, while a turn opened by a
   expect(claimed.outcomes(claimed.row.id)).toEqual(['superseded'])
   expect(claimed.offers).toHaveLength(1)
 
-  const other = await mainRig()
-  await other.hook('UserPromptSubmit')
-  await other.hook('StopFailure', { error: 'overloaded' })
-  await until(() => other.f.rows.size === 1)
-  const resume = [...other.f.rows.values()][0]!
-  await other.bind(other.f.add('message'))
-  await other.hook('Stop', { phase: 'final' })
-  expect(resume.state).toBe('waiting')
+})
+
+async function waitingModelCut() {
+  const r = await mainRig()
+  await r.hook('UserPromptSubmit')
+  await r.hook('StopFailure', { error: 'overloaded' })
+  await until(() => !!r.m.currentGen()?.resume_items?.[0]?.id)
+  const resume = [...r.f.rows.values()][0]!
+  return { ...r, resume, line: resume.payload.text as string }
+}
+
+test('settled 59: the next delivery carries the waiting line once and its normal Stop withdraws that exact resume', async () => {
+  const r = await waitingModelCut()
+  await r.bind(r.f.add('message'))
+  const content = r.offers[0].params.content
+  expect(content).toContain('message')
+  expect(content.split(r.line)).toHaveLength(2)
+  expect(r.resume.state).toBe('waiting')
+  expect(r.f.calls.some(c => c.path.endsWith('/take') && c.body.item_ids?.includes(r.resume.id))).toBe(false)
+  await r.hook('Stop', { phase: 'check' }); await r.sync()
+  expect(r.resume.state).toBe('waiting')
+  await r.hook('Stop', { phase: 'final' }); await r.sync()
+  expect(r.resume).toMatchObject({ state: 'cancelled', reason: 'withdrawn' })
+  expect(r.f.calls.filter(c => c.path === '/v1/items/' + r.resume.id && c.body.outcome)).toMatchObject([{ body: { expected_version: 1, outcome: 'withdrawn' } }])
+})
+
+test.each(['PostToolUse', 'Stop'])('settled 59: a row pulled at %s carries the line into that prompt once', async boundary => {
+  const r = await waitingModelCut()
+  const turn = { prompt_id: 'background', source: 'task-notification' }
+  await r.hook('UserPromptSubmit', turn)
+  r.enqueue(r.f.add('during-task'))
+  const got = await r.hook(boundary, { ...turn, phase: 'check' })
+  expect((got.additionalContext ?? got.block)!.split(r.line)).toHaveLength(2)
+  r.enqueue(r.f.add('also-during-task')); await r.sync()
+  const more = await r.hook('PostToolUse', turn)
+  expect(more.additionalContext).toContain('also-during-task')
+  expect(more.additionalContext).not.toContain(r.line)
+  await r.hook('Stop', { ...turn, phase: 'final' }); await r.sync()
+  expect(r.resume.reason).toBe('withdrawn')
+})
+
+test('settled 59: a failed carrier and an unrelated normal Stop keep the line for the next delivery', async () => {
+  const r = await waitingModelCut()
+  await r.bind(r.f.add('first-carrier'))
+  expect(r.offers[0].params.content).toContain(r.line)
+  await r.hook('StopFailure', { error: 'server_error' }); await r.sync()
+  await r.hook('UserPromptSubmit', { prompt_id: 'background', source: 'task-notification', dids: [] })
+  await r.hook('Stop', { prompt_id: 'background', phase: 'final' }); await r.sync()
+  expect(r.resume.state).toBe('waiting')
+  await r.bind(r.f.add('second-carrier'))
+  expect(r.offers.at(-1).params.content).toContain(r.line)
+  await r.hook('Stop', { phase: 'final' }); await r.sync()
+  expect(r.resume.reason).toBe('withdrawn')
+})
+
+test('settled 59: an older acknowledged resume recovers its sentence from its original journal entry', async () => {
+  const r = await waitingModelCut()
+  const g = r.m.currentGen()!, { key, id, session } = g.resume_items[0]
+  r.journal.write('main', g.id, g.state, { resume_items: [{ key, id, session }] })
+  r.m.initMain()
+  await r.bind(r.f.add('after-restart'))
+  expect(r.offers[0].params.content).toContain(r.line)
+  await r.hook('Stop', { phase: 'final' }); await r.sync()
+  expect(r.resume.reason).toBe('withdrawn')
+})
+
+test('settled 59: a new session receives its row without the previous session’s resume', async () => {
+  const r = await waitingModelCut(), session_id = crypto.randomUUID()
+  await r.hook('SessionStart', { session_id, source: 'clear' })
+  const did = r.enqueue(r.f.add('another-session'))
+  await until(() => r.offers.length === 1)
+  expect(r.offers[0].params.content).not.toContain(r.line)
+  await r.hook('UserPromptSubmit', { session_id, prompt_id: 'new', dids: [did] })
+  await r.hook('Stop', { session_id, prompt_id: 'new', phase: 'final' }); await r.sync()
+  expect(r.resume.state).toBe('waiting')
+})
+
+test('settled 59: a carrier can finish before the create is acknowledged', async () => {
+  const r = await mainRig()
+  r.mode.writeItem = write => r.client.recordItemWrite(write)
+  await r.hook('UserPromptSubmit')
+  await r.hook('StopFailure', { error: 'overloaded' })
+  const line = r.m.currentGen()!.resume_items[0].create.body.text
+  const did = r.enqueue(r.f.add('early-carrier'))
+  await until(() => r.offers.length === 1)
+  expect(r.offers[0].params.content).toContain(line)
+  await r.hook('UserPromptSubmit', { prompt_id: 'early', dids: [did] })
+  await r.hook('Stop', { prompt_id: 'early', phase: 'final' })
+  expect(r.f.rows.size).toBe(1)
+  await r.sync(); await r.m.pump(); await r.sync()
+  expect([...r.f.rows.values()].find(row => row.kind === 'resume')).toMatchObject({ state: 'cancelled', reason: 'withdrawn' })
 })
 
 test('C4 a lost POST response and a lost DELETE race keep the decision across retries', async () => {
