@@ -4,13 +4,25 @@ import type { ItemReport, Outcome } from '../onsen-receive.ts'
 const intermediate = new Set<Outcome>(['in_session', 'background', 'owed', 'stuck'])
 const failures = new Set<Outcome>(['cut', 'cut_person', 'not_taken', 'error', 'stuck'])
 type Row = InboxItem & { failures: number; released: boolean; expires_at: string | null; in_session_at: string | null
-  response_message_ids: string[]; answered: boolean | null }
+  response_message_ids: string[]; answered: boolean | null; waiter?: string; created_at?: string; completed_at?: string | null; cancelled_at?: string | null }
 const iso = (ms: number) => new Date(ms).toISOString()
+const memberName = /^[a-z0-9][a-z0-9_.-]{0,63}$/
+const refKinds = new Set('ticket schedule run incident alert op mail call message form telegram item'.split(' '))
+function validCreate(b: any): boolean {
+  const fields = ['kind', 'session_id', 'body', 'not_before', 'deadline', 'expires_at', 'waiter', 'refs']
+  return b && Object.keys(b).every(k => fields.includes(k)) && ['resume', 'self', 'keepwarm'].includes(b.kind)
+    && (b.session_id == null || typeof b.session_id === 'string')
+    && (b.waiter == null || typeof b.waiter === 'string' && memberName.test(b.waiter))
+    && (b.body == null || b.body.format === 'markdown' && typeof b.body.text === 'string')
+    && [b.not_before, b.deadline, b.expires_at].every(t => t == null || typeof t === 'string' && Number.isFinite(Date.parse(t)))
+    && Array.isArray(b.refs) && b.refs.every((r: any) => refKinds.has(r?.kind) && typeof r.value === 'string')
+}
 
 /** A disposable member inbox. Server time, ownership, versions and idempotency live on this side of HTTP. */
 export function fakeItems() {
   let now = Date.now(), seq = 0, claimSeq = 0, owner = '', seen = 0
   const rows = new Map<string, Row>(), writes = new Map<string, Response>(), terminal = new Map<string, string>()
+  const creates = new Map<string, { body: unknown; id: string }>()
   const givenByPull = new Set<Row>()
   let pullAcked = 0
   const calls: Array<{ path: string; query: URLSearchParams; body: any; key: string | null }> = []
@@ -76,6 +88,31 @@ export function fakeItems() {
       return Response.json({ acked: 1 })
     }
     const base = '/v1/members/adam/items'
+    if (req.method === 'POST' && /^\/v1\/members\/[^/]+\/items$/.test(path)) {
+      if (path !== base) return error(403, 'not_authorized')
+      if (mode !== 200) return error(mode, mode === 409 ? 'not_take_member' : 'not_found')
+      if (!key || !validCreate(b)) return error(400, 'invalid_request')
+      const old = creates.get(key)
+      if (old) return Bun.deepEquals(old.body, b) ? detail(rows.get(old.id)) : error(409, 'version_conflict')
+      const row = add(crypto.randomUUID(), b.kind, { from: 'adam', waiter: b.waiter ?? 'adam', session_id: b.session_id ?? null,
+        refs: b.refs, not_before: b.not_before ?? null, deadline: b.deadline ?? null, expires_at: b.expires_at ?? null,
+        payload: { text: b.body?.text ?? '' }, created_at: iso(now), completed_at: null, cancelled_at: null })
+      creates.set(key, { body: b, id: row.id })
+      return detail(row)
+    }
+    if (req.method === 'DELETE' && /^\/v1\/items\/[^/]+$/.test(path)) {
+      const row = rows.get(decodeURIComponent(path.slice('/v1/items/'.length)))
+      if (!row) return error(404, 'not_found')
+      if (row.from !== 'adam') return error(403, 'not_authorized')
+      const outcome = b.outcome ?? 'withdrawn'
+      if (!Number.isInteger(b.expected_version) || !['withdrawn', 'superseded', 'completed'].includes(outcome)
+        || outcome === 'completed' && row.kind !== 'self' || outcome === 'superseded' && row.kind !== 'resume') return error(400, 'invalid_request')
+      if (row.version !== b.expected_version || row.state !== 'waiting') return error(409, 'version_conflict')
+      if (outcome === 'completed') Object.assign(row, { state: 'completed', completed_at: iso(now), reason: null })
+      else Object.assign(row, { state: 'cancelled', cancelled_at: iso(now), reason: outcome })
+      change(row, outcome)
+      return detail(row)
+    }
     const connector = b.connector ?? q.get('connector')
     if (connector && path.startsWith(base) && mode !== 200) return error(mode, mode === 409 ? 'not_take_member' : mode === 400 ? 'invalid_request' : 'not_found')
     if (connector) {
