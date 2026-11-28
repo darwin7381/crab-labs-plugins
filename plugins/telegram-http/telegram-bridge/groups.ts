@@ -80,11 +80,12 @@ function membership(member: any): 'in' | 'left' | undefined {
 
 /** Only Telegram service updates change the chat itself. They use the same ordered writer as messages. */
 export function chatWrite(a: Agent, u: any): ChatWrite | undefined {
-  const m = u.message
-  if (isGroup(m?.chat) && m.migrate_to_chat_id != null)
-    return { kind: 'migration', path: `/bridge/chats/${m.chat.id}`, body: { moved_to: String(m.migrate_to_chat_id) } }
   const cm = u.my_chat_member
-  if (!isGroup(cm?.chat) || String(cm.new_chat_member?.user?.id) !== a.botId) return
+  const chat = (cm ?? u.message)?.chat
+  if (!isGroup(chat) || !a.access()?.groups?.[String(chat.id)]) return
+  if (!cm && u.message.migrate_to_chat_id != null)
+    return { kind: 'migration', path: `/bridge/chats/${chat.id}`, body: { moved_to: String(u.message.migrate_to_chat_id) } }
+  if (String(cm?.new_chat_member?.user?.id) !== a.botId) return
   const state = membership(cm.new_chat_member)
   if (!state || state === membership(cm.old_chat_member)) return
   return { kind: 'membership', path: `/bridge/chats/${cm.chat.id}/members/${encodeURIComponent(a.member)}`,

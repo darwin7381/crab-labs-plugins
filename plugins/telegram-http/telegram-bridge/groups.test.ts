@@ -145,6 +145,19 @@ test('membership transitions and migration are ordered PUTs; the new chat still 
   expect(tg.callsOf(a, 'setMessageReaction')).toEqual([])
 })
 
+test('membership and migration from an unlisted group make no Onsen request even when the destination is allowed', async () => {
+  const req = spyOn(bridge.onsen, 'req')
+  const chat = { type: 'group', id: -404 }
+  for (const [old, next] of [['left', 'member'], ['member', 'kicked']] as const) {
+    const { my_chat_member } = memberUpdate(old, next)
+    tg.push(a, { my_chat_member: { ...my_chat_member, chat } })
+  }
+  tg.push(a, { message: { chat, message_id: 3, migrate_to_chat_id: supergroup.id } })
+  await confirmed()
+  expect(req.mock.calls.filter(c => c[1].startsWith('/bridge/chats/'))).toHaveLength(0)
+  expect(onsen.chatWrites).toEqual([])
+})
+
 test('missing chat endpoints log once per kind across bots and the next message is still written', async () => {
   for (const [token, id] of [[a, 101], [b, 102]] as const) {
     for (let i = 0; i < 2; i++) onsen.answers.push({ path: /PUT .*\/bridge\/chats\//, status: 404, json: { detail: 'Not Found' } })
