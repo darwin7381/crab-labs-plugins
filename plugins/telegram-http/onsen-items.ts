@@ -2,10 +2,10 @@ import type { TakeMode } from './onsen-take.ts'
 
 export type InboxItem = {
   id: string; number: number; member: string; session_id: string | null; kind: string; from: string
-  state: string; reason: string | null; version: number; updated_at: string; not_before?: string | null
+  state: string; reason: string | null; note?: string | null; released?: boolean; version: number; updated_at: string; not_before?: string | null
   deadline?: string | null; half_done?: boolean; relay?: string | null; refs: Array<{ kind: string; value: string }>
   message_id?: string | null; action_id?: string | null; call_id?: string | null; mail_id?: string | null
-  events?: Array<{ kind: string; note: string }>; payload: Record<string, any>
+  events?: Array<{ kind: string; note: string | null; at?: string; claim_id?: string | null; session_id?: string | null; state?: string; reason?: string | null }>; payload: Record<string, any>
   claim?: { id: string; connector: string; taken_at: string; expires_at: string; session_id: string | null } | null
 }
 
@@ -15,20 +15,21 @@ export type ItemRef = {
   note?: string; reason?: string; half_done?: true; conversation?: string
 }
 export function itemRef(it: InboxItem): ItemRef {
-  const note = it.events?.findLast(e => e.kind === 'reassigned')?.note
   return { onsen_item_id: it.id, onsen_version: it.version, kind: it.kind, from: it.from,
-    ...(it.session_id === 'main' ? { main: true, note } : {}), ...(it.deadline ? { deadline: it.deadline } : {}),
+    ...(it.reason === 'reassigned' ? { main: true, note: it.note ?? undefined } : {}), ...(it.deadline ? { deadline: it.deadline } : {}),
     ...(it.reason ? { reason: it.reason } : {}), ...(it.half_done ? { half_done: true } : {}),
     ...(it.payload.conversation_id != null ? { conversation: String(it.payload.conversation_id) } : {}) }
 }
 
 export class ItemPeek {
   private generation = 0
-  private cursor?: string
+  private changedAfter?: string
   private page?: string
-  private pageTime?: string
+  private nextChangedAfter?: string
+  private routed = false
   private previous = new Map<string, number>()
-  private boundary = new Map<string, number>()
+  private seen = new Map<string, number>()
+  private failures = new Map<string, { at: number; delay: number }>()
   private wakeAt = Infinity
   private due?: ReturnType<typeof setTimeout>
   private timer?: ReturnType<typeof setTimeout>
@@ -36,14 +37,15 @@ export class ItemPeek {
   private request?: AbortController
 
   constructor(readonly mode: TakeMode, readonly index: () => Map<string, number>,
-    readonly route: (it: InboxItem, edit: boolean) => Promise<void>, readonly canRead: () => boolean) {}
+    readonly route: (it: InboxItem, change?: 'edited' | 'version') => Promise<void>, readonly canRead: () => boolean) {}
 
   reset(): void {
     this.generation++
     this.request?.abort()
-    this.cursor = this.page = this.pageTime = undefined
+    this.changedAfter = this.page = this.nextChangedAfter = undefined
+    this.routed = false
     this.previous.clear()
-    this.boundary.clear()
+    this.seen.clear()
     clearTimeout(this.timer)
     if (this.mode.active && !this.reading) this.schedule(0)
   }
@@ -61,12 +63,24 @@ export class ItemPeek {
   }
 
   dueAt(time: string): void {
-    const ms = Date.parse(time)
+    this.wake(Date.now() + (Date.parse(time) - this.mode.now()))
+  }
+
+  private wake(ms: number): void {
     if (!(ms > Date.now() && ms < this.wakeAt)) return
     clearTimeout(this.due)
     this.wakeAt = ms
     this.due = setTimeout(() => { this.wakeAt = Infinity; this.reset() }, ms - Date.now())
     this.due.unref()
+  }
+
+  private async routeWaiting(row: InboxItem, heldVersion?: number): Promise<void> {
+    if (heldVersion === undefined) return this.route(row)
+    const detail = await this.mode.req('GET', '/v1/items/' + encodeURIComponent(row.id))
+    if (detail?.status === 404) return
+    if (detail?.status !== 200) throw new Error('could not read item history for ' + row.id)
+    const current: InboxItem = detail.json.data
+    if (current.state === 'waiting') await this.route(current, current.events?.at(-1)?.kind === 'edited' ? 'edited' : 'version')
   }
 
   async poll(): Promise<void> {
@@ -77,7 +91,7 @@ export class ItemPeek {
     try {
       if (!this.canRead()) { delay = 250; return }
       const q = new URLSearchParams({ state: 'waiting', wait: '25', connector: this.mode.connector, limit: '100' })
-      if (this.cursor) q.set('changed_after', this.cursor)
+      if (this.changedAfter) q.set('changed_after', this.changedAfter)
       if (this.page) q.set('cursor', this.page)
       this.request = new AbortController()
       const r = await this.mode.req('GET', this.mode.path + '?' + q, undefined, 35_000, undefined, this.request.signal)
@@ -89,27 +103,44 @@ export class ItemPeek {
           return
         }
       }
-      if (r?.status !== 200 || !Array.isArray(r.json.items) || !r.json.as_of) { delay = 2000; return }
+      if (r?.status !== 200 || !Array.isArray(r.json.items) || typeof r.json.changed_after !== 'string' || !r.json.changed_after) { delay = 2000; return }
       const known = this.index()
-      const asOf = this.pageTime ?? r.json.as_of
+      // Later pages can miss rows committed since page one. Resume from page one's token.
+      this.nextChangedAfter ??= r.json.changed_after
       for (const it of r.json.items as InboxItem[]) {
         if (g !== this.generation || !this.canRead()) return
-        if (it.not_before && Date.parse(it.not_before) > Date.now()) { this.dueAt(it.not_before); continue }
+        if (it.not_before && Date.parse(it.not_before) > this.mode.now()) { this.dueAt(it.not_before); continue }
         const version = known.get(it.id)
         if (version === undefined || it.version > version) {
-          if (this.previous.get(it.id) !== it.version && this.boundary.get(it.id) !== it.version) await this.route(it, version !== undefined)
+          const failure = this.failures.get(it.id)
+          if (failure && failure.at > Date.now()) this.wake(failure.at)
+          else if ((failure || this.previous.get(it.id) !== it.version) && this.seen.get(it.id) !== it.version) {
+            try {
+              await this.routeWaiting(it, version)
+              this.failures.delete(it.id)
+              if (g !== this.generation) return
+              this.routed = true
+            } catch (error) {
+              const delay = Math.min(30_000, (failure?.delay ?? 500) * 2)
+              const at = Date.now() + delay
+              this.failures.set(it.id, { at, delay })
+              this.wake(at)
+              this.mode.log('onsen take: routing ' + it.id + ' failed: ' + error)
+            }
+          }
         }
         if (g !== this.generation) return
-        if (Date.parse(it.updated_at) >= Date.parse(asOf)) this.boundary.set(it.id, it.version)
+        this.seen.set(it.id, it.version)
       }
       // A dispatched control may lift a gate and reset the cursor while this page is being routed.
       if (g !== this.generation) return
-      this.pageTime = asOf
       this.page = r.json.next_cursor || undefined
       if (!this.page) {
-        this.cursor = asOf; this.pageTime = undefined
-        this.previous = this.boundary; this.boundary = new Map()
-        if (r.json.items.length) delay = 100
+        if (!this.changedAfter) for (const id of this.failures.keys()) if (!this.seen.has(id)) this.failures.delete(id)
+        this.changedAfter = this.nextChangedAfter; this.nextChangedAfter = undefined
+        this.previous = this.seen; this.seen = new Map()
+        if (r.json.items.length) delay = this.routed ? 100 : 1000
+        this.routed = false
       }
     } catch (err) { if (g === this.generation) this.mode.log('onsen take: peek failed: ' + err); delay = 2000 }
     finally {

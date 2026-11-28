@@ -224,7 +224,8 @@ describe('an edited message reaches the agent', () => {
     expect(editorName({ id: 42, first_name: 'Rosie', last_name: 'L' })).toBe('Rosie L')
     expect(editorName({ id: 43, username: 'ann' })).toBe('@ann')
     expect(editorName({ id: Number(JOEY_TG_ID) })).toBe('Joey')
-    expect(originalTime(0)).toBe('??:??Z')
+    expect(originalTime(0)).toBe('')
+    expect(editHeader(edited({ date: undefined }))).toBe('〔Joey 改了那一則（tg:2166）〕')
   })
 
   test('already seen: a new inbound (header + full new text, meta edited, ts = the edit), the event edit_delivered replaced_in_queue false', async () => {

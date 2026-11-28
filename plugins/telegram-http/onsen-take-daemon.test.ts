@@ -3,6 +3,10 @@ import { randomUUID } from 'crypto'
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
+import { Journal } from './lanes-state.ts'
+import { itemRef } from './onsen-items.ts'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
 import { startBotApiMock } from './test-fixtures/tg-bot-api-mock.ts'
 import { freePort, until } from './test-fixtures/tg-daemon.ts'
@@ -39,7 +43,7 @@ async function waitFor(ok: () => boolean | Promise<boolean>, ms = 5000) {
   while (!await ok() && Date.now() < end) await Bun.sleep(15)
   expect(await ok()).toBe(true)
 }
-async function daemon(env: Record<string, string> = {}, initialMode = 200, setup?: (root: string) => Record<string, string>) {
+async function daemon(env: Record<string, string> = {}, initialMode = 200, setup?: (root: string, f: ReturnType<typeof fakeItems>) => Record<string, string> | Promise<Record<string, string>>) {
   const f = fakeItems(), root = mkdtempSync(join(tmpdir(), 'take-daemon-')), state = join(root, 'tg'), lanes = join(root, '.lanes')
   clean.push(async () => { try { await f.stop() } finally { rmSync(root, { recursive: true, force: true }) } })
   f.mode(initialMode)
@@ -47,9 +51,9 @@ async function daemon(env: Record<string, string> = {}, initialMode = 200, setup
   writeFileSync(join(state, 'access.json'), JSON.stringify({ dmPolicy: 'allowlist', allowFrom: ['1'], groups: {}, pending: {}, ackReaction: '' }))
   copyFileSync(join(import.meta.dir, 'lanes-router.fleet.json'), join(lanes, 'router.json'))
   const port = await freePort()
-  const settings = setup?.(root)
+  const settings = await setup?.(root, f)
   const childEnv: Record<string, string | undefined> = {
-    PATH: process.env.PATH, TMPDIR: root, HOME: join(root, 'home'), TELEGRAM_HTTP_PORT: String(port), TELEGRAM_STATE_DIR: state,
+    PATH: process.env.PATH, GIT_ALLOW_PROTOCOL: 'file', TMPDIR: root, HOME: join(root, 'home'), TELEGRAM_HTTP_PORT: String(port), TELEGRAM_STATE_DIR: state,
     AGENT_WORKSPACE_DIR: root, GENESIS_LANES: '1', LANES_AGENT: 'adam', ONSEN_HOST: 'Mac-Mini', ONSEN_TAKE: '*',
     ONSEN_OBSERVATION: 'adam', ONSEN_BASE: f.base, ONSEN_REGISTRY_CLI: '0', JEV_SCREEN: '', CRAB_LABS_PLUGINS_ENV: join(root, 'no-config'),
     USAGE_WALL_READ: '0', HUB_SYNC: '0', TYPESAFE_KEY_FILE: join(root, 'no-key'), LANES_CLAUDE_BIN: join(import.meta.dir, 'test-fixtures/no-claude.sh'),
@@ -90,6 +94,114 @@ async function daemon(env: Record<string, string> = {}, initialMode = 200, setup
   return { f, root, lanes, state, proc, base, journal, log, restart }
 }
 
+async function activePerson(id: string) {
+  const sid = randomUUID(), pid = process.pid, turn = 'person-prompt'
+  let registryFile = '', transcript = '', entry: Record<string, unknown> = {}
+  const d = await daemon({ MCP_READY_DELAY_MS: '50' }, 200, root => {
+    const sessions = join(root, 'home/.claude/sessions')
+    const projects = join(root, 'home/.claude/projects', root.replace(/[^a-zA-Z0-9]/g, '-'))
+    mkdirSync(sessions, { recursive: true }); mkdirSync(projects, { recursive: true })
+    writeFileSync(join(root, '.lanes/main-expected'), sid)
+    transcript = join(projects, sid + '.jsonl')
+    writeFileSync(transcript, '')
+    registryFile = join(sessions, pid + '.json')
+    entry = { pid, sessionId: sid, cwd: root, kind: 'interactive', entrypoint: 'cli', status: 'idle', statusUpdatedAt: Date.now() }
+    writeFileSync(registryFile, JSON.stringify(entry))
+    return {}
+  })
+  const headers = { Authorization: 'Bearer test-loopback', 'Content-Type': 'application/json' }
+  const hook = async (event: string, more = {}) => {
+    const resp = await fetch(d.base + '/lanes/main-event', { method: 'POST', headers,
+      body: JSON.stringify({ event, pid, session_id: sid, prompt_id: turn, transcript_path: transcript, ...more }) })
+    expect(resp.status).toBe(200)
+    return resp.json()
+  }
+  expect((await hook('SessionStart', { source: 'startup' })).accepted).toBe(true)
+  const offers: any[] = []
+  const client = new Client({ name: 'main-test', version: '1' }, { capabilities: {} })
+  client.fallbackNotificationHandler = async n => { if (n.method === 'notifications/claude/channel') offers.push(n.params) }
+  await client.connect(new StreamableHTTPClientTransport(new URL(d.base + '/mcp'), { requestInit: { headers } }))
+  clean.push(() => client.close())
+  const row = d.f.add(id)
+  expect(await until(() => offers.some(n => n.content.includes(row.id)), 6000), d.log().slice(-2500)).toBe(true)
+  expect(row.state).toBe('claimed')
+  const offer = offers.find(n => n.content.includes(row.id))
+  await hook('UserPromptSubmit', { dids: [offer.meta.did] })
+  await waitFor(() => row.claim?.session_id === 'main')
+  const stop = async () => {
+    await hook('Stop', { phase: 'final' })
+    await Bun.sleep(3100)
+    writeFileSync(registryFile, JSON.stringify({ ...entry, statusUpdatedAt: Date.now() }))
+  }
+  return { d, row, client, offers, hook, stop }
+}
+
+test('real daemon completes an idle main person item with its reply after the final Stop', async () => {
+  const { d, row, client, offers, stop } = await activePerson('main-happy')
+  const reply = await client.callTool({ name: 'reply', arguments: { chat_id: '1', text: 'received and done' } })
+  expect(reply.isError, JSON.stringify(reply.content)).toBeFalsy()
+  const replyId = /onsen:(\d+)/.exec(JSON.stringify(reply.content))?.[1]
+  expect(replyId, JSON.stringify(reply.content)).toBeTruthy()
+  expect(row.state).toBe('claimed')
+  await stop()
+  expect(await until(() => row.state === 'completed', 8000), d.log().slice(-2500)).toBe(true)
+  expect(d.f.history.filter(h => h.item_id === row.id).map(h => h.body.outcome)).toEqual(['in_session', 'completed'])
+  expect(row.response_message_ids).toEqual([replyId])
+  expect(offers.filter(n => n.content.includes(row.id))).toHaveLength(1)
+}, 25000)
+
+test('a mid-turn arrival and the original message each complete with only their own quote-reply', async () => {
+  const { d, row: first, client, hook, stop } = await activePerson('original-message')
+  const second = d.f.add('mid-turn-message', 'message', { message_id: '24', payload: { message_id: '24', conversation_id: 'conv', kind: 'text',
+    from: 'joey', via: 'web', text: 'mid-turn-message', client: { chat: '1', msg_id: 'form-24', user_id: '1', user: 'Joey' } } })
+  await waitFor(() => d.journal().some(r => r.rec === 'msg' && r.onsen_items?.some((i: any) => i.onsen_item_id === second.id)))
+  await hook('PostToolUse', { tool_name: 'Bash' })
+  await waitFor(() => second.claim?.session_id === 'main')
+  const responseIds: string[] = []
+  for (const row of [first, second]) {
+    const reply = await client.callTool({ name: 'reply', arguments: { chat_id: '1', reply_to: row.payload.client.msg_id, text: 'answer to ' + row.id } })
+    expect(reply.isError, JSON.stringify(reply.content)).toBeFalsy()
+    const id = /onsen:(\d+)/.exec(JSON.stringify(reply.content))?.[1]
+    expect(id).toBeTruthy()
+    responseIds.push(id!)
+  }
+  const writes = d.f.calls.filter(c => c.path === '/v1/messages' && String(c.body.body).startsWith('answer to '))
+  expect(writes.map(w => w.body.reply_to_message_id)).toEqual([first.message_id, second.message_id])
+  expect(new Set(writes.map(w => w.body.turn_id)).size).toBe(1)
+  expect(responseIds[0]).not.toBe(responseIds[1])
+  await stop()
+  await waitFor(() => [first, second].every(row => row.state === 'completed'), 8000)
+  expect([first.response_message_ids, second.response_message_ids]).toEqual(responseIds.map(id => [id]))
+}, 25000)
+
+test('after 45 s without renewal the main completes its original claim with one delivery and no re-take', async () => {
+  const { d, row, offers, stop } = await activePerson('lease-expiry')
+  await waitFor(() => d.f.calls.some(c => c.path.endsWith('/observation') && c.body.held_item_ids?.includes(row.id)))
+  const originalClaimId = row.claim!.id
+  const itemPath = '/v1/items/' + row.id
+  const lastRenewal = d.f.calls.length
+  // Server time advances with no observation in the interval.
+  const untilExpiry = Date.parse(row.claim!.expires_at) - d.f.now()
+  d.f.advance(untilExpiry - 1)
+  expect(row.state).toBe('claimed')
+  d.f.advance(1)
+  expect(row).toMatchObject({ state: 'waiting', reason: 'cut', claim: null })
+  expect(row.events!.at(-1)?.kind).toBe('lease_expired')
+  expect(d.f.calls.slice(lastRenewal).some(c => c.path.endsWith('/observation'))).toBe(false)
+  await waitFor(() => d.f.calls.slice(lastRenewal).some(c => c.path === itemPath))
+  await stop()
+  await waitFor(() => d.f.calls.slice(lastRenewal).some(c =>
+    c.path.endsWith('/observation') && Array.isArray(c.body.held_item_ids) && !c.body.held_item_ids.includes(row.id)), 18_000)
+
+  const afterExpiry = d.f.calls.slice(lastRenewal)
+  expect(offers.filter(n => n.content.includes(row.id))).toHaveLength(1)
+  expect(afterExpiry.filter(c => c.path.endsWith('/take') && c.body.item_ids.includes(row.id))).toHaveLength(0)
+  const reports = afterExpiry.filter(c => c.path === itemPath + '/report').map(c => c.body)
+  expect(reports).toEqual([expect.objectContaining({ outcome: 'completed', claim_id: originalClaimId })])
+  expect(d.f.history.filter(h => h.item_id === row.id).map(h => h.body.outcome)).toEqual(['in_session', 'completed'])
+  expect(row.state).toBe('completed')
+}, 35_000)
+
 for (const [name, cfg, reason] of [
   ['unset', { ONSEN_TAKE: '' }, ''], ['observation off', { ONSEN_OBSERVATION: '' }, 'ONSEN_OBSERVATION'],
   ['lanes off', { GENESIS_LANES: '0' }, 'LANES_ON'], ['recording off', { ONSEN_RECORD: '0' }, 'recording'],
@@ -103,12 +215,46 @@ for (const [name, cfg, reason] of [
   if (reason) expect(log[0]).toContain(reason)
 })
 
+test('a pulled person_edit without a date uses the retained original arrival', async () => {
+  const d = await daemon({ ONSEN_TAKE: '', GENESIS_LANES: '0', MCP_READY_DELAY_MS: '50' }, 409)
+  const headers = { Authorization: 'Bearer test-loopback', 'Content-Type': 'application/json' }
+  const remote = new Client({ name: 'pull-edit-test', version: '1' }, { capabilities: {} })
+  const delivered: any[] = []
+  remote.fallbackNotificationHandler = async n => { if (n.method === 'notifications/claude/channel') delivered.push(n.params) }
+  await remote.connect(new StreamableHTTPClientTransport(new URL(d.base + '/mcp'), { requestInit: { headers } }))
+  clean.push(() => remote.close())
+  const from = { name: 'telegram', chat: '1', msg_id: '4400', user_id: '1', user: 'joey' }
+  const post = async (kind: string, payload: unknown) => {
+    const res = await fetch(d.base + '/onsen/person', { method: 'POST', headers, body: JSON.stringify({ kind, payload }) })
+    expect(res.status).toBe(200)
+  }
+  await post('person_message', { message_id: 'message-id', conversation_id: 'conv', client: from, from: 'joey', via: 'telegram',
+    kind: 'text', text: 'original text', sent_at: '2020-01-12T03:17:00Z' })
+  await waitFor(() => delivered.some(n => n.content === 'original text'))
+  await post('person_edit', { message_id: 'message-id', client: from, text: 'edited text', edited_at: '2020-01-14T08:23:00Z' })
+  await waitFor(() => delivered.some(n => n.meta.edited === 'true'))
+  expect(delivered.find(n => n.meta.edited === 'true').content).toBe('〔@joey 改了他 01-12 03:17Z 那一則（tg:4400）〕\nedited text')
+}, 15_000)
+
+test('the inbox daemon follows take_member and serves the take relays with its local switch unset', async () => {
+  const d = await daemon({ CHANNEL_INBOX_ONLY: '1', AGENT_INBOX_SELF: 'adam', ONSEN_PULL: 'adam', ONSEN_TAKE: '' })
+  await waitFor(() => d.log().includes('member is on take'))
+  for (const endpoint of ['inbound-log', 'scheduler-taken']) {
+    const reply = await fetch(d.base + '/lanes/' + endpoint, { method: 'POST', headers: { Authorization: 'Bearer test-loopback' }, body: '{}' })
+    expect(reply.status).toBe(200)
+  }
+  expect(d.f.calls.some(c => c.path.endsWith('/items'))).toBe(false)
+  expect(d.f.calls.filter(c => c.path === '/inbox')).toHaveLength(1)
+  const health = await fetch(d.base + '/healthz').then(r => r.json())
+  expect(health.onsen_pull).toMatchObject({ on: true, errors: 0, backoff_s: 0, last_error: null })
+})
+
 test('daemon probes only once on an old server and keeps observation on the legacy shape', async () => {
   const d = await daemon({}, 400)
   await waitFor(() => d.f.calls.some(c => c.path.endsWith('/observation')))
   expect(d.f.calls.filter(c => c.path.endsWith('/items'))).toHaveLength(1)
   expect(d.f.calls.find(c => c.path.endsWith('/observation'))!.body.connector).toBeUndefined()
-  expect(d.log().split('\n').filter(l => l.includes('mode probe did not return 200'))).toHaveLength(1)
+  expect(d.log().split('\n').filter(l => l.includes('mode probe: HTTP 400'))).toHaveLength(1)
 })
 
 test('real daemon routes one unclaimed notification per album at count or 1.5 s and replaces a newer waiting edit', async () => {
@@ -120,11 +266,17 @@ test('real daemon routes one unclaimed notification per album at count or 1.5 s 
     return row
   }
   const records = (group: string) => d.journal().filter(l => l.rec === 'msg' && l.notif?.params?.meta?.media_group_id === group)
-  add('a', 'album', 3); add('b', 'album', 3)
+  const a = add('a', 'album', 3); add('b', 'album', 3)
   await Bun.sleep(120); expect(records('album')).toHaveLength(0)
   add('c', 'album', 3)
   await waitFor(() => records('album').length > 0)
   expect(records('album')).toHaveLength(1); expect(records('album')[0].onsen_items.map((r: any) => r.onsen_item_id)).toEqual(['a', 'b', 'c'])
+  const original = records('album')[0].notif
+  a.reason = 'not_taken'; d.f.change(a, 'not_taken')
+  await waitFor(() => d.journal().some(l => l.onsen_items?.some((i: any) => i.onsen_item_id === a.id && i.onsen_version === a.version)))
+  expect(records('album')).toHaveLength(1)
+  expect(records('album')[0].notif).toEqual(original)
+  expect(d.journal().some(l => l.edited_in_queue)).toBe(false)
   add('x', 'window'); await Bun.sleep(300); add('y', 'window')
   await Bun.sleep(1050); expect(records('window')).toHaveLength(0)
   await waitFor(() => records('window').length > 0)
@@ -135,6 +287,67 @@ test('real daemon routes one unclaimed notification per album at count or 1.5 s 
   await waitFor(() => d.journal().some(l => l.edited_in_queue && l.notif.params.content === 'new content'))
   expect(d.f.calls.filter(c => c.path.endsWith('/take'))).toHaveLength(0)
 }, 10000)
+
+test('a deferred mail hand-back is reattached as a batched unclaimed M1 item', async () => {
+  const d = await daemon({}, 200, (root, f) => {
+    const row = f.add('mail-deferred', 'mail', { reason: 'reassigned', note: 'Decision for main', from: 'eve' })
+    const journal = new Journal(join(root, 'tg', 'lanes', 'state.jsonl'))
+    journal.write('event', 'original', 'open', { onsen_items: [itemRef(row)],
+      obligations: [{ id: 'ho-mail', kind: 'main', state: 'open', handoff: 'ho-mail', defer: true }] })
+    return {}
+  })
+  await waitFor(() => d.journal().some(r => r.rec === 'msg' && r.event === 'original'))
+  const local = d.journal().find(r => r.rec === 'msg' && r.event === 'original')
+  expect(local.reason).toBe('batched')
+  expect(local.notif.params.content).toContain('Decision for main')
+  expect(d.f.rows.get('mail-deferred')?.state).toBe('waiting')
+})
+
+test('stopped and over-budget threads and a missing lane hand their queued items back', async () => {
+  const ids = ['stopped', 'budget', 'gone', 'owned-gone']
+  const d = await daemon({}, 200, async (root, f) => {
+    const journal = new Journal(join(root, 'tg', 'lanes', 'state.jsonl'))
+    const lanes: Record<string, any> = {}, threads: Record<string, any> = {}
+    for (const id of ids) {
+      const row = f.add(id, 'call', { from: 'eve' }), lane = 'adam.worker.' + row.number
+      if (id === 'owned-gone') {
+        const taken = await fetch(f.base + '/v1/members/adam/items/take', { method: 'POST',
+          headers: { Authorization: 'Bearer test-member', 'Idempotency-Key': id },
+          body: JSON.stringify({ connector: 'mac-mini/adam', item_ids: [id], wait: 0, limit: 1 }) })
+        expect(taken.status).toBe(200)
+        const dir = join(root, 'tg', 'onsen')
+        mkdirSync(dir, { recursive: true })
+        writeFileSync(join(dir, 'claims.json'), JSON.stringify({ claims: { [id]: { claim_id: row.claim!.id, taken_at: row.claim!.taken_at } } }))
+      }
+      if (!id.endsWith('gone')) {
+        lanes[lane] = { id: lane, kind: 'worker', status: 'idle', thread: id, session_id: randomUUID(), runs: 0 }
+        threads[id] = { id, lane, fresh: id === 'budget' ? 1000 : 0, stopped: id === 'stopped' ? 'closed' : null }
+      }
+      journal.write('run', 'run-' + id, 'queued', { lane, event: id, attempt: 1, ev: { id, source: 'mesh', from: 'eve', text: id,
+        onsen_items: [itemRef(row)], notif: { method: 'notifications/claude/channel', params: {} } } })
+    }
+    writeFileSync(join(root, '.lanes', 'state.json'), JSON.stringify({ lanes, threads }))
+    return { LANES_THREAD_BUDGET: '500' }
+  })
+  for (const id of ids) {
+    await waitFor(() => d.f.history.some(h => h.item_id === id && h.body.outcome === 'reassigned'), 12000)
+    expect(d.f.rows.get(id)?.note).toBeTruthy()
+    expect(d.f.calls.filter(c => c.path.endsWith('/take') && c.body.item_ids.includes(id))).toHaveLength(1)
+  }
+}, 18000)
+
+test('a person item with no chat or a disallowed chat completes with no reply', async () => {
+  const d = await daemon()
+  const noChat = d.f.add('no-chat', 'message', { payload: {} })
+  const denied = d.f.add('denied')
+  denied.payload.client.chat = '12345'
+  for (const row of [noChat, denied]) {
+    await waitFor(() => row.state === 'completed')
+    expect(d.f.history.filter(h => h.item_id === row.id).map(h => h.body.response_message_ids)).toEqual([[]])
+  }
+  expect(d.log()).toContain('no Telegram chat')
+  expect(d.log()).toContain('not allowlisted')
+})
 
 test('daemon handles a control at dispatch and immediately completes a re-served done id', async () => {
   const d = await daemon({ C1_COMMAND_FAILURE: '1' })
@@ -175,6 +388,8 @@ function scriptedLane(root: string) {
   return { LANES_CLAUDE_BIN: bin }
 }
 
+import capturedPage from './test-fixtures/onsen-0.40.0/list-completed.json'
+const capturedPerson = capturedPage.items.find(it => it.kind === 'message')!
 const worker = 'adam.worker.1'
 async function laneHook(root: string, n: number, event: string) {
   const file = join(root, 'hook-' + n)
@@ -192,12 +407,14 @@ async function runningWorker() {
     }))
     return scriptedLane(root)
   })
-  const person = (id: string, tg: string) => d.f.add(id, 'message', { message_id: id, payload: {
+  const person = (id: string, tg: string, source = {}) => d.f.add(id, 'message', { ...source, message_id: id, payload: {
     message_id: id, from: 'joey', conversation_id: 'conv', kind: 'text', thread: 555, text: id,
     client: { name: 'telegram', chat: '1', msg_id: tg, user_id: '1', user: 'Joey', thread: '555' },
   } })
-  person('start-worker', '550')
-  await waitFor(() => d.f.history.some(h => h.item_id === 'start-worker' && h.body.session_id === worker))
+  const first = person(capturedPerson.id, '550', { ...capturedPerson, state: 'waiting' })
+  await waitFor(() => d.f.history.some(h => h.item_id === first.id && h.body.session_id === worker))
+  expect(first.session_id).toBe('main')
+  expect(d.f.calls.filter(c => c.path === '/v1/items/' + first.id)).toHaveLength(0)
   const row = person('message-during-run', '551')
   const input = join(d.lanes, 'run', 'steer', worker + '.in.jsonl')
   await waitFor(() => existsSync(input) && readFileSync(input, 'utf8').includes(row.id))
@@ -324,7 +541,7 @@ test('two peek pages of steering reach one boundary in takes of at most 100 IDs'
   const text = JSON.parse(await hook(1, 'PostToolUse')).hookSpecificOutput.additionalContext
   expect(text).toContain('「burst-99」')
   expect(text).toContain('「' + row.id + '」')
-  const takes = d.f.calls.filter(c => c.path.endsWith('/take') && !c.body.item_ids.includes('start-worker'))
+  const takes = d.f.calls.filter(c => c.path.endsWith('/take') && !c.body.item_ids.includes(capturedPerson.id))
   expect(takes.map(c => c.body.item_ids.length).sort((a, b) => b - a)).toEqual([100, 1])
   expect(new Set(takes.flatMap(c => c.body.item_ids))).toEqual(new Set(messages.map(r => r.id)))
   writeFileSync(join(d.root, 'release-lane'), '')
@@ -397,6 +614,7 @@ test('a busy lane slot leaves the next alert waiting; its run receives the claim
   await waitFor(() => records().some(r => r.rec === 'msg' && r.onsen_items?.some((i: any) => i.onsen_item_id === two.id)))
   const main = records().find(r => r.rec === 'msg' && r.onsen_items?.some((i: any) => i.onsen_item_id === two.id))
   expect(main.notif.params.content).toContain(hand!.body.note)
+  expect(d.f.calls.filter(c => c.path === '/v1/items/' + two.id)).toHaveLength(0)
   expect(records().some(r => r.rec === 'msg' && (r.kind === 'handoff' || r.kind === 'carry'))).toBe(false)
 }, 18000)
 
@@ -533,8 +751,9 @@ for (const code of [404, 409, 0]) test('daemon stays on pull after probe ' + (co
   const cfg: Record<string, string> = {}
   if (!code) cfg.ONSEN_BASE = 'http://127.0.0.1:' + await freePort()
   const d = await daemon(cfg, code || 200)
-  await waitFor(() => d.log().includes('mode probe did not return 200'))
-  expect(d.log().split('\n').filter(s => s.includes('mode probe did not return 200'))).toHaveLength(1)
+  const refusal = 'mode probe: ' + (code ? 'HTTP ' + code : 'no response')
+  await waitFor(() => d.log().includes(refusal))
+  expect(d.log().split('\n').filter(s => s.includes(refusal))).toHaveLength(1)
   expect(d.f.calls.filter(c => c.query.has('wait') || c.path.endsWith('/take'))).toHaveLength(0)
   expect(d.f.calls.filter(c => c.path.endsWith('/items'))).toHaveLength(code ? 1 : 0)
 })

@@ -1364,7 +1364,9 @@ export class Registry implements StatusSource {
         try { const meta = JSON.parse(readFileSync(join(sub, name.replace(/\.jsonl$/, '.meta.json')), 'utf8')); if (meta?.requestShape && meta.requestShape !== 'background') continue } catch {}
         n++
       }
-    } catch { return null }
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === 'ENOENT' && existsSync(dir) ? 0 : null
+    }
     return n
   }
   lastActivity(sid: string | null): string | null {

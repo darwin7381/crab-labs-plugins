@@ -1,0 +1,12 @@
+--- a/C1-spec.md
++++ b/C1-spec.md
+@@ -189,3 +189,3 @@
+ | 5.1 | mode probe (settled 32) | `GET /v1/members/<m>/items?limit=1&connector=<c>`. 200 means take. Anything else means pull: 409 `{error:{code:"not_take_member"}}`, 404, 400 (an Onsen that doesn't know `connector`), or a network error. No new endpoint, no new field |
+-| 5.2 | peek (C:365, settled 33) | `GET /v1/members/<m>/items?state=waiting&wait=<≤55>&connector=<c>&limit=<≤100>[&changed_after=<T>]` → `Page<Item>`; never claims. **With** `changed_after`: only rows with `updated_at >= T`; if none, it waits until one appears or `wait` ends (empty page). **Without** it (at start, when a gate lifts): it returns at once if any row matches. Next call: `changed_after` = the previous response's `as_of` (server time, never local). Because of `>=`, the same `id` + `version` can come again: skip it. A `not_before` coming due is not a change: schedule it yourself from the row's `not_before` |
++| 5.2 | peek (C:365, settled 42) | `GET /v1/members/<m>/items?state=waiting&wait=<≤55>&connector=<c>&limit=<≤100>[&changed_after=<T>]` → `Page<Item>`; never claims. **With** `changed_after`: only rows with `updated_at >= T`; if none, it waits until one appears or `wait` ends (empty page). **Without** it (at start, when a gate lifts): it returns at once if any row matches. Every page for a request carrying `connector` includes a top-level `changed_after: T`. Onsen sets T far enough back to cover its longest permitted write transaction. Keep the filter fixed through pagination, then send the first page's T verbatim as `changed_after` on the next peek. A row can commit after `as_of` with an earlier `updated_at`. Because of `>=`, the same `id` + `version` can come again: skip it. A `not_before` coming due is not a change: schedule it yourself from the row's `not_before` |
+ | 5.3 | take (C:362) | `POST /v1/members/<m>/items/take` `{connector, item_ids, wait:0, limit}` → `D<{claim_id, items, waiting, next_not_before}>`. Given rows become `claimed`, `claim.session_id:null`. Same key gives the same result. 409 `not_current_connector` carries `current` |
+@@ -253,3 +253,3 @@
+ 1. **Mode probe:** §5.1 (32).
+-2. **`?wait=` return:** `changed_after` (33), see §5.2.
++2. **`?wait=` return:** `changed_after` (42), see §5.2.
+ 3. **Content:** `payload` (34).

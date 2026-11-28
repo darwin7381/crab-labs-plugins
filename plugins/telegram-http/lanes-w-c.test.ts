@@ -85,7 +85,7 @@ test('002w C, gap 15, path the main\'s send past the hop limit (/lanes/outbound-
 test('002w C, gap 15, path a lane\'s reply_agent past the hop limit: through stopThread: the record\'s stop, the notice, the hand-over now (2a936a7: the thread was marked stopped, nobody told, the event handed over only when the run ended)', async () => {
   const a = await atLimit('可以把 timeout 改成 5 秒嗎？')
   const k = meshOut.length
-  const out = await L.callLaneTool(L.__runTok(a.lane)!, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '可以，已改。' })
+  const out = await L.callLaneTool(L.__runTok(a.lane)!, 'reply_agent', { line: 'call', because: 'Eve 在等設定', to: 'cain', text: '請確認 timeout 能不能改成 5 秒。' })
   expect(out).toContain('blocked')
   expect(st.threads[a.th].stopped).toBeTruthy()
   expect(E().get(a.ev.id)!.stop).toMatchObject({ why: 'hop' })

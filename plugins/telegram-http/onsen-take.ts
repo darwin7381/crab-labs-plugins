@@ -14,9 +14,9 @@ export function takeRefusal(o: { inbox: boolean; roamer: boolean; lanes: boolean
 }
 
 /** The connector parameter distinguishes this probe from a normal member inbox read. */
-export async function deliveryMode(req: ActionReq, path: string, connector: string): Promise<'take' | 'pull'> {
+export async function deliveryMode(req: ActionReq, path: string, connector: string) {
   const r = await req('GET', path + '?' + new URLSearchParams({ limit: '1', connector }), undefined, 5000).catch(() => null)
-  return r?.status === 200 ? 'take' : 'pull'
+  return { take: r?.status === 200, status: r?.status, asOf: Date.parse(r?.json?.as_of) }
 }
 
 export type ItemRequest = (...args: [...Parameters<ActionReq>, signal?: AbortSignal]) => ReturnType<ActionReq>
@@ -30,6 +30,8 @@ export class TakeMode {
   private stopped = false
   private timer?: ReturnType<typeof setTimeout>
   private reason = ''
+  private offset = 0
+  readonly now = () => Date.now() + this.offset
 
   constructor(readonly member: string, readonly req: ItemRequest, readonly changed: (active: boolean) => void,
     readonly log: (line: string) => void, machine = machineName(),
@@ -42,11 +44,12 @@ export class TakeMode {
     const mode = await deliveryMode(this.req, this.path, this.connector)
     if (this.stopped) return
     this.checking = false
-    if (mode === 'pull') {
+    if (!mode.take) {
       if (this.reason === 'not_current_connector') this.pause(this.reason, 45_000)
-      else this.pause('mode probe did not return 200', 60_000)
+      else this.pause('mode probe: ' + (mode.status ? 'HTTP ' + mode.status : 'no response'), 60_000)
       return
     }
+    if (Number.isFinite(mode.asOf)) this.offset = mode.asOf - Date.now()
     this.reason = ''
     this.active = this.observationRequired = true
     this.log('onsen take: started ' + this.connector)

@@ -56,7 +56,7 @@ function fake(o: { report?: 'sent' | 'failed' | 'never'; afterMs?: number; statu
 test('say: conversation_id from the chat (asked once, cached), reply_to as Onsen\'s id, no client / chat / delivery; the bridge\'s numbers back, in order', async () => {
   const f = fake({ afterMs: 100 })
   const r = await f.say.say({ chat: '1828', sender: 'main', text: '收到', replyTo: '950', silent: true, turn_id: 't1' })
-  expect(r).toEqual({ onsenId: '5001', conversationId: '77', ids: ['960', '961'], held: false })
+  expect(r).toEqual({ onsenId: '5001', conversationId: '77', replyToMessageId: '4001', ids: ['960', '961'], held: false })
   const w = f.calls.find(c => c.p === '/v1/messages')!.b
   expect(w.conversation_id).toBe('77')
   expect(w.reply_to_message_id).toBe('4001')
@@ -87,7 +87,7 @@ test('say: a 5xx is tried again (1 s, 3 s; here shortened), a 4xx fails at once;
   await expect(fake({ status: [400] }).say.say({ chat: '1828', sender: 'main', text: 'x' })).rejects.toThrow(/HTTP 400: nope/)
   await expect(fake().say.say({ chat: '555', sender: 'main', text: 'x' })).rejects.toThrow(/no conversation for chat 555/)
   const u = fake()
-  await u.say.say({ chat: '1828', sender: 'main', text: 'x', replyTo: '12345' })
+  expect((await u.say.say({ chat: '1828', sender: 'main', text: 'x', replyTo: '12345' })).replyToMessageId).toBeUndefined()
   expect('reply_to_message_id' in u.calls.find(c => c.p === '/v1/messages')!.b).toBe(false)
 })
 

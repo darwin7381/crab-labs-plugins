@@ -142,7 +142,7 @@ export class OnsenIds {
   get size(): { conversations: number; messages: number } { return { conversations: this.conv.size, messages: this.msg.size } }
 }
 
-export type Said = { onsenId: string; conversationId: string; ids: string[]; held: boolean; why?: string }
+export type Said = { onsenId: string; conversationId: string; replyToMessageId?: string; ids: string[]; held: boolean; why?: string }
 export type SayAsk = { chat: string; sender: string; text: string; kind?: string; turn_id?: string | null; replyTo?: string | null; thread?: string | null
   silent?: boolean; fileIds?: string[]; attachments?: Array<{ name: string; mime?: string; size?: number }> }
 /** WO-197 segment 2: a chat that names a person rather than a conversation (`member:<name>`): written with `to` (their direct conversation with this
@@ -193,8 +193,11 @@ export class ConnectorSay {
     const id = String(d.message_id ?? d.id), conv = String(d.conversation_id ?? cid)
     if (to && conv) this.o.ids.know(a.chat, conv)                        // the owner's conversation, for what follows
     if (d.duplicate) this.stats.duplicates++; else this.stats.written++
-    if (d.delivery === 'sent') { this.stats.direct++; return { onsenId: id, conversationId: conv, ids: [], held: false } }   // nothing draws it
-    return this.waitReport(id, conv)
+    let said: Said
+    if (d.delivery === 'sent') { this.stats.direct++; said = { onsenId: id, conversationId: conv, ids: [], held: false } }
+    else said = await this.waitReport(id, conv)
+    if (reply != null) said.replyToMessageId = reply
+    return said
   }
 
   /** the bridge's report: GET /messages/<id> until delivery leaves pending (WAIT_MS at most) */

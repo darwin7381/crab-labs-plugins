@@ -441,22 +441,28 @@ export class OnsenClient {
   private observers: Array<(line: SpoolLine) => void> = []
   /** WO-175: what became of the Call lines sent lately (idem → fate), and who waits for one not sent yet */
   private itemReports = 0
+  private reportedThrough: number
   private itemAck?: (line: ItemReport, ok: boolean) => void
 
   watchItemReports(replay: (line: ItemReport) => void, ack: (line: ItemReport, ok: boolean) => void): void {
     this.itemAck = ack
     this.itemReports = 0
-    let offset = this.readCursor()
+    for (const { line } of this.pendingReports()) { this.itemReports++; replay(line.r) }
+  }
+
+  private *pendingReports() {
+    let offset = Math.max(this.readCursor(), this.reportedThrough)
     for (;;) {
       const lines = this.unsent(offset)
-      if (!lines.length) break
-      for (const { line } of lines) if (line?.k === 'ir') { this.itemReports++; replay(line.r) }
+      if (!lines.length) return
+      for (const entry of lines) if (entry.line?.k === 'ir') yield { ...entry, line: entry.line }
       offset = lines[lines.length - 1]!.end
     }
   }
   hasItemReports(): boolean { return this.itemReports > 0 }
   recordItemReport(line: ItemReport): boolean {
     if (!this.append({ k: 'ir', r: line })) return false
+    if (!this.itemReports) this.nextTryAt = 0 // let the first report past a non-report's backoff
     this.itemReports++
     return true
   }
@@ -479,6 +485,7 @@ export class OnsenClient {
     this.spool = join(cfg.dir, 'spool.jsonl')
     this.spoolOld = join(cfg.dir, 'spool.1.jsonl')
     this.cursorFile = join(cfg.dir, 'cursor.json')
+    this.reportedThrough = this.readCursor('reportedThrough')
     this.rejected = join(cfg.dir, 'rejected.jsonl')
     this.linesFile = join(cfg.dir, 'lines.json')
   }
@@ -765,13 +772,14 @@ export class OnsenClient {
   pendingBytes(): number {
     try { return Math.max(0, statSync(this.spool).size - this.readCursor()) } catch { return 0 }
   }
-  private readCursor(): number {
-    try { const n = Number(JSON.parse(readFileSync(this.cursorFile, 'utf8')).offset); return Number.isFinite(n) && n >= 0 ? n : 0 } catch { return 0 }
+  private readCursor(key = 'offset'): number {
+    try { const n = Number(JSON.parse(readFileSync(this.cursorFile, 'utf8'))[key]); return Number.isFinite(n) && n >= 0 ? n : 0 } catch { return 0 }
   }
-  private writeCursor(offset: number): void {
+  private writeCursor(offset: number, reportEnd = this.reportedThrough): void {
     const tmp = `${this.cursorFile}.${process.pid}.tmp`
-    writeFileSync(tmp, JSON.stringify({ offset, at: new Date().toISOString() }), { mode: 0o600 })
+    writeFileSync(tmp, JSON.stringify({ offset, ...(reportEnd > offset ? { reportedThrough: reportEnd } : {}), at: new Date().toISOString() }), { mode: 0o600 })
     renameSync(tmp, this.cursorFile)
+    this.reportedThrough = reportEnd > offset ? reportEnd : 0
   }
   private fail(why: string): void {
     this.backoffMs = Math.min(Math.max(1000, this.backoffMs * 2), this.cfg.maxBackoffMs ?? 60_000)
@@ -886,7 +894,8 @@ export class OnsenClient {
   }
 
   private async pass(): Promise<void> {
-    const todo = this.unsent()
+    const fifo = this.unsent()
+    const todo = this.itemReports ? [...this.pendingReports(), ...fifo] : fifo
     if (!todo.length) { this.rotateIfDrained(); return }
     const cred = this.cfg.credential()
     if (!cred) {
@@ -959,6 +968,8 @@ export class OnsenClient {
         continue
       }
       if (t.line.k === 'ir') {
+        // The FIFO cursor can now pass a report acknowledged ahead of a stuck record.
+        if (t.end <= this.reportedThrough) { this.writeCursor(t.end); i++; continue }
         const line = t.line.r, body = line.body
         const path = '/v1/items/' + encodeURIComponent(line.item_id) + '/report'
         const key = ['ir', line.item_id, body.claim_id, body.outcome].map(encodeURIComponent).join(':')
@@ -971,7 +982,7 @@ export class OnsenClient {
           else return this.failStatus(r, path)
         }
         this.itemAck?.(line, ok)
-        this.writeCursor(t.end)
+        this.writeCursor(this.readCursor(), t.end)
         this.itemReports = Math.max(0, this.itemReports - 1)
         this.ok(); i++; continue
       }
