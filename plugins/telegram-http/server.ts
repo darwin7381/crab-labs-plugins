@@ -395,6 +395,7 @@ const onsen: Onsen.OnsenClient | null = INBOX_ONLY ? null : new Onsen.OnsenClien
 })
 const ONSEN_TAKE_ON = switchOn(process.env.ONSEN_TAKE, ONSEN_AGENT)
 let takeMode: TakeMode | undefined
+let takeKeepwarm: LocalKeepwarm | undefined
 let itemPeek: ItemPeek | undefined
 let itemReceiver: ItemReceiver | undefined
 let itemClaims: Claims | undefined
@@ -405,15 +406,22 @@ if (ONSEN_TAKE_ON) {
   if (reason) log('info', `onsen take: staying on pull: ${reason}`)
   else if (onsen) {
     takeMode = new TakeMode(ONSEN_AGENT, (m, p, b, t, h, signal) => onsen.request(m, p, b, t, h, signal),
-      active => { if (active) { Lanes.retireItemReceipts(); itemClaims!.start(); itemPeek!.reset() } else itemPeek!.stop(); registryStatusChanged?.() }, line => log('info', line))
+      active => {
+        if (active) {
+          Lanes.retireItemReceipts(); Lanes.resumeSelfItems(); itemClaims!.start(); itemPeek!.reset()
+          takeKeepwarm?.start(); void takeKeepwarm?.run()
+        } else { itemPeek!.stop(); takeKeepwarm?.stop() }
+        registryStatusChanged?.()
+      }, line => log('info', line))
     itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, Lanes.offerMissed, () => registryStatusChanged?.(), takeMode.now)
     onsen.watchItemReports(line => itemClaims!.replay(line), (line, ok) => itemClaims!.acknowledged(line, ok))
-    itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at), () => itemPeek!.reset())
-    Lanes.useItemReceiver(itemReceiver)
+    itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at), () => itemPeek!.reset(), due => !!takeKeepwarm?.matchesWindow(due))
+    Lanes.useItemReceiver(itemReceiver, onsen)
     itemPeek = new ItemPeek(takeMode, Lanes.itemIndex, routeInboxItem, () => !itemClaims!.blocked())
     Lanes.observeItemGates(() => itemPeek!.reset())
   }
 }
+if (onsen) onsen.mayWithdrawKeepwarm = row => takeKeepwarm?.mayWithdraw(row) === true
 if (onsen) { log('info', `onsen: agent=${ONSEN_AGENT} base=${onsen.cfg.base} record=${onsen.cfg.record ? 'on' : 'off'}`); onsen.start() }   // the sync loop (record on only)
 // 1.58.32 (Chiron): a roamer posts nothing to Onsen, so it adds nothing to the spool; what an older version left there stays as it is (not ours to delete)
 if (onsen && Onsen.isRoamerEnv(process.env)) log('info', `onsen: a roamer (ROAMER_MODE=1) records nothing into the Onsen spool; ${onsen.pendingBytes()} bytes an older version left in ${onsen.spool} are kept as they are, not sent`)
@@ -2270,7 +2278,7 @@ async function laneMainCore(method: 'GET' | 'POST', path: string, body?: unknown
 // decision (mailbox_decide → mail_decision) and the cards entering the due window (GET /due every minute → mail_due). One the router cannot take
 // now waits in <state>/mail-events.json and goes on the next tick. Lanes off: no events (the main does what it decided itself).
 const mailEvents = INBOX_ONLY && Lanes.LANES_ON
-  ? new MailEvents({ file: join(STATE_DIR, 'mail-events.json'), send: async ev => !!(await Lanes.routeRemote(ev as unknown as Lanes.InEvent)), log: (l, m) => log(l as 'info' | 'warn' | 'error', m) })
+  ? new MailEvents({ file: join(STATE_DIR, 'mail-events.json'), pausedForTake: () => !!onsenPuller?.pausedForTake, send: async ev => !!(await Lanes.routeRemote(ev as unknown as Lanes.InEvent)), log: (l, m) => log(l as 'info' | 'warn' | 'error', m) })
   : null
 if (mailEvents) {
   const fetchDue = async () => { const r = await btccMail('GET', `/api/mesh/mail/due?within=${MAIL_DUE_WITHIN_S}`).catch(() => null); return r?.status === 200 && Array.isArray(r.json?.due) ? r.json.due : null }
@@ -3040,11 +3048,12 @@ function keepwarmMode(): 'live' | 'dry' | 'off' {
   v = v.trim()
   return v === 'live' || v === 'dry' ? v : 'off'
 }
-if (INBOX_ONLY && keepwarmMode() !== 'off') {
-  new LocalKeepwarm({
-    name: INBOX_SELF,
+if (takeMode || INBOX_ONLY && keepwarmMode() !== 'off') {
+  const keepwarm = new LocalKeepwarm({
+    name: takeMode?.member ?? INBOX_SELF,
     stateDir: STATE_DIR,
-    mode: keepwarmMode,
+    take: takeMode && onsen ? { mode: takeMode, write: write => onsen.recordItemWrite(write) } : undefined,
+    mode: () => takeMode?.active ? 'live' : takeMode || onsenPuller?.pausedForTake ? 'off' : keepwarmMode(),
     projectsDir: () => (process.env.KEEPWARM_PROJECTS_DIR || '').trim() || TRANSCRIPT_DIR,
     // lanes-golive (C4): with lanes on the main's transcript by its session id (lane transcripts share the dir); lanes off: the newest, as before
     ...(Lanes.LANES_ON ? { transcript: () => Lanes.mainTranscriptFile((process.env.KEEPWARM_PROJECTS_DIR || '').trim() || TRANSCRIPT_DIR) } : {}),
@@ -3060,7 +3069,7 @@ if (INBOX_ONLY && keepwarmMode() !== 'off') {
     },
     // the same line the Mac mini watchdog sends through /inject: sender fleet-watchdog, no_reply
     deliver: async (text) => {
-      if (activeServers.size === 0) return false
+      if (onsenPuller?.pausedForTake || activeServers.size === 0) return false
       const chatId = String(loadAccess().allowFrom[0] ?? 'local-inject')
       await dispatchInbound(chatId, {
         method: 'notifications/claude/channel',
@@ -3072,7 +3081,9 @@ if (INBOX_ONLY && keepwarmMode() !== 'off') {
       return true
     },
     log,
-  }).start()
+  })
+  if (takeMode) takeKeepwarm = keepwarm
+  else keepwarm.start()
 }
 
 // WO-165 A (JEV_SCREEN): Jev reads the bottom of the main's screen (screen-status.ts); set up with the Onsen status below. The duty officer's looks of
@@ -5073,6 +5084,10 @@ async function routeInboxItem(row: InboxItem, change?: 'edited' | 'version'): Pr
     return
   }
   const payload = { ...row.payload }
+  if (row.from === row.member && (row.kind === 'self' || row.kind === 'keepwarm')) {
+    Lanes.routeOwnItem(row, item, [item.note, item.half_done ? '上一回合被打斷，接著做。' : '', payload.text].filter(Boolean).join('\n'))
+    return
+  }
   const prefix = [item.note, item.half_done ? '上一回合被打斷，接著做。' : ''].filter(Boolean).join('\n')
   if (prefix) payload.text = prefix + '\n' + (payload.text ?? '')
   if (row.kind === 'message' || row.message_id) {

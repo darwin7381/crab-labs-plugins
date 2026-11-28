@@ -1,10 +1,16 @@
-import { describe, expect, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { describe, expect, spyOn, test } from 'bun:test'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   LocalKeepwarm, POKE_TEXT, decide, decideMail, isRealInput, remindText, scan, type KState, type MailCount,
 } from './keepwarm-local.ts'
+import { fakeItems } from './test-fixtures/onsen-items.ts'
+import { TakeMode } from './onsen-take.ts'
+import { OnsenClient } from './onsen-client.ts'
+import { ItemReceiver } from './onsen-receive.ts'
+import { Claims } from './onsen-claims.ts'
+import { itemRef } from './onsen-items.ts'
 
 const T0 = Date.parse('2026-11-16T08:00:00Z') / 1000
 const iso = (t: number) => new Date(t * 1000).toISOString()
@@ -24,6 +30,13 @@ const lines = (...recs: any[]) => recs.map(r => JSON.stringify(r)).join('\n') + 
 const turnAt = (t: number) => [joey(t), req(t + 1), answer(t + 5), end(t + 6)]
 
 describe('scan', () => {
+  test('a member-written keepwarm does not restart the 24-hour real-work clock', () => {
+    const rec = chan(T0 + 3000, 'lanes', POKE_TEXT)
+    rec.message.content = rec.message.content.replace('user="lanes"', 'user="lanes" via="lanes" kind="keepwarm"')
+    const s = scan(lines(...turnAt(T0), rec, req(T0 + 3001), answer(T0 + 3002), end(T0 + 3004)))
+    expect(s.last_poke).toBe(T0 + 3000)
+    expect(s.last_real).toBe(T0)
+  })
   test('a channel message from Joey is real work; a fleet-watchdog line is not', () => {
     const s = scan(lines(...turnAt(T0), poke(T0 + 3000), req(T0 + 3001), answer(T0 + 3003), end(T0 + 3004)))
     expect(s.last_real).toBe(T0)
@@ -48,6 +61,139 @@ describe('scan', () => {
     expect(isRealInput({ isMeta: true }, 'skill body')).toBe(false)
     expect(isRealInput({}, 'typed prompt')).toBe(true)
   })
+})
+
+test('take keepwarm uses the member credential, replaces a stale warm window and survives loss of its POST reply', async () => {
+  const f = fakeItems(), dir = mkdtempSync(join(tmpdir(), 'kw-take-')), file = join(dir, 'main.jsonl')
+  const at = Math.floor(f.now() / 1000) + 0.789
+  let lost = true, clock = at + 10, mail = 0, delivered = 0
+  const client = new OnsenClient({ dir, agent: 'adam', base: f.base, record: true, credential: () => 'test-member', log: () => {},
+    fetch: (async (url, init) => {
+      const response = await fetch(url, init)
+      if (init?.method === 'POST' && lost) { lost = false; throw Error('lost response') }
+      return response
+    }) as typeof fetch })
+  const mode = new TakeMode('adam', client.request.bind(client), () => {}, () => {})
+  const monitor = () => new LocalKeepwarm({ name: 'adam', take: { mode, write: w => client.recordItemWrite(w) }, stateDir: dir, projectsDir: () => dir, transcript: () => file,
+    mode: () => 'live', mail: async () => { mail++; return null }, deliver: async () => { delivered++; return true }, log: () => {}, now: () => clock })
+  const check = monitor()
+  client.mayWithdrawKeepwarm = row => check.mayWithdraw(row)
+  try {
+    await mode.probe()
+    writeFileSync(file, lines(...turnAt(at)))
+    await check.run()
+    expect(f.rows.size).toBe(0)
+    await client.syncNow(true) // the POST lands but the spool loses its reply
+    await monitor().run()
+    await client.syncNow(true)
+    expect(f.rows.size).toBe(1)
+    const first = [...f.rows.values()][0]!
+    expect(first).toMatchObject({ kind: 'keepwarm', from: 'adam', session_id: 'main', deadline: null,
+      not_before: iso(at + 1 + 50 * 60), expires_at: iso(at + 1 + 60 * 60), state: 'waiting' })
+    expect(check.matchesWindow(first.not_before!)).toBe(true)
+    const dueSecond = Math.floor(Date.parse(first.not_before!) / 1000)
+    first.not_before = iso(dueSecond)
+    expect(check.matchesWindow(first.not_before)).toBe(true)
+    expect(check.matchesWindow(iso(dueSecond + 1))).toBe(true)
+    expect(check.matchesWindow(iso(dueSecond + 2))).toBe(false)
+    await check.run(); await client.syncNow(true)
+    expect(first.state).toBe('waiting')
+    expect(f.rows.size).toBe(1)
+    const count = f.calls.length
+    for (const elapsed of [60, 120, 180]) {
+      writeFileSync(file, lines(...turnAt(at), joey(at + 40), req(at + elapsed)))
+      clock = at + elapsed + 1
+      await monitor().run()
+      expect(check.matchesWindow(iso(at + elapsed + 50 * 60))).toBe(false)
+    }
+    expect(f.calls.length).toBe(count)
+    expect(first.state).toBe('waiting')
+    const later = at + 900
+    clock = at + 1 + 50 * 60
+    writeFileSync(file, lines(...turnAt(later)))
+    const receiver = new ItemReceiver(mode, new Claims(join(dir, 'claims.json'), client, () => {}, () => {}), () => {}, undefined,
+      due => check.matchesWindow(due))
+    const stale = await receiver.receive([itemRef(first)])
+    expect([...stale.gone]).toEqual([first.id])
+    expect(f.calls.some(c => c.path.endsWith('/take'))).toBe(false)
+    await check.run()
+    expect(first.state).toBe('waiting')
+    const pending = client.pendingBytes()
+    await check.run()
+    expect(client.pendingBytes()).toBe(pending)
+    f.change(first, 'edited')
+    await client.syncNow(true)
+    expect(first.state).toBe('waiting') // the queued withdrawal was for the version the scheduler listed
+    await check.run(); await client.syncNow(true)
+    const second = [...f.rows.values()].at(-1)!
+    expect(first).toMatchObject({ state: 'cancelled', reason: 'withdrawn' })
+    expect(second.not_before).toBe(iso(later + 1 + 50 * 60))
+    await check.run()
+    expect(f.rows.size).toBe(2)
+    clock = later + 1 + 60 * 60
+    await check.run()
+    expect(second.state).toBe('waiting')
+    writeFileSync(file, lines(...turnAt(later), joey(clock), req(clock + 1)))
+    await client.syncNow(true)
+    expect(second.state).toBe('waiting')
+    writeFileSync(file, lines(...turnAt(later)))
+    await check.run()
+    f.down(true)
+    await client.syncNow(true)
+    expect(second.state).toBe('waiting')
+    f.down(false)
+    const restarted = new OnsenClient(client.cfg)
+    restarted.mayWithdrawKeepwarm = row => check.mayWithdraw(row)
+    try { await restarted.syncNow(true) } finally { restarted.stop() }
+    expect([...f.rows.values()].filter(r => r.state === 'waiting')).toHaveLength(0)
+    writeFileSync(file, lines(joey(later), req(later + 24 * 3600), answer(later + 24 * 3600 + 1), end(later + 24 * 3600 + 2)))
+    clock = later + 24 * 3600 + 3
+    await check.run(); await client.syncNow(true)
+    expect(f.rows.size).toBe(2)
+    const raceAt = clock + 60
+    const old = f.add('old-warm-window', 'keepwarm', { from: 'adam', session_id: 'main', not_before: iso(clock) })
+    clock = raceAt + 15
+    writeFileSync(file, lines(...turnAt(raceAt)))
+    const request = mode.req
+    const peek = spyOn(mode, 'req').mockImplementationOnce(async (...args) => {
+      const response = await request(...args)
+      writeFileSync(file, lines(...turnAt(raceAt), joey(clock), req(clock + 1)))
+      return response
+    })
+    try { await check.run(); await client.syncNow(true) } finally { peek.mockRestore() }
+    expect(old.state).toBe('waiting')
+    expect(f.rows.size).toBe(3)
+    // Onsen returns the new idle window at whole seconds. C1 can take it at that time.
+    writeFileSync(file, lines(...turnAt(raceAt)))
+    old.not_before = iso(Math.floor(raceAt + 1 + 50 * 60))
+    f.advance(Date.parse(old.not_before) - f.now() + 1)
+    clock = f.now() / 1000
+    expect((await receiver.receive([itemRef(old)])).given.has(old.id)).toBe(true)
+    expect([mail, delivered]).toEqual([0, 0])
+  } finally { mode.stop(); f.stop(); client.stop(); rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('the full cache lifetime sets expiry even when the 24-hour real-work cutoff comes first', async () => {
+  const f = fakeItems(), dir = mkdtempSync(join(tmpdir(), 'kw-expiry-')), file = join(dir, 'main.jsonl')
+  const at = Math.floor(f.now() / 1000), lastReal = at - 23 * 3600 - 45 * 60
+  let clock = at + 5
+  const client = new OnsenClient({ dir, agent: 'adam', base: f.base, record: true, credential: () => 'test-member', log: () => {} })
+  const mode = new TakeMode('adam', client.request.bind(client), () => {}, () => {})
+  const check = new LocalKeepwarm({ name: 'adam', take: { mode, write: w => client.recordItemWrite(w) }, stateDir: dir,
+    projectsDir: () => dir, transcript: () => file, mode: () => 'live', mail: async () => null, deliver: async () => false, log: () => {}, now: () => clock })
+  try {
+    await mode.probe()
+    writeFileSync(file, lines(joey(lastReal), req(at), answer(at + 1), end(at + 2)))
+    await check.run(); await client.syncNow(true)
+    const [row] = f.rows.values()
+    expect(row).toMatchObject({ kind: 'keepwarm', not_before: iso(at + 50 * 60), expires_at: iso(at + 60 * 60) })
+    expect(f.calls.find(c => c.body.kind === 'keepwarm')!.body).not.toHaveProperty('waiter')
+    clock = at + 50 * 60
+    expect(check.matchesWindow(row!.not_before!)).toBe(false)
+    f.advance(Date.parse(row!.expires_at!) - f.now() + 1)
+    expect(row!.reason).toBe('expired')
+    expect([...f.rows.values()].filter(r => r.kind === 'notice')).toHaveLength(0)
+  } finally { mode.stop(); client.stop(); f.stop(); rmSync(dir, { recursive: true, force: true }) }
 })
 
 describe('decide (keep-warm)', () => {

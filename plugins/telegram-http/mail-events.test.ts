@@ -11,6 +11,22 @@ const DEC = { id: 41, title: 'Lynx：維護時段', from: 'lynx', status: 'read'
 const DUE = { id: 42, title: 'Kot：重開 daemon', deadline: '2026-11-24T12:00:00+00:00', overdue: false, decide: '要不要重開', recommend: '重開',
   lane: 'kot.reflex.2', thread: 'kot#t-9', from_lane: 'kot.reflex.2', ref: 'ev-1' }
 
+test('a take member hands off decisions and skips due mail, including a switch during a due query', async () => {
+  let take = true, reads = 0, sends = 0
+  const m = new MailEvents({ file: join(mkdtempSync(join(tmpdir(), 'mail-take-')), 'events'), pausedForTake: () => take,
+    send: async () => ++sends > 1, log: () => {} })
+  const tick = () => m.tick(async () => { reads++; take = true; return [DUE] })
+  expect(await m.emit(decisionEvent(DEC))).toBe('queued')
+  expect(await tick()).toEqual({ flushed: 1, due: 0 })
+  expect(reads).toBe(0)
+  take = false
+  expect(await tick()).toEqual({ flushed: 0, due: 0 })
+  expect(sends).toBe(2)
+  take = false
+  expect(await m.emit(decisionEvent(DEC))).toBe('handed')
+  expect(sends).toBe(3)
+})
+
 test('mail_decision: the seam v2 fields, id mail-decision-<id>, a readable text and notification for a router that does not know the kind', () => {
   const ev = decisionEvent(DEC)
   expect(ev).toMatchObject({ id: 'mail-decision-41', source: 'mail', kind: 'mail_decision', mail_id: 41, lane: 'kot.mail.1', thread: 'kot#t-1',

@@ -122,6 +122,16 @@ function puller(on: ReturnType<typeof standIn>, b: OnsenInbox, got: string[], de
 }
 
 describe('the pull', () => {
+  test('the legacy inbox exposes the member mode to reminders, including when only the tg daemon opted in', async () => {
+    let status = 409
+    const p = new OnsenPuller({ inbox: new OnsenInbox({ file: join(dir(), 'i.json') }), base: 'test', host: 'h', log: quiet,
+      req: async () => ({ status, json: { acked_seq: 0 } }), deliver: async () => 'delivered' })
+    await p.once().catch(() => {})
+    expect(p.pausedForTake).toBe(true)
+    status = 200
+    await p.once()
+    expect(p.pausedForTake).toBe(false)
+  })
   test('first start (no local copy, WO-158): starts after Onsen\'s acked_seq; a new agent (nothing acked) gets the 3 items sent before its first poll, then a 4th once', async () => {
     const on = standIn(), got: string[] = [], logs: string[] = []
     for (const t of ['old-1', 'old-2', 'old-3']) on.put(t)

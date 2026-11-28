@@ -22,6 +22,9 @@
 
 import { appendFileSync, closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { ownItem, type ItemWriter } from './onsen-item-writes.ts'
+import type { TakeMode } from './onsen-take.ts'
+import type { InboxItem } from './onsen-items.ts'
 
 export const KEEPWARM_AFTER_S = 50 * 60
 export const CACHE_TTL_S = 60 * 60
@@ -53,16 +56,18 @@ function openTag(text: string): string | null {
 }
 export function isPoke(text: string): boolean {
   const m = /<channel\b[^>]*>/.exec(text)
+  if (isKeepwarmItem(m?.[0])) return true
   if (!m || !m[0].includes('user="fleet-watchdog"')) return false
   return text.slice(m.index + m[0].length).trimStart().startsWith(MARK)
 }
+const isKeepwarmItem = (tag?: string | null) => !!tag && tag.includes('via="lanes"') && tag.includes('kind="keepwarm"')
 export function isJoey(text: string): boolean {
   const t = openTag(text)
   return !!t && (t.includes(`user_id="${JOEY_TG_ID}"`) || t.includes('user="Joey (BTCC)"'))
 }
 export function fromWatchdog(text: string): boolean {
   const t = openTag(text)
-  return !!t && t.includes('user="fleet-watchdog"')
+  return isKeepwarmItem(t) || !!t && t.includes('user="fleet-watchdog"')
 }
 /** Did this user record hand the agent work? Channel messages are isMeta with origin.kind=channel. */
 export function isRealInput(r: any, text: string): boolean {
@@ -88,10 +93,11 @@ function* records(text: string): Generator<any> {
 }
 
 export interface KScan {
+  last_poke?: number | null
   last_req: number | null; turn_open: boolean; compact_after: boolean; walled: boolean
   last_real: number | null; last_joey: number | null; after_req_usage: any
 }
-export function scan(text: string): KScan {
+export function scan(text: string, includeRequest = false): KScan {
   const s: KScan = { last_req: null, turn_open: false, compact_after: false, walled: false, last_real: null, last_joey: null, after_req_usage: null }
   let lastAssistant: number | null = null
   let turnEnd: number | null = null
@@ -116,6 +122,7 @@ export function scan(text: string): KScan {
       }
     } else if (typ === 'user') {
       const [t, tr] = userText(r)
+      if (!tr && isPoke(t)) s.last_poke = ts(r)
       if (tr || !t.trim() || !isRealInput(r, t)) continue
       s.last_real = ts(r) ?? s.last_real
       if (isJoey(t)) s.last_joey = ts(r) ?? s.last_joey
@@ -123,13 +130,16 @@ export function scan(text: string): KScan {
       // a message absorbed mid-turn is recorded only as this attachment (Chiron btcc 9570)
       const att = r.attachment
       const t = typeof att.prompt === 'string' ? att.prompt : ''
+      if (isPoke(t)) s.last_poke = ts(r) ?? ts(att)
       if (!t.trim() || !isRealInput({ origin: att.origin, isMeta: att.isMeta }, t)) continue
       const at = ts(r) ?? ts(att)
       s.last_real = Math.max(at ?? 0, s.last_real ?? 0) || s.last_real
       if (isJoey(t)) s.last_joey = Math.max(at ?? 0, s.last_joey ?? 0) || s.last_joey
     }
   }
-  s.turn_open = !!(lastAssistant && (turnEnd == null || turnEnd < lastAssistant))
+  // A take member can already be busy on the first request, before any assistant record is written.
+  const activity = Math.max(lastAssistant ?? 0, includeRequest ? s.last_req ?? 0 : 0)
+  s.turn_open = activity > (turnEnd ?? 0)
   return s
 }
 /** Usage of the first genuine main-thread answer after time t (a poke's answer). */
@@ -159,12 +169,14 @@ export interface KState {
 }
 const hm = (t: number) => { const d = new Date(t * 1000); return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}` }
 
-export function decide(s: KScan | null, st: KState, now: number): [string, string] {
+export function decide(s: KScan | null, st: KState, now: number, schedule = false): [string, string] {
   if (!s || !s.last_req) return ['skip', 'never called the model in this session']
   const idle = now - s.last_req
   if (s.turn_open) return ['skip', 'turn running']
-  if (idle < KEEPWARM_AFTER_S) return ['skip', `idle ${(idle / 60).toFixed(1)}m`]
-  if (st.poked_for === s.last_req) return ['skip', 'already poked for this idle stretch']
+  if (!schedule) {
+    if (idle < KEEPWARM_AFTER_S) return ['skip', `idle ${(idle / 60).toFixed(1)}m`]
+    if (st.poked_for === s.last_req) return ['skip', 'already poked for this idle stretch']
+  }
   if (idle >= CACHE_TTL_S) return ['note', `already cold: ${Math.round(idle / 60)}m since the last request`]
   if (s.compact_after) return ['note', 'already cold: compacted since the last request']
   if (s.walled) return ['note', 'usage wall: the last answer is the limit error']
@@ -201,6 +213,7 @@ export function decideMail(s: KScan | null, st: KState, now: number, n: number, 
 /** This agent's unread mail: on = its mailbox is open; null = the query failed (wake no one). */
 export type MailCount = { on: boolean; n: number; oldestS: number | null } | null
 export interface LocalKeepwarmDeps {
+  take?: { mode: TakeMode; write: ItemWriter }
   mode(): 'live' | 'dry' | 'off'
   projectsDir(): string | null
   mail(): Promise<MailCount>
@@ -239,11 +252,88 @@ function readTail(path: string, max = TAIL_BYTES): string {
   } finally { closeSync(fd) }
 }
 
+// Onsen may return a whole-second RFC 3339 time for a millisecond transcript timestamp.
+const sameKeepwarmTime = (rowTime: string | null | undefined, dueMs: number) => Math.abs(Date.parse(rowTime ?? '') - dueMs) <= 1000
+
 export class LocalKeepwarm {
   private running = false
+  private timer?: ReturnType<typeof setInterval>
   constructor(private readonly d: LocalKeepwarmDeps) {}
   private now(): number { return this.d.now ? this.d.now() : Date.now() / 1000 }
   private statePath() { return join(this.d.stateDir, 'keepwarm-local.json') }
+  private state(): KState {
+    try { return JSON.parse(readFileSync(this.statePath(), 'utf8')) } catch { return {} }
+  }
+  private transcript(st: KState) {
+    const dir = this.d.projectsDir()
+    const named = this.d.transcript ? this.d.transcript() : undefined
+    const path = named !== undefined ? (named && existsSync(named) ? named : null) : dir ? newestJsonl(dir) : null
+    const text = path ? readTail(path) : ''
+    const s = path ? scan(text, !!this.d.take) : null
+    const wall = this.d.wall?.() ?? null
+    if (s && wall !== null) s.walled = wall
+    if (s?.last_real) st.last_real = Math.max(s.last_real, st.last_real ?? 0)
+    return { s, text, path }
+  }
+
+  /** A model action since the minute pass invalidates its previous window, even if that row just became due. */
+  matchesWindow(due?: string): boolean {
+    const st = this.state()
+    try {
+      const { s } = this.transcript(st)
+      return !!s?.last_req && sameKeepwarmTime(due, (s.last_req + KEEPWARM_AFTER_S) * 1000)
+        && decide(s, st, this.now(), true)[0] === 'poke'
+    } catch { return false }
+  }
+
+  /** A queued withdrawal may drain in a later turn or after another idle window has begun. */
+  mayWithdraw(row: InboxItem): boolean {
+    const take = this.d.take
+    if (!take?.mode.active || row.kind !== 'keepwarm' || row.from !== take.mode.member || row.session_id !== 'main') return false
+    const st = this.state(), { s } = this.transcript(st)
+    if (s?.turn_open) return false
+    const due = ((s?.last_req ?? 0) + KEEPWARM_AFTER_S) * 1000
+    return decide(s, st, this.now(), true)[0] !== 'poke' || !sameKeepwarmTime(row.not_before, due)
+  }
+
+  /** Reconcile the warm window with waiting Items. A new model action moves the window, including across restarts. */
+  private async schedule({ mode, write }: NonNullable<LocalKeepwarmDeps['take']>, s: KScan | null, st: KState, now: number): Promise<void> {
+    if (s?.turn_open) return
+    const due = ((s?.last_req ?? 0) + KEEPWARM_AFTER_S) * 1000
+    const expires = ((s?.last_req ?? 0) + CACHE_TTL_S) * 1000
+    const wanted = decide(s, st, now, true)[0] === 'poke' && due < expires
+    const q = new URLSearchParams({ kind: 'keepwarm', session_id: 'main', state: 'waiting', connector: mode.connector, limit: '100' })
+    let exists = false
+    const obsolete: InboxItem[] = []
+    do {
+      const page = await mode.req('GET', mode.path + '?' + q)
+      if (!mode.active) return
+      if (page?.status !== 200 || !Array.isArray(page.json?.items)) throw new Error('could not read waiting keepwarm Items')
+      for (const row of page.json.items as InboxItem[]) {
+        if (row.kind !== 'keepwarm' || row.from !== mode.member || row.session_id !== 'main') continue
+        if (wanted && sameKeepwarmTime(row.not_before, due)) exists = true
+        else obsolete.push(row)
+      }
+      if (!page.json.next_cursor) break
+      q.set('cursor', page.json.next_cursor)
+    } while (mode.active)
+    // The transcript can change while the member listing or a withdrawal is in flight.
+    const stillIdle = () => {
+      if (!mode.active) return false
+      const current = this.transcript(st).s
+      return !current?.turn_open && current?.last_req === s?.last_req
+    }
+    for (const row of obsolete) {
+      if (!stillIdle()) return
+      write({ key: 'keepwarm:withdraw:' + row.id, item: { kind: 'keepwarm', refs: [] }, id: row.id,
+        outcome: 'withdrawn', expected_version: row.version })
+    }
+    if (!wanted || exists || st.poked_for === s!.last_req || !stillIdle()) return
+    const item = ownItem('keepwarm', 'main', POKE_TEXT, due)
+    item.expires_at = new Date(expires).toISOString()
+    write({ key: 'keepwarm:main:' + due, item })
+    st.poked_for = s!.last_req
+  }
 
   /** One pass (every minute). Returns the log lines it wrote. */
   async run(): Promise<string[]> {
@@ -253,19 +343,13 @@ export class LocalKeepwarm {
     this.running = true
     const lines: string[] = []
     const name = this.d.name
-    let st: KState = {}
-    try { st = JSON.parse(readFileSync(this.statePath(), 'utf8')) } catch {}
+    const st = this.state()
     try {
       const now = this.now()
-      const dir = this.d.projectsDir()
-      const named = this.d.transcript ? this.d.transcript() : undefined
-      const path = named !== undefined ? (named && existsSync(named) ? named : null) : dir ? newestJsonl(dir) : null
-      const text = path ? readTail(path) : ''
-      const s = path ? scan(text) : null
-      // WO-120: a fresh usage-wall state decides "walled" instead of this scan (which reads any api-request as the end)
-      const wall = this.d.wall?.() ?? null
-      if (s && wall !== null) s.walled = wall
-      if (s?.last_real) st.last_real = Math.max(s.last_real, st.last_real ?? 0)
+      const { path, text, s } = this.transcript(st)
+      if (this.d.take && s?.last_poke && s.last_poke !== st.poked_at) {
+        Object.assign(st, { poked_at: s.last_poke, poked_kind: 'poke', judged: false })
+      }
       if (st.poked_at && (st.poked_kind ?? 'poke') === 'poke' && !st.judged && path) {
         const u = firstUsageAfter(text, st.poked_at)
         if (u) {
@@ -275,6 +359,10 @@ export class LocalKeepwarm {
             lines.push(`KEEPWARM-COLD ${name}: the poke at ${hm(st.poked_at)} wrote ${u.cache_creation_input_tokens} / read ${u.cache_read_input_tokens} — stopping until real work`)
           }
         }
+      }
+      if (this.d.take) {
+        if (this.d.take.mode.active) await this.schedule(this.d.take, s, st, now)
+        return lines
       }
       const send = async (text: string, why: string, tag: string): Promise<boolean> => {
         if (mode === 'live') {
@@ -345,8 +433,10 @@ export class LocalKeepwarm {
   }
 
   start(everyMs = 60_000): void {
-    const t = setInterval(() => { void this.run() }, everyMs)
-    t.unref?.()
+    if (this.timer) return
+    this.timer = setInterval(() => { void this.run() }, everyMs)
+    this.timer.unref?.()
     this.d.log('info', `keepwarm-local ON (${this.d.mode()}; projects ${this.d.projectsDir() ?? '?'})`)
   }
+  stop(): void { clearInterval(this.timer); this.timer = undefined }
 }

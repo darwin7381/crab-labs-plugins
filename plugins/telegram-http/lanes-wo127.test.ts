@@ -11,7 +11,13 @@ import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, chmodSync, mkdi
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { createServer } from 'http'
-import { decisionEvent, dueEvent } from './mail-events.ts'
+import { MailEvents, decisionEvent, dueEvent } from './mail-events.ts'
+import { OnsenClient } from './onsen-client.ts'
+import { OnsenInbox, OnsenPuller } from './onsen-inbox.ts'
+import { TakeMode } from './onsen-take.ts'
+import { Claims } from './onsen-claims.ts'
+import { ItemReceiver } from './onsen-receive.ts'
+import { fakeItems } from './test-fixtures/onsen-items.ts'
 process.env.LANES_FLOOD_CONTROL = '0'
 process.env.LANES_DEFER_DECISIONS = '0'                                     // WO-128 (1.39.0): these tests pin 1.38's behaviour (every card wakes the main); lanes-wo128 tests the switch on
 // the tg daemon's own HTTP routes, for the agent-inbox side's calls into it (/lanes/mail-checked)
@@ -24,7 +30,7 @@ delete process.env.LANES_TG_PORT
 Lref = L
 const B = await import('./lanes-boundary.ts')
 const { mainContext } = await import('./lanes-main.ts')
-const { LANE_DECIDE_LATER_TOOL, MAILBOX_CARD_TOOL } = await import('./fleet-mail.ts')
+const { LANE_DECIDE_LATER_TOOL, MAILBOX_CARD_TOOL, callTool } = await import('./fleet-mail.ts')
 
 const ws = mkdtempSync(join(tmpdir(), 'lanes-wo127-ws-'))
 const dir = join(ws, '.lanes'); mkdirSync(dir)
@@ -158,8 +164,29 @@ async function asked(text = 'api-gw 5xx 一直高，可以重啟嗎？'): Promis
   return { r, m, out }
 }
 
+// Both daemons learn the mode from the same member through their normal HTTP probes.
+async function withMemberMode(take: boolean, run: (puller: OnsenPuller, itemCreates: () => Promise<number>) => Promise<void>) {
+  const f = fakeItems(), state = mkdtempSync(join(tmp, 'member-'))
+  const client = new OnsenClient({ dir: state, agent: 'adam', base: f.base, record: true, credential: () => 'test-member', log: () => {} })
+  const req = client.request.bind(client)
+  const mode = new TakeMode('adam', req, () => {}, () => {})
+  const claims = new Claims(join(state, 'claims.json'), client, () => {}, () => {})
+  const puller = new OnsenPuller({ req, base: f.base, inbox: new OnsenInbox({ file: join(state, 'inbox.json') }),
+    host: 'fixture', takeEnabled: true, waitS: 0, log: () => {}, deliver: async () => 'delivered' })
+  try {
+    f.mode(take ? 200 : 409)
+    L.useItemReceiver(new ItemReceiver(mode, claims, () => {}), client)
+    await mode.probe(); await puller.once()
+    expect([mode.active, puller.pausedForTake]).toEqual([take, take])
+    await run(puller, async () => {
+      await client.syncNow(true)
+      return f.calls.filter(c => c.path === mode.path && c.key !== null).length
+    })
+  } finally { L.useItemReceiver(undefined); mode.stop(); claims.stop(); client.stop(); f.stop() }
+}
+
 // ------------------------------------------------------------------ 1-3: the decision comes back, the lane finishes, Joey gets one line
-test('WO-127 #1 照建議: decide_later wakes the main with the card; mailbox_decide → the same thread\'s lane resumes and finishes; one line to Joey, the system\'s words in front; the main owes nothing and its Stop check is not held', async () => {
+test.each([false, true])('WO-127 #1 照建議 (take=%s): decide_later wakes the main with the card; mailbox_decide → the same thread\'s lane resumes and finishes; one line to Joey, the system\'s words in front; the main owes nothing and its Stop check is not held', take => withMemberMode(take, async (puller, itemCreates) => {
   const before = sent.length
   const { r, m, out } = await asked()
   expect(out).toContain(`放進主線的信箱了（#${m}`); expect(out).toContain('The main was woken with your card')
@@ -174,13 +201,25 @@ test('WO-127 #1 照建議: decide_later wakes the main with the card; mailbox_de
   // the main's turn takes it and decides
   const mt = await mainTurnWith([r.id])
   try {
-    const runs = runsOf().length
-    const d = await L.routeEvent(decided(m, 'as_recommended'))
-    expect(d).toMatchObject({ rule: 'mail-decision', target: 'lane', lane: r.lane })                   // the same lane, resumed
+    const runs = runsOf().length, beforeDecision = await itemCreates()
+    const mail = new MailEvents({ file: join(tmp, 'mail-decisions'), pausedForTake: () => puller.pausedForTake, log: () => {},
+      send: async ev => {
+        const d = await L.routeEvent(ev as any)
+        expect(d).toMatchObject({ rule: 'mail-decision', target: 'lane', lane: r.lane })
+        return d.target === 'lane'
+      } })
+    const answer = await callTool('mailbox_decide', { id: m, decision: 'as_recommended' }, {
+      btcc: async (method, path, body) => {
+        expect([method, path]).toEqual(['POST', '/api/mesh/mail/' + m + '/decide'])
+        return { status: 200, json: { ...box.get(m), ...body as object } }
+      }, mailEvent: d => mail.emit(decisionEvent(d)), call: async () => '', core: async () => { throw Error('unexpected call') }
+    })
+    expect(answer!.content[0]!.text).toContain('已交給 ' + r.lane)                   // the same lane, resumed
     expect(L.__events().mainObs(r.id)).toEqual([])                                                  // the main owes nothing for it any more
     expect((await stopCheck(mt)).block).toBeUndefined()                                             // and its Stop check holds nothing
-    const dr = await runOf(r.lane, runs, d.lane ? `mail-decision-${m}` : '')
+    const dr = await runOf(r.lane, runs, `mail-decision-${m}`)
     expect(dr.argv).toContain('--resume')
+    expect(await itemCreates()).toBe(beforeDecision)
     expect(dr.prompt).toContain('主線回了決定：照建議。'); expect(dr.prompt).toContain(`信 #${m}`); expect(dr.prompt).toContain('要你決定：要不要現在重啟 api-gw')
     expect(dr.prompt).toContain('說好之後：重啟 api-gw、看 5 分鐘、回 Eve')
     expect(dr.prompt).toContain(B.BOUNDARY_DECISION_SENTENCE)                                         // item 8: the card's sentence rides every run
@@ -197,7 +236,7 @@ test('WO-127 #1 照建議: decide_later wakes the main with the card; mailbox_de
     expect(await until(() => mailCalls.some(c => c.name === 'mailbox_check' && c.args.id === m))).toBe(true)   // the decided lane item is checked off for the lane
     expect(handoffs()).not.toContain(`信箱 #${m}`)
   } finally { await mt.stop() }
-}, 40000)
+}), 40000)
 
 test('WO-127 #2 改成… (and #7 of the ticket\'s items): the note reaches the lane; its line says what the main changed it to; WO-125\'s 〔系統〕 line still rides it', async () => {
   const before = sent.length

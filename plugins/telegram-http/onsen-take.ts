@@ -1,5 +1,5 @@
 import { hostname } from 'os'
-import type { ActionReq } from './onsen-client.ts'
+import type { ActionReq, OnsenClient } from './onsen-client.ts'
 
 export function machineName(host = process.env.ONSEN_HOST): string {
   return (host?.trim() || hostname().replace(/\.local$/, '')).toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+/, '').slice(0, 32) || 'unknown'
@@ -19,7 +19,7 @@ export async function deliveryMode(req: ActionReq, path: string, connector: stri
   return { take: r?.status === 200, status: r?.status, asOf: Date.parse(r?.json?.as_of) }
 }
 
-export type ItemRequest = (...args: [...Parameters<ActionReq>, signal?: AbortSignal]) => ReturnType<ActionReq>
+export type ItemRequest = OnsenClient['request']
 
 export class TakeMode {
   readonly path: string

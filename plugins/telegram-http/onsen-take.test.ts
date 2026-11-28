@@ -374,6 +374,26 @@ test('claim invariant after every idle, busy and walled main transition', async 
   expect(r.claims.held()).toEqual([])
 })
 
+test('a due keepwarm waits through a busy turn, then binds and completes on an idle main', async () => {
+  const r = await mainRig()
+  await r.hook('UserPromptSubmit'); r.status('busy')
+  const row = r.f.add('warm', 'keepwarm', { from: 'adam', session_id: 'main', not_before: new Date(r.f.now() + 60_000).toISOString() })
+  const did = r.enqueue(row)
+  await r.m.pump()
+  expect(row.state).toBe('waiting')
+  r.f.advance(60_000)
+  await r.hook('PostToolUse')
+  expect(row.claim).toBeNull()
+  r.status('idle'); await r.hook('Stop', { phase: 'final' })
+  await r.m.pump()
+  await until(() => r.m.items(x => x.id === did)[0]?.state === 'offered')
+  await r.hook('UserPromptSubmit', { dids: [did], prompt_id: 'warm' })
+  await r.hook('Stop', { prompt_id: 'warm', phase: 'final' })
+  r.f.advance(REGISTRY_SETTLE_MS + 1); r.status('idle')
+  await r.sync()
+  expect(r.outcomes(row.id)).toEqual(['in_session', 'completed'])
+})
+
 test('20 s without a bind returns the offer, the same did can bind once on a new claim', async () => {
   const r = await mainRig(), row = r.f.add('miss'), did = r.enqueue(row)
   await until(() => r.offers.length === 1)
