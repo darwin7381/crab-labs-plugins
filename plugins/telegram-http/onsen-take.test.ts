@@ -160,6 +160,32 @@ test('C4 switch to take imports an unsent pull cut, and waits for a pull stream 
   expect(writing.f.calls.filter(c => c.body.kind === 'resume')).toHaveLength(0)
 })
 
+test.each(['queued create', 'waiting row'])('C4 a refused new prompt shares the session’s %s', async stage => {
+  const r = await mainRig()
+  r.mode.writeItem = write => r.client.recordItemWrite(write)
+  r.setWall({ walled: true, clearedMs: null })
+  await r.hook('UserPromptSubmit')
+  await r.hook('StopFailure', { error: 'rate_limit' })
+  if (stage === 'waiting row') await r.sync()
+  const key = r.m.currentGen()!.resume_items[0].key
+  await r.hook('StopFailure', { prompt_id: 'refused-retry', error: 'rate_limit' })
+  await r.sync()
+  const rows = [...r.f.rows.values()]
+  expect(rows).toHaveLength(1)
+  expect(r.f.calls.filter(c => c.body.kind === 'resume').map(c => c.key)).toEqual([key])
+  r.m.routeResume(itemRef(rows[0]!), rows[0]!.payload.text)
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 })
+  await until(() => { void r.m.pump(); return r.offers.length === 1 })
+  await r.hook('UserPromptSubmit', { prompt_id: 'received', dids: [r.offers[0].params.meta.did] })
+  await r.hook('Stop', { prompt_id: 'received', phase: 'final' })
+  r.f.advance(REGISTRY_SETTLE_MS + 1); r.status('idle'); await r.sync()
+  expect(r.outcomes(rows[0]!.id)).toEqual(['in_session', 'completed'])
+  expect(r.offers).toHaveLength(1)
+  await r.hook('UserPromptSubmit', { prompt_id: 'later-work', dids: [] })
+  await r.hook('StopFailure', { prompt_id: 'later-work', error: 'server_error' }); await r.sync()
+  expect([...r.f.rows.values()].map(row => row.state)).toEqual(['completed', 'waiting'])
+})
+
 test('C4 a refused resume probe belongs to its claimed row even if StopFailure is the first hook', async () => {
   const r = await accountCut()
   r.setWall({ walled: false, clearedMs: Date.now() + 1000 })

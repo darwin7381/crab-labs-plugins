@@ -20,7 +20,6 @@ export function resumeNotification(content: string) {
 type Resume = {
   key: string
   session?: string
-  prompt?: string
   id?: string
   superseded?: true
   create?: { kind: 'resume'; session_id: 'main'; body: { format: 'markdown'; text: string }; refs: never[]; not_before?: string }
@@ -36,10 +35,12 @@ export class ResumeItems {
 
   private entries(): Resume[] { return this.current()?.resume_items ?? [] }
 
+  private undelivered(e: Resume): boolean { return !e.superseded && (!e.id || !this.delivered(e.id)) }
+
   cutFields(g: Row, cut: CutTurn) {
     const entries = this.entries()
-    if (entries.some(e => !e.superseded && e.session === g.session_id && e.prompt === g.prompt_id)) return { cut_turn: null }
-    const entry: Resume = { key: randomUUID(), session: g.session_id, prompt: g.prompt_id, create: {
+    if (entries.some(e => e.session === g.session_id && this.undelivered(e))) return { cut_turn: null }
+    const entry: Resume = { key: randomUUID(), session: g.session_id, create: {
       kind: 'resume', session_id: 'main', body: { format: 'markdown', text: resumeText(cut) }, refs: [],
       ...(cut.retry_at != null ? { not_before: new Date(cut.retry_at).toISOString() } : {}) } }
     return { cut_turn: null, resume_items: [...entries, entry] }
@@ -58,7 +59,7 @@ export class ResumeItems {
 
   supersede(session: string): void {
     const entries = this.entries()
-    const pending = new Set(entries.filter(e => !e.superseded && (!e.session || e.session === session) && (!e.id || !this.delivered(e.id))))
+    const pending = new Set(entries.filter(e => (!e.session || e.session === session) && this.undelivered(e)))
     if (!pending.size) return
     this.save(entries.map(e => pending.has(e) ? { ...e, superseded: true } : e))
     for (const e of pending) if (e.id) {
