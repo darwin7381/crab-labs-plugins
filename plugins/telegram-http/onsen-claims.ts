@@ -19,7 +19,7 @@ type Claim = {
 function sameState(before: ReceivingState, now: ReceivingState): boolean {
   return before.status === now.status && (now.turn === undefined || (before.turn === now.turn && before.lastTurn === now.lastTurn))
 }
-type Done = { item_id: string; claim_id: string; at: number }
+type Done = { item_id: string; claim_id: string; at: number; confirmed?: boolean }
 type Spool = {
   recordItemReport(line: ItemReport): boolean
   hasItemReports(): boolean
@@ -103,7 +103,7 @@ export class Claims implements ClaimStore {
   }
   inSession(id: string): boolean { return !!this.rows[id]?.in_session_at }
   blocked(): boolean { return this.spool.hasItemReports() }
-  completed(id: string): boolean { return this.done.some(d => d.item_id === id && d.at > this.now() - week) }
+  completed(id: string, confirmed = false): boolean { return this.done.some(d => d.item_id === id && d.at > this.now() - week && (!confirmed || d.confirmed)) }
 
   waiting(id: string): void {
     // A server can return an unread mail Item to waiting even after accepting its completed report.
@@ -239,8 +239,9 @@ export class Claims implements ClaimStore {
     if (accepted && (state === 'completed' || state === 'cancelled')) this.receivers.delete(id)
     if (accepted && state === 'waiting') this.waiting(id)
     if (accepted && state === 'completed') {
-      if (!this.done.some(d => d.claim_id === body.claim_id && d.item_id === id))
-        this.done.push({ item_id: id, claim_id: body.claim_id, at: this.now() })
+      const entry = this.done.find(d => d.claim_id === body.claim_id && d.item_id === id)
+      if (entry) entry.confirmed = true
+      else this.done.push({ item_id: id, claim_id: body.claim_id, at: this.now(), confirmed: true })
       for (const [sid, wait] of this.waits) {
         wait.ids = wait.ids.filter(waiting => waiting !== id)
         if (!wait.ids.length) this.waits.delete(sid)

@@ -5172,7 +5172,15 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
 async function routeInboxItem(row: InboxItem, change?: 'edited' | 'version'): Promise<void> {
   const ownResume = row.kind === 'resume' && row.from === row.member
   const item = itemRef(row)
-  if (row.state === 'waiting') itemClaims?.waiting(row.id)
+  if (row.state === 'waiting' && itemClaims?.completed(row.id)) {
+    if (itemClaims.completed(row.id, true)) {
+      const result = await itemReceiver!.receive([item])
+      if (result.given.has(row.id)) itemReceiver!.report([item], 'completed')
+      return
+    }
+    // Older versions remembered requested outcomes without checking what state the server returned.
+    itemClaims.waiting(row.id)
+  }
   if (change && !roamerItems) {
     Lanes.updateWaitingItem(item, change === 'edited' ? { content: String(row.payload.text ?? ''), at: row.updated_at } : undefined)
     return
