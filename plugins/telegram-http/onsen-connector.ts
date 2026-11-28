@@ -21,7 +21,7 @@ import { readFileSync } from 'fs'
 import { parseFleetConfig } from './fleet-config.ts'
 
 type Log = (level: 'info' | 'warn' | 'error', msg: string) => void
-export type Request = (method: 'GET' | 'POST' | 'PUT', path: string, body?: unknown, timeoutMs?: number, headers?: Record<string, string>) => Promise<{ status: number; json: any } | null>
+export type Request = (method: 'GET' | 'POST' | 'PUT', path: string, body?: unknown, timeoutMs?: number) => Promise<{ status: number; json: any } | null>
 
 export const WAIT_MS = 3_000
 export const POLL_MS = 150
@@ -88,7 +88,7 @@ export function why(r: { status: number; json: any } | null): string {
 export class OnsenIds {
   private conv = new Map<string, { id: string; at: number }>()
   private msg = new Map<string, { id: string; at: number }>()
-  constructor(private o: { request: Request; agent: string; ttlMs?: number; now?: () => number }) {}
+  constructor(private o: { request: Request; ttlMs?: number; now?: () => number }) {}
   private fresh(e: { at: number } | undefined): boolean { return !!e && (this.o.now ?? Date.now)() - e.at < (this.o.ttlMs ?? CACHE_MS) }
   /** the conversation a chat id stands for (`onsen:<id>` as it is); throws when Onsen has none for it */
   async conversation(chat: string): Promise<string> {
@@ -96,11 +96,8 @@ export class OnsenIds {
     if (m) return m[1]!
     const had = this.conv.get(chat)
     if (had && this.fresh(had)) return had.id
-    const peer = MEMBER_CHAT.exec(chat)?.[1]
-    const r = peer
-      ? await this.o.request('POST', '/v1/conversations', { participants: [this.o.agent, peer] }, TRY_MS, { 'Idempotency-Key': `c:${this.o.agent}:direct:${peer}` })
-      : await this.o.request('GET', `/v1/conversations/by-chat/${encodeURIComponent(chat)}`, undefined, TRY_MS)
-    const id = r && (r.status === 200 || r.status === 201) ? r.json?.data?.id : undefined
+    const r = await this.o.request('GET', `/v1/conversations/by-chat/${encodeURIComponent(chat)}`, undefined, TRY_MS)
+    const id = r && r.status === 200 ? r.json?.data?.id : undefined
     if (id == null) throw new Error(`Onsen has no conversation for chat ${chat} (${why(r)})`)
     this.know(chat, String(id))
     return String(id)
@@ -159,13 +156,14 @@ export class ConnectorSay {
   private sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
   async say(a: SayAsk): Promise<Said> {
-    const cid = await this.o.ids.conversation(a.chat)
+    const to = MEMBER_CHAT.exec(String(a.chat))?.[1]
+    const cid = to ? '' : await this.o.ids.conversation(a.chat)
     let reply: string | null = null
-    if (!MEMBER_CHAT.test(a.chat) && a.replyTo != null && String(a.replyTo) !== '') {
+    if (!to && a.replyTo != null && String(a.replyTo) !== '') {
       reply = await this.o.ids.message(a.chat, String(a.replyTo)).catch(e => { this.o.log('warn', `connector: reply_to ${a.replyTo}: ${e instanceof Error ? e.message : e}`); return null })
       if (reply == null) { this.stats.reply_unknown++; this.o.log('info', `connector: reply_to ${a.replyTo} is not a message Onsen knows in chat ${a.chat}: written without it`) }
     }
-    const body: Record<string, unknown> = { conversation_id: cid, idem_key: `c:${this.o.agent}:${cid}:out:${randomUUID()}`, sender: a.sender, body: a.text,
+    const body: Record<string, unknown> = { ...(to ? { to } : { conversation_id: cid }), idem_key: `c:${this.o.agent}:${to ? `to-${to}` : cid}:out:${randomUUID()}`, sender: a.sender, body: a.text,
       kind: a.kind ?? 'text', sent_at: new Date().toISOString(), ...(reply != null ? { reply_to_message_id: reply } : {}),
       ...(a.thread ? { thread: String(a.thread) } : {}), ...(a.silent ? { urgency: 'silent', meta: { silent: true } } : {}),
       ...(a.turn_id ? { turn_id: String(a.turn_id).slice(0, 120) } : {}),
@@ -192,6 +190,7 @@ export class ConnectorSay {
     }
     const d = r!.json?.data ?? r!.json ?? {}
     const id = String(d.message_id ?? d.id), conv = String(d.conversation_id ?? cid)
+    if (to && conv) this.o.ids.know(a.chat, conv)                        // the owner's conversation, for what follows
     if (d.duplicate) this.stats.duplicates++; else this.stats.written++
     if (d.delivery === 'sent') { this.stats.direct++; return { onsenId: id, conversationId: conv, ids: [], held: false } }   // nothing draws it
     return this.waitReport(id, conv)

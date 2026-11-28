@@ -418,7 +418,7 @@ const onsenVersion: OnsenFirst.OnsenVersion | null = onsen && onsen.cfg.record &
 const msList = (v: string | undefined): number[] | undefined => { const l = String(v ?? '').split(',').map(x => Number(x.trim())).filter(x => Number.isFinite(x) && x >= 0); return l.length ? l : undefined }
 /** WO-197 (onsen-connector.ts): the connector's way into Onsen: the agent's Telegram numbers turned into Onsen's ids (asked, cached), what it says
  *  written with conversation_id and the bridge's report waited for (ONSEN_BRIDGE_WAIT_MS, 3 s); ONSEN_BRIDGE_RETRY_MS (tests) the write's retries */
-const connectorIds: Connector.OnsenIds | null = onsen ? new Connector.OnsenIds({ agent: ONSEN_AGENT, request: onsen.request.bind(onsen) }) : null
+const connectorIds: Connector.OnsenIds | null = onsen ? new Connector.OnsenIds({ request: onsen.request.bind(onsen) }) : null
 const connectorSay: Connector.ConnectorSay | null = connectorIds ? new Connector.ConnectorSay({ request: (m, p, b, t) => onsen!.request(m, p, b, t),
   ids: connectorIds, agent: ONSEN_AGENT, log, waitMs: Number(process.env.ONSEN_BRIDGE_WAIT_MS ?? Connector.WAIT_MS), retryMs: msList(process.env.ONSEN_BRIDGE_RETRY_MS) }) : null
 /** WO-197 (connector mode): one thing the agent says (the main's reply, a lane's line, a router notice), written into Onsen with conversation_id: its

@@ -190,12 +190,7 @@ export function startOnsenStandin(creds: Record<string, Who>, port = 0): OnsenSt
     }
     if (path === '/v1/meta') return Response.json({ api_version: 1, data: { server_version: st.version[who] ?? '0.31.0', commit: 'test', deployed_at: '2026-11-26T10:00:43Z' } })
     // WO-197: the connector's side of CONTRACT §7d (Onsen 0.35.2)
-    if (path === '/v1/conversations' && req.method === 'POST') {
-      const pair = body?.participants
-      if (!Array.isArray(pair) || pair.length !== 2 || !pair.includes('adam')) return Response.json({ error: { code: 'invalid_request' } }, { status: 400 })
-      const chat = 'to:' + pair.find(name => name !== 'adam'), status = convs.includes(chat) ? 200 : 201
-      return Response.json({ api_version: 1, data: { id: String(convOf(chat)), kind: 'direct' } }, { status })
-    }
+    if (path === '/v1/conversations' && req.method === 'POST') return Response.json({ error: { code: 'not_authorized' } }, { status: 403 })
     const bc = path.match(/^\/v1\/conversations\/by-chat\/([^/]+)$/)
     if (bc) {
       const chat = decodeURIComponent(bc[1]!)
@@ -244,11 +239,12 @@ export function startOnsenStandin(creds: Record<string, Who>, port = 0): OnsenSt
     }
     if (path === '/v1/messages' && req.method === 'POST') {
       if (st.a500[who]) return Response.json({ error: { message: 'database is down' } }, { status: 500 })
-      const bad = ['to', 'client', 'chat', 'delivery', 'client_msg_id', 'backfilled', 'deliver'].filter(k => k in (body ?? {}))
-      if (bad.length || body?.conversation_id == null) return Response.json({ error: { message: `with conversation_id, no ${bad.join(', ')}` } }, { status: 400 })
+      const bad = ['client', 'chat', 'delivery', 'client_msg_id', 'backfilled', 'deliver'].filter(k => k in (body ?? {}))
+      if (bad.length || (body?.conversation_id == null) === (body?.to == null)) return Response.json({ error: { message: `with conversation_id / to, no ${bad.join(', ')}` } }, { status: 400 })
+      // WO-197 segment 2: `to` (a person: their direct conversation with this agent, one per person); a thread must be one of the conversation's
+      const cref = body.to != null ? String(convOf(`to:${body.to}`)) : String(body.conversation_id)
       const had = msgs.find(m => m.who === who && m.item.idem_key === body.idem_key)
-      if (had) return Response.json({ api_version: 1, data: { message_id: String(had.id), conversation_id: String(body.conversation_id), duplicate: true, delivery: had.delivery?.state ?? 'sent' } })
-      const cref = String(body.conversation_id)
+      if (had) return Response.json({ api_version: 1, data: { message_id: String(had.id), conversation_id: cref, duplicate: true, delivery: had.delivery?.state ?? 'sent' } })
       if (body.thread != null && !threads.some(x => x.cid === cref && x.thread === String(body.thread)))
         return Response.json({ error: { code: 'invalid_request', message: `thread ${body.thread}: not a thread of conversation ${cref}` } }, { status: 400 })
       const cid = Number(cref), chat = chatOf(cid) ?? `onsen-${cid}`

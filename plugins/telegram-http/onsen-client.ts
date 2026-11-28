@@ -940,7 +940,7 @@ export class OnsenClient {
       }
       if (t.line.k === 'blocked') {
         const receipt = t.line.r
-        const ids = new OnsenIds({ agent: this.cfg.agent, request: this.request.bind(this) })
+        const ids = new OnsenIds({ request: this.request.bind(this) })
         const id = 'message_id' in receipt ? receipt.message_id : /^form-(\d+)$/.exec(receipt.client_msg_id)?.[1] ?? await ids.message(receipt.chat, receipt.client_msg_id)
         const path = id ? `/v1/messages/${encodeURIComponent(id)}/receipt` : ''
         const r = id ? await this.put(path, { handling: { state: 'blocked', blocked_by: 'usage_limit', retry_after: receipt.retry_after } }, cred)

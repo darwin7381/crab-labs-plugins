@@ -49,7 +49,7 @@ function fake(o: { report?: 'sent' | 'failed' | 'never'; afterMs?: number; statu
     if (/^\/v1\/messages\/\d+\/reactions$/.test(p) || /^\/v1\/messages\/\d+$/.test(p)) return { status: 200, json: { data: { message_id: p.split('/')[3] } } }
     return { status: 404, json: {} }
   }
-  const ids = new OnsenIds({ request, agent: 'adam' })
+  const ids = new OnsenIds({ request })
   return { calls, ids, say: new ConnectorSay({ request, ids, agent: 'adam', log: noLog, waitMs: 600, pollMs: 50, retryMs: [20, 20] }) }
 }
 
@@ -112,30 +112,25 @@ test('WO-197 segment 2: the machine config key is the reader\'s own (ONSEN_OWNER
   expect(new BridgeSwitch({ agent: 'adam', file: 'x', key: 'ONSEN_OWNER', read: () => 'ONSEN_BRIDGE=adam\n' }).value()).toBeUndefined()
 })
 
-test('owner alerts open the direct conversation once and write by conversation_id', async () => {
+test('WO-197 segment 2: a chat member:<name> is written with `to` (the person\'s direct conversation), no conversation asked, no reply; the conversation Onsen answers is kept', async () => {
   const calls: Array<{ m: string; p: string; b: any }> = []
-  const request: Request = async (m, p, b, _ms, headers) => {
+  const request: Request = async (m, p, b) => {
     calls.push({ m, p, b })
-    if (p === '/v1/conversations' && m === 'POST') {
-      expect(headers?.['Idempotency-Key']).toBe('c:adam:direct:amy')
-      return { status: 201, json: { data: { id: '88' } } }
-    }
     if (p === '/v1/messages' && m === 'POST') return { status: 201, json: { data: { message_id: '5100', conversation_id: '88', duplicate: false, delivery: 'sent' } } }
     if (p === '/v1/conversations/88/messages/by-client-id/12') return { status: 200, json: { data: { id: '4100' } } }
     return { status: 404, json: {} }
   }
-  const ids = new OnsenIds({ request, agent: 'adam' })
+  const ids = new OnsenIds({ request })
   const say = new ConnectorSay({ request, ids, agent: 'adam', log: noLog, waitMs: 200, pollMs: 50 })
   expect(memberChat('amy')).toBe('member:amy')
   const r = await say.say({ chat: 'member:amy', sender: 'system:alert', text: '⚠️ 系統警告', replyTo: '12' })
   expect(r).toMatchObject({ onsenId: '5100', conversationId: '88', held: false })
-  expect(await ids.conversation('member:amy')).toBe('88')
-  expect(calls.map(c => c.p)).toEqual(['/v1/conversations', '/v1/messages'])
-  expect(calls[0]!.b).toEqual({ participants: ['adam', 'amy'] })
-  const w = calls[1]!.b
-  expect(w.conversation_id).toBe('88')
-  expect('to' in w || 'reply_to_message_id' in w).toBe(false)
-  expect(w.idem_key).toMatch(/^c:adam:88:out:/)
+  expect(calls.map(c => c.p)).toEqual(['/v1/messages'])
+  const w = calls[0]!.b
+  expect(w.to).toBe('amy')
+  expect('conversation_id' in w || 'reply_to_message_id' in w).toBe(false)
+  expect(w.idem_key).toMatch(/^c:adam:to-amy:out:/)
+  expect(await ids.conversation('member:amy')).toBe('88')                // kept: no by-chat asked for it
 })
 
 test('a group reply keeps the shared conversation across Telegram and web', async () => {
@@ -165,7 +160,7 @@ test('WO-197 segment 2 (sonn\'s ruling 9): a thread Onsen refuses (a Telegram to
     return { status: 404, json: {} }
   }
   const logs: string[] = []
-  const ids = new OnsenIds({ request, agent: 'adam' })
+  const ids = new OnsenIds({ request })
   const say = new ConnectorSay({ request, ids, agent: 'adam', log: (_l, m) => logs.push(m), waitMs: 200, pollMs: 50 })
   const r = await say.say({ chat: '1828', sender: 'adam.worker.1', text: 'x', thread: '7401' })
   expect(r.onsenId).toBe('5200')

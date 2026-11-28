@@ -8,7 +8,7 @@
 //              the line drawn by conversation_id (never client / chat) at the /clear's time
 //   threads    a person's message in a thread: the tag's topic / topic_name as the person's message carried them, the router's topic Onsen's thread;
 //              reply(topic=<the tag's>) is written with that thread; a thread Onsen refuses is dropped and the reply written
-//   owner      a system warning goes into the owner's direct conversation (ONSEN_OWNER); with none set and none mapped: one error, /healthz connector.owner null, no Action
+//   owner      a system warning goes `to` the owner (ONSEN_OWNER); with none set and none mapped: one error, /healthz connector.owner null, no Action
 // In every test the Bot API stand-in sees nothing and bot_api_refused stays {}.
 import { test, expect, beforeAll, afterAll } from 'bun:test'
 import { existsSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'fs'
@@ -229,14 +229,14 @@ test('6. a person\'s message in a thread: the tag\'s topic / topic_name as the m
   expect(apiK.calls).toEqual([]); expect((await health(k)).connector.bot_api_refused).toEqual({})
 }, 30000)
 
-test('7. a system warning (the TUI\'s API error, OTLP) goes into the owner’s direct conversation with sender system:alert', async () => {
+test('7. a system warning (the TUI\'s API error, OTLP) goes to the owner: one Onsen message `to` joey, sender system:alert; nothing to Telegram', async () => {
   const otlp = { resourceLogs: [{ scopeLogs: [{ logRecords: [{ attributes: Object.entries({ 'event.name': 'api_error', status_code: '500', query_source: 'repl_main_thread',
     error: 'Internal server error seg2' }).map(([key, v]) => ({ key, value: { stringValue: v } })) }] }] }] }
   expect((await fetch(`http://127.0.0.1:${k.port}/v1/logs`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(otlp) })).status).toBe(200)
   expect(await until(() => said().some(b => String(b.body).includes('Internal server error seg2')), 8000)).toBe(true)
   const b = said().find(x => String(x.body).includes('Internal server error seg2'))!
-  expect(b).toMatchObject({ conversation_id: onsen.conv('to:joey'), sender: 'system:alert' })
-  expect('to' in b).toBe(false)
+  expect(b).toMatchObject({ to: 'joey', sender: 'system:alert' })
+  expect('conversation_id' in b).toBe(false)
   expect(b.body).toContain('⚠️ 系統警告')
   expect(apiK.calls).toEqual([]); expect((await health(k)).connector.bot_api_refused).toEqual({})
 })
