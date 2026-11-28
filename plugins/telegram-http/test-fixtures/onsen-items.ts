@@ -1,7 +1,7 @@
 import type { InboxItem } from '../onsen-items.ts'
 import type { ItemReport, Outcome } from '../onsen-receive.ts'
 
-const intermediate = new Set<Outcome>(['in_session', 'background', 'owed', 'stuck', 'deferred'])
+const intermediate = new Set<Outcome | 'deferred'>(['in_session', 'background', 'owed', 'stuck', 'deferred'])
 const failures = new Set<Outcome>(['cut', 'cut_person', 'not_taken', 'error', 'stuck'])
 type Row = InboxItem & { failures: number; released: boolean; expires_at: string | null; in_session_at: string | null
   response_message_ids: string[]; answered: boolean | null; about_item_id?: string; created_at?: string; completed_at?: string | null; cancelled_at?: string | null }

@@ -104,6 +104,30 @@ test('C4 a bare model error writes one resume; the normal peek takes it when due
   expect(r.m.currentGen()?.resume_sent).toBeUndefined()
 })
 
+test('C4 reuses the C5 pending Item line and durable id across client restart', async () => {
+  const r = await mainRig()
+  r.writer.write = write => r.client.recordItemWrite(write)
+  await r.hook('UserPromptSubmit')
+  await r.hook('StopFailure', { error: 'overloaded' })
+  const { key, create } = r.m.currentGen()!.resume_items[0]
+  const restarted = new OnsenClient(r.client.cfg)
+  for (let n = 0; n < 10; n++) {
+    await r.m.pump()
+    restarted.recordItemWrite({ key, item: create })
+  }
+  const lines = () => readFileSync(r.client.spool, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+  expect(lines()).toEqual([{ k: 'item', r: { key, item: create } }])
+  await r.sync()
+  const [row] = r.f.rows.values()
+  expect(restarted.writtenItemId(key)).toBe(row!.id)
+  await r.hook('UserPromptSubmit', { prompt_id: 'continued', dids: [] })
+  await r.sync()
+  expect(lines().map(line => line.k)).toEqual(['item', 'item'])
+  expect(lines()[1].r).toMatchObject({ id: row!.id, outcome: 'superseded' })
+  expect(row).toMatchObject({ state: 'cancelled', reason: 'superseded' })
+  expect(r.f.calls.filter(call => call.body.kind === 'resume')).toHaveLength(1)
+})
+
 test('C4 a process cut records the old background count; an item failure and an asked restart create no resume', async () => {
   const d = await mainRig()
   d.status('busy', 2)
