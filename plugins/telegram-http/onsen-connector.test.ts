@@ -1,7 +1,7 @@
 // WO-197 onsen-connector.ts: the switch (list or *, the machine config read again every 30 s), the numbers turned into Onsen's ids by asking Onsen
 // (cached, onsen:<id> as it is), a reply written with conversation_id and the bridge's report waited for (3 s), reactions and edits
 import { test, expect } from 'bun:test'
-import { BridgeSwitch, bridgeOn, ConnectorSay, OnsenIds, numbersOf, reactionOk, withoutOnsenLabel, memberChat, HELD, NOT_TAKEN, type Request } from './onsen-connector.ts'
+import { BridgeSwitch, bridgeOn, cachedBridgeBotName, ConnectorSay, OnsenIds, numbersOf, reactionOk, withoutOnsenLabel, memberChat, HELD, NOT_TAKEN, type Request } from './onsen-connector.ts'
 
 const noLog = () => {}
 
@@ -19,6 +19,24 @@ test('the switch: none by default; a list or *; the machine config read again at
   expect(s.on()).toBe(false)
   expect(reads).toBe(2)
   expect(new BridgeSwitch({ agent: 'adam', file: 'x', plist: '*', read: () => 'ONSEN_BRIDGE=0' }).on()).toBe(true)
+})
+
+test('bot-name lookups share one request for ten minutes and refresh at expiry', async () => {
+  let time = 0, reads = 0, username = 'first_bot'
+  const botName = cachedBridgeBotName(async () => { reads++; return username }, () => time)
+  expect(await Promise.all([botName(), botName()])).toEqual(['first_bot', 'first_bot'])
+  username = 'new_bot'
+  time = 599_999
+  expect(await botName()).toBe('first_bot')
+  expect(reads).toBe(1)
+  time++
+  expect(await botName()).toBe('new_bot')
+  expect(reads).toBe(2)
+  username = ''
+  time += 600_000
+  expect(await botName()).toBe('')
+  expect(await botName()).toBe('')
+  expect(reads).toBe(3)
 })
 
 test('the reaction set: Telegram\'s; a variation selector does not matter', () => {

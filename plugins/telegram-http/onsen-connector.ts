@@ -68,6 +68,16 @@ export class BridgeSwitch {
   fresh(): boolean { this.at = -Infinity; return this.on() }
 }
 
+// Group commands and thread links share one endpoint lookup, including calls made while it is in flight.
+export function cachedBridgeBotName(read: () => Promise<string>, now = Date.now): () => Promise<string> {
+  let cached: { name: Promise<string>; expires: number } | undefined
+  return () => {
+    const at = now()
+    if (!cached || at >= cached.expires) cached = { name: read(), expires: at + CACHE_MS }
+    return cached.name
+  }
+}
+
 /** a Bot API call the connector refused to make (its bot is the bridge's now) */
 export class NoTelegram extends Error {
   readonly noTelegram = true

@@ -665,7 +665,7 @@ async function connectorThreadState(chat: string, thread: number, state: 'open' 
 }
 /** the bot's username as the bridge carrying this agent reports it (its `endpoints` record of this member: attributes.username; CONTRACT §7b: a member
  *  reads its own records). Check the current carrying endpoint for an addressed group command. */
-async function bridgeBotName(): Promise<string> {
+const bridgeBotName = Connector.cachedBridgeBotName(async () => {
   const path = `/v1/members/${encodeURIComponent(CONNECTOR_AGENT)}/extension-records`
   const seen = new Set<string>()
   let cursor = ''
@@ -680,7 +680,7 @@ async function bridgeBotName(): Promise<string> {
     cursor = page.next_cursor ?? ''
   } while (cursor && !seen.has(cursor))
   return ''
-}
+})
 /** WO-197 segment 2 (Chiron mesh 12869 point 5): the link open_worker gives for a thread: Telegram's once the bridge reported its topic (within 3 s,
  *  with the bot's username known), else the Onsen page's */
 async function connectorThreadLink(chat: string, thread: number): Promise<string | null> {

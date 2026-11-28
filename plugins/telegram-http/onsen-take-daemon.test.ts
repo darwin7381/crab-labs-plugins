@@ -215,7 +215,7 @@ test('a group /clear reaches the control handler only from the owner and address
   expect(d.f.calls.filter(c => c.path.endsWith('/take') || ['/v1/messages', '/v1/actions', '/restart-lines'].includes(c.path))).toHaveLength(0)
   const owner = command('105', 'joey', '/clear@LAB_A_BOT')
   await waitFor(() => owner.state === 'completed')
-  expect(d.f.calls.some(c => c.path.endsWith('/extension-records') && c.query.get('cursor') === 'page+2')).toBe(true)
+  expect(d.f.calls.filter(c => c.path.endsWith('/extension-records')).map(c => c.query.get('cursor'))).toEqual([null, 'page+2'])
   expect(readFileSync(join(d.root, 'tmux-calls'), 'utf8').split('\n').filter(l => l.includes('/clear'))).toEqual(['send-keys -t test-pane /clear Enter'])
   expect(d.f.calls.filter(c => c.path === '/v1/messages')).toHaveLength(1)
   expect(ordinary.map(row => row.state)).toEqual(ordinary.map(() => 'waiting'))
