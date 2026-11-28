@@ -13,7 +13,7 @@ export type InboxItem = {
 /** Only references travel in the M1 and lane journals. A waiting reference owns no claim. */
 export type ItemRef = {
   onsen_item_id: string; onsen_version: number; kind: string; from: string; deadline?: string; main?: true
-  note?: string; reason?: string; half_done?: true; conversation?: string; from_kind?: MemberKind
+  note?: string; reason?: string; half_done?: true; conversation?: string; from_kind?: MemberKind | null
 }
 export function itemRef(it: InboxItem): ItemRef {
   const note = it.events?.findLast(e => e.kind === 'reassigned')?.note
@@ -23,12 +23,13 @@ export function itemRef(it: InboxItem): ItemRef {
     ...(it.payload.conversation_id != null ? { conversation: String(it.payload.conversation_id) } : {}) }
 }
 
-/** Old message references predate agent senders. Their person-message eligibility survives a restart. */
+/** Old references lack from_kind. An explicit null means the registry could not identify this sender. */
 export function personMessage(ref: ItemRef): boolean {
-  return ref.kind === 'message' && (ref.from_kind == null || ref.from_kind === 'human' || ref.from_kind === 'guest')
+  return ref.kind === 'message' && (ref.from_kind === undefined || ref.from_kind === 'human' || ref.from_kind === 'guest')
 }
 export function mayTakeItem(ref: ItemRef, phase: 'in_turn' | 'usage_limit'): boolean {
-  return personMessage(ref) || (phase === 'in_turn' && (ref.kind === 'call' || ref.kind === 'control' || Date.parse(ref.deadline ?? '') <= Date.now()))
+  if (ref.kind === 'message') return personMessage(ref)
+  return phase === 'in_turn' && (ref.kind === 'call' || ref.kind === 'control' || Date.parse(ref.deadline ?? '') <= Date.now())
 }
 
 /** The server supplies these rows oldest first on the claim that advances this member's read position. */

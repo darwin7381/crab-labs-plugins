@@ -138,6 +138,20 @@ test('real daemon routes one unclaimed notification per album at count or 1.5 s 
   expect(d.f.calls.filter(c => c.path.endsWith('/take'))).toHaveLength(0)
 }, 10000)
 
+test('a missing sender is logged once and the following Joey DM reaches the journal in order', async () => {
+  const d = await daemon()
+  d.f.add('first unknown', 'message', { from: 'missing-member' })
+  d.f.add('second unknown', 'message', { from: 'missing-member' })
+  d.f.add('following Joey DM')
+  const refs = () => d.journal().filter(r => r.rec === 'msg' && r.notif && r.onsen_items).map(r => r.onsen_items[0])
+  await waitFor(() => refs().length === 3)
+  expect(refs().map(r => [r.onsen_item_id, r.from_kind])).toEqual([
+    ['first unknown', null], ['second unknown', null], ['following Joey DM', 'human'],
+  ])
+  expect(d.log().split('\n').filter(line => line.includes('unknown member kind for missing-member'))).toHaveLength(1)
+  expect(d.f.calls.filter(c => c.path === '/v1/members/missing-member')).toHaveLength(1)
+})
+
 test('daemon handles a control at dispatch and immediately completes a re-served done id', async () => {
   const d = await daemon({ C1_COMMAND_FAILURE: '1' })
   const cmd = d.f.add('help', 'control', { message_id: 'm-help', payload: { message_id: 'm-help', conversation_id: 'conv', from: 'joey',

@@ -48,7 +48,7 @@ async function mainRig() {
   m.initMain(); r.attach(m)
   const hook = (event: string, data: Partial<MainEvent> = {}) => m.mainEvent({ event, pid, session_id: sid, prompt_id: 'turn', ...data })
   await hook('SessionStart', { source: 'startup' })
-  const enqueue = (row: InboxItem, old = false, fromKind?: MemberKind) => m.enqueue(row.kind === 'message' ? 'joey' : 'peer',
+  const enqueue = (row: InboxItem, old = false, fromKind?: MemberKind | null) => m.enqueue(row.kind === 'message' ? 'joey' : 'peer',
     { method: 'notifications/claude/channel', params: { content: row.payload.text, meta: { chat_id: '1', message_id: String(row.number), user: row.from } } },
     { event: row.id, fields: old ? {} : { onsen_items: [{ ...itemRef(row), from_kind: fromKind }] } })
   const bind = async (row: InboxItem) => {
@@ -172,17 +172,30 @@ test('during a turn a guest reaches the hook while an agent mention waits for th
   expect(r.f.calls.filter(c => c.path.endsWith('/take')).map(c => c.body.item_ids)).toEqual([[guest.id], [peer.id]])
 })
 
-test('the member registry classifies senders once and retries a missing member before giving it person privileges', async () => {
-  const r = rig(), names = new MemberNames({ get: member => r.client.request('GET', '/v1/members/' + member), changed: () => {} })
-  await expect(names.kindOf('newcomer')).rejects.toThrow('member kind')
+test('the member registry treats lookup failures as non-person, logs once and can recover', async () => {
+  const r = rig(), logs: string[] = []
+  let now = 0, offline = true
+  const names = new MemberNames({ get: member => {
+    if (offline) throw new Error('offline')
+    return r.client.request('GET', '/v1/members/' + member)
+  }, changed: () => {}, now: () => now, log: m => logs.push(m) })
+  expect(await names.kindOf('newcomer')).toBeNull()
+  offline = false
+  now += 30_000
+  expect(await names.kindOf('newcomer')).toBeNull()
+  expect(await names.kindOf('newcomer')).toBeNull()
+  expect(logs).toHaveLength(1)
+  expect(logs[0]).toContain('newcomer')
   r.f.members.set('newcomer', 'agent')
+  now += 30_000
   expect(await Promise.all([names.kindOf('newcomer'), names.kindOf('newcomer')])).toEqual(['agent', 'agent'])
   expect(await names.kindOf('newcomer')).toBe('agent')
   expect(r.f.calls.filter(c => c.path === '/v1/members/newcomer')).toHaveLength(2)
   const ref = itemRef(r.f.add('msg'))
-  for (const from_kind of ['human', 'guest', 'agent', 'system'] as const) {
+  expect(mayTakeItem(ref, 'in_turn')).toBe(true) // pre-registry journal record
+  for (const from_kind of ['human', 'guest', 'agent', 'system', null] as const) {
     const person = from_kind === 'guest' || from_kind === 'human'
-    expect(mayTakeItem({ ...ref, from_kind }, 'in_turn')).toBe(person)
+    expect(mayTakeItem({ ...ref, from_kind, deadline: '2000-01-01' }, 'in_turn')).toBe(person)
     expect(mayTakeItem({ ...ref, from_kind }, 'usage_limit')).toBe(person)
   }
 })
