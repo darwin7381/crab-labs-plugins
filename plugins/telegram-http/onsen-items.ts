@@ -26,6 +26,7 @@ export class ItemPeek {
   private changedAfter?: string
   private page?: string
   private nextChangedAfter?: string
+  private routed = false
   private previous = new Map<string, number>()
   private seen = new Map<string, number>()
   private wakeAt = Infinity
@@ -41,6 +42,7 @@ export class ItemPeek {
     this.generation++
     this.request?.abort()
     this.changedAfter = this.page = this.nextChangedAfter = undefined
+    this.routed = false
     this.previous.clear()
     this.seen.clear()
     clearTimeout(this.timer)
@@ -97,7 +99,11 @@ export class ItemPeek {
         if (it.not_before && Date.parse(it.not_before) > Date.now()) { this.dueAt(it.not_before); continue }
         const version = known.get(it.id)
         if (version === undefined || it.version > version) {
-          if (this.previous.get(it.id) !== it.version && this.seen.get(it.id) !== it.version) await this.route(it, version !== undefined)
+          if (this.previous.get(it.id) !== it.version && this.seen.get(it.id) !== it.version) {
+            await this.route(it, version !== undefined)
+            if (g !== this.generation) return
+            this.routed = true
+          }
         }
         if (g !== this.generation) return
         this.seen.set(it.id, it.version)
@@ -108,7 +114,8 @@ export class ItemPeek {
       if (!this.page) {
         this.changedAfter = this.nextChangedAfter; this.nextChangedAfter = undefined
         this.previous = this.seen; this.seen = new Map()
-        if (r.json.items.length) delay = 100
+        if (r.json.items.length) delay = this.routed ? 100 : 1000
+        this.routed = false
       }
     } catch (err) { if (g === this.generation) this.mode.log('onsen take: peek failed: ' + err); delay = 2000 }
     finally {

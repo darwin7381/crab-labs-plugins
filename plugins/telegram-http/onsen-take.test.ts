@@ -175,6 +175,21 @@ test('peek waits without claiming and reads a gated row again on release', async
   expect(r.f.calls.filter(c => c.path.endsWith('/take'))).toHaveLength(0)
 })
 
+test('an unchanged row in the overlap produces about one peek per second over ten seconds', async () => {
+  const r = rig()
+  r.f.add('overlap')
+  await r.mode.probe()
+  let routed = 0
+  const peek = new ItemPeek(r.mode, () => new Map(), async () => { routed++ }, () => true)
+  clean.push(() => peek.stop())
+  await peek.poll()
+  await Bun.sleep(10_000)
+  const polls = r.f.calls.filter(c => c.query.has('wait')).length
+  expect(routed).toBe(1)
+  expect(polls).toBeGreaterThanOrEqual(9)
+  expect(polls).toBeLessThanOrEqual(12)
+}, 12_000)
+
 test('peek echoes Onsen’s token and sees a transaction that commits after the previous as_of', async () => {
   const r = rig(), seen: string[] = []
   r.f.add('old')
